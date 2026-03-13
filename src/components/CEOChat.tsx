@@ -1,32 +1,33 @@
 import { useState } from "react";
-import { chatMessages, type ChatMessage } from "@/data/mockData";
+import { useChatMessages, type ChatMessage } from "@/hooks/useSupabaseData";
+import { supabase } from "@/integrations/supabase/client";
 import { Send, Bot, User } from "lucide-react";
+import { useQueryClient } from "@tanstack/react-query";
 
 const CEOChat = () => {
-  const [messages, setMessages] = useState<ChatMessage[]>(chatMessages);
+  const { data: messages = [], isLoading } = useChatMessages();
   const [input, setInput] = useState("");
+  const queryClient = useQueryClient();
 
-  const handleSend = () => {
+  const handleSend = async () => {
     if (!input.trim()) return;
-    const newMsg: ChatMessage = {
-      id: `msg-${Date.now()}`,
+    const timestamp = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+
+    await supabase.from("chat_messages").insert({
       role: "user",
       content: input,
-      timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
-    };
-    setMessages((prev) => [...prev, newMsg]);
+      timestamp,
+    });
     setInput("");
+    queryClient.invalidateQueries({ queryKey: ["chat_messages"] });
 
-    setTimeout(() => {
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: `msg-${Date.now()}-resp`,
-          role: "orchestrator",
-          content: "Acknowledged. Routing your directive to the relevant agents. I'll update you when execution begins.",
-          timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
-        },
-      ]);
+    setTimeout(async () => {
+      await supabase.from("chat_messages").insert({
+        role: "orchestrator",
+        content: "Acknowledged. Routing your directive to the relevant agents. I'll update you when execution begins.",
+        timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+      });
+      queryClient.invalidateQueries({ queryKey: ["chat_messages"] });
     }, 1200);
   };
 
@@ -39,29 +40,33 @@ const CEOChat = () => {
       </div>
 
       <div className="flex-1 overflow-y-auto p-3 space-y-3">
-        {messages.map((msg) => (
-          <div key={msg.id} className={`flex gap-2 ${msg.role === "user" ? "flex-row-reverse" : ""}`}>
-            <div className={`w-5 h-5 rounded-sm flex items-center justify-center flex-shrink-0 mt-0.5 ${
-              msg.role === "user" ? "bg-primary" : "bg-secondary"
-            }`}>
-              {msg.role === "user" ? (
-                <User size={10} className="text-primary-foreground" />
-              ) : (
-                <Bot size={10} className="text-muted-foreground" />
-              )}
-            </div>
-            <div className={`flex-1 min-w-0 ${msg.role === "user" ? "text-right" : ""}`}>
-              <div className={`inline-block text-left p-2 rounded-sm max-w-full ${
-                msg.role === "user"
-                  ? "bg-primary text-primary-foreground"
-                  : "bg-secondary border border-border"
+        {isLoading ? (
+          <div className="p-4 text-xs text-muted-foreground">Loading...</div>
+        ) : (
+          messages.map((msg) => (
+            <div key={msg.id} className={`flex gap-2 ${msg.role === "user" ? "flex-row-reverse" : ""}`}>
+              <div className={`w-5 h-5 rounded-sm flex items-center justify-center flex-shrink-0 mt-0.5 ${
+                msg.role === "user" ? "bg-primary" : "bg-secondary"
               }`}>
-                <p className="text-xs whitespace-pre-wrap leading-relaxed">{msg.content}</p>
+                {msg.role === "user" ? (
+                  <User size={10} className="text-primary-foreground" />
+                ) : (
+                  <Bot size={10} className="text-muted-foreground" />
+                )}
               </div>
-              <p className="text-[9px] font-mono text-muted-foreground mt-1">{msg.timestamp}</p>
+              <div className={`flex-1 min-w-0 ${msg.role === "user" ? "text-right" : ""}`}>
+                <div className={`inline-block text-left p-2 rounded-sm max-w-full ${
+                  msg.role === "user"
+                    ? "bg-primary text-primary-foreground"
+                    : "bg-secondary border border-border"
+                }`}>
+                  <p className="text-xs whitespace-pre-wrap leading-relaxed">{msg.content}</p>
+                </div>
+                <p className="text-[9px] font-mono text-muted-foreground mt-1">{msg.timestamp}</p>
+              </div>
             </div>
-          </div>
-        ))}
+          ))
+        )}
       </div>
 
       <div className="p-3 border-t border-border">

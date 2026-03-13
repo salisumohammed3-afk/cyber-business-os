@@ -1,4 +1,4 @@
-import { agents, type AgentStatus } from "@/data/mockData";
+import { useAgents, type AgentStatus } from "@/hooks/useSupabaseData";
 import { Bot, Cpu, Globe, Megaphone, Rocket, Search, Sparkles } from "lucide-react";
 import { toast } from "sonner";
 
@@ -23,6 +23,8 @@ const statusLabel: Record<AgentStatus, string> = {
 };
 
 const AgentSidebar = () => {
+  const { data: agents = [], isLoading } = useAgents();
+
   const handleSurpriseMe = () => {
     toast("🔍 Business Opportunity Search initiated", {
       description: "Research Agent scanning for untapped market segments...",
@@ -39,30 +41,34 @@ const AgentSidebar = () => {
       </div>
 
       <div className="flex-1 overflow-y-auto p-2 space-y-1">
-        {agents.map((agent) => {
-          const Icon = iconMap[agent.id] || Bot;
-          return (
-            <div
-              key={agent.id}
-              className="p-2.5 rounded-sm border border-border hover:border-foreground/20 hover:bg-secondary transition-colors cursor-pointer group"
-            >
-              <div className="flex items-center gap-2 mb-1.5">
-                <Icon size={14} className="text-muted-foreground group-hover:text-foreground transition-colors" />
-                <span className="text-xs font-medium text-foreground">{agent.name}</span>
-                <div className={`w-1.5 h-1.5 rounded-full ml-auto ${statusColor[agent.status]}`} />
+        {isLoading ? (
+          <div className="p-4 text-xs text-muted-foreground">Loading agents...</div>
+        ) : (
+          agents.map((agent) => {
+            const Icon = iconMap[agent.id] || Bot;
+            return (
+              <div
+                key={agent.id}
+                className="p-2.5 rounded-sm border border-border hover:border-foreground/20 hover:bg-secondary transition-colors cursor-pointer group"
+              >
+                <div className="flex items-center gap-2 mb-1.5">
+                  <Icon size={14} className="text-muted-foreground group-hover:text-foreground transition-colors" />
+                  <span className="text-xs font-medium text-foreground">{agent.name}</span>
+                  <div className={`w-1.5 h-1.5 rounded-full ml-auto ${statusColor[agent.status]}`} />
+                </div>
+                <p className="text-[10px] text-muted-foreground leading-tight">{agent.role}</p>
+                <div className="flex items-center justify-between mt-2">
+                  <span className="font-mono text-[9px] text-muted-foreground">
+                    {statusLabel[agent.status]}
+                  </span>
+                  <span className="font-mono text-[9px] text-muted-foreground">
+                    {agent.tasks_completed} runs
+                  </span>
+                </div>
               </div>
-              <p className="text-[10px] text-muted-foreground leading-tight">{agent.role}</p>
-              <div className="flex items-center justify-between mt-2">
-                <span className="font-mono text-[9px] text-muted-foreground">
-                  {statusLabel[agent.status]}
-                </span>
-                <span className="font-mono text-[9px] text-muted-foreground">
-                  {agent.tasksCompleted} runs
-                </span>
-              </div>
-            </div>
-          );
-        })}
+            );
+          })
+        )}
       </div>
 
       <div className="p-3 border-t border-border">

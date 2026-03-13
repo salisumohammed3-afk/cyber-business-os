@@ -14,7 +14,161 @@ export type Database = {
   }
   public: {
     Tables: {
-      [_ in never]: never
+      agents: {
+        Row: {
+          created_at: string
+          id: string
+          last_action: string
+          name: string
+          role: string
+          status: Database["public"]["Enums"]["agent_status"]
+          tasks_completed: number
+          updated_at: string
+        }
+        Insert: {
+          created_at?: string
+          id: string
+          last_action?: string
+          name: string
+          role: string
+          status?: Database["public"]["Enums"]["agent_status"]
+          tasks_completed?: number
+          updated_at?: string
+        }
+        Update: {
+          created_at?: string
+          id?: string
+          last_action?: string
+          name?: string
+          role?: string
+          status?: Database["public"]["Enums"]["agent_status"]
+          tasks_completed?: number
+          updated_at?: string
+        }
+        Relationships: []
+      }
+      chat_messages: {
+        Row: {
+          content: string
+          created_at: string
+          id: string
+          role: string
+          timestamp: string
+        }
+        Insert: {
+          content: string
+          created_at?: string
+          id?: string
+          role: string
+          timestamp?: string
+        }
+        Update: {
+          content?: string
+          created_at?: string
+          id?: string
+          role?: string
+          timestamp?: string
+        }
+        Relationships: []
+      }
+      metrics: {
+        Row: {
+          change: string | null
+          id: string
+          label: string
+          positive: boolean | null
+          updated_at: string
+          value: string
+        }
+        Insert: {
+          change?: string | null
+          id?: string
+          label: string
+          positive?: boolean | null
+          updated_at?: string
+          value: string
+        }
+        Update: {
+          change?: string | null
+          id?: string
+          label?: string
+          positive?: boolean | null
+          updated_at?: string
+          value?: string
+        }
+        Relationships: []
+      }
+      tasks: {
+        Row: {
+          agent_id: string
+          agent_name: string
+          category: string
+          created_at: string
+          id: string
+          progress: number
+          reasoning: string
+          status: Database["public"]["Enums"]["task_status"]
+          timestamp: string
+          title: string
+          tool_output: string
+          updated_at: string
+        }
+        Insert: {
+          agent_id: string
+          agent_name: string
+          category?: string
+          created_at?: string
+          id: string
+          progress?: number
+          reasoning?: string
+          status?: Database["public"]["Enums"]["task_status"]
+          timestamp?: string
+          title: string
+          tool_output?: string
+          updated_at?: string
+        }
+        Update: {
+          agent_id?: string
+          agent_name?: string
+          category?: string
+          created_at?: string
+          id?: string
+          progress?: number
+          reasoning?: string
+          status?: Database["public"]["Enums"]["task_status"]
+          timestamp?: string
+          title?: string
+          tool_output?: string
+          updated_at?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "tasks_agent_id_fkey"
+            columns: ["agent_id"]
+            isOneToOne: false
+            referencedRelation: "agents"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      terminal_logs: {
+        Row: {
+          created_at: string
+          id: string
+          message: string
+        }
+        Insert: {
+          created_at?: string
+          id?: string
+          message: string
+        }
+        Update: {
+          created_at?: string
+          id?: string
+          message?: string
+        }
+        Relationships: []
+      }
     }
     Views: {
       [_ in never]: never
@@ -23,7 +177,8 @@ export type Database = {
       [_ in never]: never
     }
     Enums: {
-      [_ in never]: never
+      agent_status: "active" | "idle" | "thinking"
+      task_status: "running" | "completed" | "queued" | "failed"
     }
     CompositeTypes: {
       [_ in never]: never
@@ -150,6 +305,9 @@ export type CompositeTypes<
 
 export const Constants = {
   public: {
-    Enums: {},
+    Enums: {
+      agent_status: ["active", "idle", "thinking"],
+      task_status: ["running", "completed", "queued", "failed"],
+    },
   },
 } as const

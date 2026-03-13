@@ -1,4 +1,4 @@
-import { type Task } from "@/data/mockData";
+import { type Task } from "@/hooks/useSupabaseData";
 import { X, Brain, Terminal } from "lucide-react";
 import { AnimatePresence, motion } from "framer-motion";
 
@@ -32,7 +32,7 @@ const TaskBlueprintModal = ({ task, onClose }: Props) => {
                 <span className="font-mono text-[10px] text-muted-foreground">{task.id}</span>
                 <h2 className="text-sm font-medium text-foreground mt-0.5">{task.title}</h2>
                 <div className="flex items-center gap-2 mt-1">
-                  <span className="text-[10px] text-muted-foreground">{task.agentName}</span>
+                  <span className="text-[10px] text-muted-foreground">{task.agent_name}</span>
                   <span className="text-[10px] text-muted-foreground">·</span>
                   <span className="text-[10px] text-muted-foreground">{task.timestamp}</span>
                 </div>
@@ -66,7 +66,7 @@ const TaskBlueprintModal = ({ task, onClose }: Props) => {
                   </span>
                 </div>
                 <pre className="text-[10px] font-mono text-muted-foreground bg-secondary p-3 rounded-sm border border-border overflow-x-auto whitespace-pre-wrap leading-relaxed">
-                  {task.toolOutput}
+                  {task.tool_output}
                 </pre>
               </div>
             </div>

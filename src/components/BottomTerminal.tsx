@@ -1,8 +1,9 @@
-import { terminalLogs } from "@/data/mockData";
+import { useTerminalLogs } from "@/hooks/useSupabaseData";
 import { Radio } from "lucide-react";
 
 const BottomTerminal = () => {
-  const duplicated = [...terminalLogs, ...terminalLogs];
+  const { data: logs = [] } = useTerminalLogs();
+  const duplicated = [...logs, ...logs];
 
   return (
     <div className="h-8 border-t border-border bg-background flex items-center px-4 overflow-hidden">

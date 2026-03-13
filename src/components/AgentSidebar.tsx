@@ -31,7 +31,7 @@ const AgentSidebar = () => {
   };
 
   return (
-    <div className="w-56 border-r border-border bg-card flex flex-col h-full">
+    <div className="w-56 border-r border-border bg-background flex flex-col h-full">
       <div className="p-3 border-b border-border">
         <span className="font-mono text-[10px] text-muted-foreground tracking-widest uppercase">
           Agent Grid
@@ -44,10 +44,10 @@ const AgentSidebar = () => {
           return (
             <div
               key={agent.id}
-              className="p-2.5 rounded-sm border border-border hover:border-emerald/30 hover:bg-surface-elevated transition-colors cursor-pointer group"
+              className="p-2.5 rounded-sm border border-border hover:border-foreground/20 hover:bg-secondary transition-colors cursor-pointer group"
             >
               <div className="flex items-center gap-2 mb-1.5">
-                <Icon size={14} className="text-muted-foreground group-hover:text-emerald transition-colors" />
+                <Icon size={14} className="text-muted-foreground group-hover:text-foreground transition-colors" />
                 <span className="text-xs font-medium text-foreground">{agent.name}</span>
                 <div className={`w-1.5 h-1.5 rounded-full ml-auto ${statusColor[agent.status]}`} />
               </div>
@@ -68,7 +68,7 @@ const AgentSidebar = () => {
       <div className="p-3 border-t border-border">
         <button
           onClick={handleSurpriseMe}
-          className="w-full py-2 px-3 rounded-sm border border-emerald bg-emerald/10 text-emerald text-xs font-mono font-medium hover:bg-emerald/20 transition-colors flex items-center justify-center gap-1.5"
+          className="w-full py-2 px-3 rounded-sm bg-primary text-primary-foreground text-xs font-mono font-medium hover:bg-primary/90 transition-colors flex items-center justify-center gap-1.5"
         >
           <Sparkles size={12} />
           Surprise Me

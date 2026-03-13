@@ -3,7 +3,7 @@ import { tasks, type Task } from "@/data/mockData";
 import { ChevronDown, ChevronRight, CheckCircle2, Loader2, Clock, AlertCircle } from "lucide-react";
 import TaskBlueprintModal from "./TaskBlueprintModal";
 
-const statusConfig = {
+const statusConfig: Record<string, { icon: React.ElementType; color: string; bg: string; animate?: boolean }> = {
   completed: { icon: CheckCircle2, color: "text-emerald", bg: "bg-emerald/10" },
   running: { icon: Loader2, color: "text-amber", bg: "bg-amber/10", animate: true },
   queued: { icon: Clock, color: "text-muted-foreground", bg: "bg-muted" },

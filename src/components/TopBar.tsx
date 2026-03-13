@@ -3,8 +3,8 @@ import { TrendingUp, TrendingDown } from "lucide-react";
 
 const TopBar = () => {
   return (
-    <div className="h-12 border-b border-border bg-card flex items-center px-4 gap-6">
-      <span className="font-mono text-xs text-muted-foreground tracking-widest uppercase mr-4">
+    <div className="h-12 border-b border-border bg-background flex items-center px-4 gap-6">
+      <span className="text-lg font-semibold tracking-tight text-foreground mr-4">
         AuraOS
       </span>
       <div className="h-4 w-px bg-border" />
@@ -21,9 +21,13 @@ const TopBar = () => {
           <div className="h-4 w-px bg-border ml-2" />
         </div>
       ))}
-      <div className="ml-auto flex items-center gap-2">
-        <div className="w-1.5 h-1.5 rounded-full bg-emerald pulse-active" />
-        <span className="font-mono text-xs text-emerald">ONLINE</span>
+      <div className="ml-auto flex items-center gap-3">
+        <button className="px-3 py-1 rounded-sm bg-primary text-primary-foreground text-xs font-medium hover:bg-primary/90 transition-colors">
+          + New
+        </button>
+        <button className="px-3 py-1 rounded-sm border border-border text-xs font-medium text-foreground hover:bg-secondary transition-colors">
+          Menu ▾
+        </button>
       </div>
     </div>
   );

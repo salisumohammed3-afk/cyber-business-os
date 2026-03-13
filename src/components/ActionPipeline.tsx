@@ -3,11 +3,11 @@ import { tasks, type Task } from "@/data/mockData";
 import { ChevronDown, ChevronRight, CheckCircle2, Loader2, Clock, AlertCircle } from "lucide-react";
 import TaskBlueprintModal from "./TaskBlueprintModal";
 
-const statusConfig: Record<string, { icon: React.ElementType; color: string; bg: string; animate?: boolean }> = {
-  completed: { icon: CheckCircle2, color: "text-emerald", bg: "bg-emerald/10" },
-  running: { icon: Loader2, color: "text-amber", bg: "bg-amber/10", animate: true },
-  queued: { icon: Clock, color: "text-muted-foreground", bg: "bg-muted" },
-  failed: { icon: AlertCircle, color: "text-destructive", bg: "bg-destructive/10" },
+const statusConfig: Record<string, { icon: React.ElementType; color: string; bg: string; label: string; animate?: boolean }> = {
+  completed: { icon: CheckCircle2, color: "text-emerald", bg: "bg-emerald/10", label: "completed" },
+  running: { icon: Loader2, color: "text-amber", bg: "bg-amber/10", label: "running", animate: true },
+  queued: { icon: Clock, color: "text-muted-foreground", bg: "bg-secondary", label: "queued" },
+  failed: { icon: AlertCircle, color: "text-destructive", bg: "bg-destructive/10", label: "failed" },
 };
 
 const ActionPipeline = () => {
@@ -45,7 +45,7 @@ const ActionPipeline = () => {
               <div
                 key={task.id}
                 onClick={() => setSelectedTask(task)}
-                className="border border-border rounded-sm p-3 hover:border-emerald/20 transition-colors cursor-pointer"
+                className="border border-border rounded-sm p-3 hover:border-foreground/20 transition-colors cursor-pointer"
               >
                 <div className="flex items-start gap-2 mb-2">
                   <StatusIcon
@@ -56,7 +56,7 @@ const ActionPipeline = () => {
                     <div className="flex items-center gap-2 mb-0.5">
                       <span className="font-mono text-[10px] text-muted-foreground">{task.id}</span>
                       <span className={`text-[9px] font-mono px-1.5 py-0.5 rounded-sm ${config.bg} ${config.color}`}>
-                        {task.status}
+                        {config.label}
                       </span>
                     </div>
                     <p className="text-xs text-foreground font-medium truncate">{task.title}</p>
@@ -68,8 +68,7 @@ const ActionPipeline = () => {
                   </div>
                 </div>
 
-                {/* Progress bar */}
-                <div className="h-1 bg-muted rounded-sm overflow-hidden mb-2">
+                <div className="h-1 bg-secondary rounded-sm overflow-hidden mb-2">
                   <div
                     className={`h-full transition-all duration-500 rounded-sm ${
                       task.status === "completed" ? "bg-emerald" : task.status === "running" ? "bg-amber" : "bg-muted-foreground/30"
@@ -78,17 +77,16 @@ const ActionPipeline = () => {
                   />
                 </div>
 
-                {/* View Logs toggle */}
                 <button
                   onClick={(e) => toggleLog(task.id, e)}
-                  className="flex items-center gap-1 text-[10px] font-mono text-muted-foreground hover:text-emerald transition-colors"
+                  className="flex items-center gap-1 text-[10px] font-mono text-muted-foreground hover:text-foreground transition-colors"
                 >
                   {isExpanded ? <ChevronDown size={10} /> : <ChevronRight size={10} />}
                   View Logs
                 </button>
 
                 {isExpanded && (
-                  <pre className="mt-2 p-2 bg-background rounded-sm text-[10px] font-mono text-muted-foreground overflow-x-auto whitespace-pre-wrap leading-relaxed border border-border">
+                  <pre className="mt-2 p-2 bg-secondary rounded-sm text-[10px] font-mono text-muted-foreground overflow-x-auto whitespace-pre-wrap leading-relaxed border border-border">
                     {task.toolOutput}
                   </pre>
                 )}

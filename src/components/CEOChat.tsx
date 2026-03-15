@@ -1,93 +1,106 @@
-import { useState } from "react";
-import { useChatMessages, type ChatMessage } from "@/hooks/useSupabaseData";
-import { supabase } from "@/integrations/supabase/client";
-import { Send, Bot, User } from "lucide-react";
-import { useQueryClient } from "@tanstack/react-query";
+import { useRef, useEffect, useState } from 'react'
+import { useLiveChat } from '@/hooks/useLiveChat'
 
-const CEOChat = () => {
-  const { data: messages = [], isLoading } = useChatMessages();
-  const [input, setInput] = useState("");
-  const queryClient = useQueryClient();
+type ConversationIdProp = string | null
 
-  const handleSend = async () => {
-    if (!input.trim()) return;
-    const timestamp = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+export function CEOChat({ conversationId }: { conversationId?: ConversationIdProp }) {
+  const { messages, loading, error, sendMessage } = useLiveChat(conversationId ?? null)
+  const scrollContainerRef = useRef<HTMLDivElement>(null)
+  const [inputValue, setInputValue] = useState('')
+  const [sending, setSending] = useState(false)
 
-    await supabase.from("chat_messages").insert({
-      role: "user",
-      content: input,
-      timestamp,
-    });
-    setInput("");
-    queryClient.invalidateQueries({ queryKey: ["chat_messages"] });
+  // Auto-scroll to bottom when messages change
+  useEffect(() => {
+    scrollContainerRef.current?.scrollTo({
+      top: scrollContainerRef.current.scrollHeight,
+      behavior: 'smooth',
+    })
+  }, [messages])
 
-    setTimeout(async () => {
-      await supabase.from("chat_messages").insert({
-        role: "orchestrator",
-        content: "Acknowledged. Routing your directive to the relevant agents. I'll update you when execution begins.",
-        timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
-      });
-      queryClient.invalidateQueries({ queryKey: ["chat_messages"] });
-    }, 1200);
-  };
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault()
+    const text = inputValue.trim()
+    if (!text || sending) return
+    setSending(true)
+    setInputValue('')
+    try {
+      await sendMessage(text)
+    } catch (err) {
+      console.error(err)
+      setInputValue(text)
+    } finally {
+      setSending(false)
+    }
+  }
+
+  const isWaitingForResponse =
+    messages.length > 0 && messages[messages.length - 1]?.role === 'user'
 
   return (
-    <div className="w-80 border-l border-border bg-background flex flex-col h-full">
-      <div className="p-3 border-b border-border">
-        <span className="font-mono text-[10px] text-muted-foreground tracking-widest uppercase">
-          CEO Strategy Layer
-        </span>
-      </div>
-
-      <div className="flex-1 overflow-y-auto p-3 space-y-3">
-        {isLoading ? (
-          <div className="p-4 text-xs text-muted-foreground">Loading...</div>
-        ) : (
+    <div className="flex flex-col h-full">
+      <div
+        ref={scrollContainerRef}
+        className="flex-1 overflow-y-auto p-4 space-y-4"
+      >
+        {loading && (
+          <div className="flex justify-center py-4">
+            <span className="text-sm text-gray-500">Loading...</span>
+          </div>
+        )}
+        {error && (
+          <div className="rounded-lg bg-red-50 p-3 text-sm text-red-700">
+            {error.message}
+          </div>
+        )}
+        {!loading &&
           messages.map((msg) => (
-            <div key={msg.id} className={`flex gap-2 ${msg.role === "user" ? "flex-row-reverse" : ""}`}>
-              <div className={`w-5 h-5 rounded-sm flex items-center justify-center flex-shrink-0 mt-0.5 ${
-                msg.role === "user" ? "bg-primary" : "bg-secondary"
-              }`}>
-                {msg.role === "user" ? (
-                  <User size={10} className="text-primary-foreground" />
-                ) : (
-                  <Bot size={10} className="text-muted-foreground" />
-                )}
-              </div>
-              <div className={`flex-1 min-w-0 ${msg.role === "user" ? "text-right" : ""}`}>
-                <div className={`inline-block text-left p-2 rounded-sm max-w-full ${
-                  msg.role === "user"
-                    ? "bg-primary text-primary-foreground"
-                    : "bg-secondary border border-border"
-                }`}>
-                  <p className="text-xs whitespace-pre-wrap leading-relaxed">{msg.content}</p>
-                </div>
-                <p className="text-[9px] font-mono text-muted-foreground mt-1">{msg.timestamp}</p>
+            <div
+              key={msg.id}
+              className={
+                msg.role === 'user'
+                  ? 'flex justify-end'
+                  : 'flex justify-start'
+              }
+            >
+              <div
+                className={
+                  msg.role === 'user'
+                    ? 'rounded-lg px-4 py-2 max-w-[80%] bg-blue-600 text-white'
+                    : 'rounded-lg px-4 py-2 max-w-[80%] bg-gray-200 text-gray-900'
+                }
+              >
+                <p className="text-sm whitespace-pre-wrap">{msg.content ?? ''}</p>
               </div>
             </div>
-          ))
+          ))}
+        {isWaitingForResponse && (
+          <div className="flex justify-start">
+            <span className="text-sm text-gray-500 animate-pulse">
+              thinking...
+            </span>
+          </div>
         )}
       </div>
-
-      <div className="p-3 border-t border-border">
-        <div className="flex items-center gap-2 border border-border rounded-sm p-1.5">
-          <input
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && handleSend()}
-            placeholder="Ask Aura anything..."
-            className="flex-1 bg-transparent text-xs text-foreground placeholder:text-muted-foreground outline-none px-1"
-          />
-          <button
-            onClick={handleSend}
-            className="p-1 rounded-sm hover:bg-secondary text-muted-foreground hover:text-foreground transition-colors"
-          >
-            <Send size={12} />
-          </button>
-        </div>
-      </div>
+      <form
+        onSubmit={handleSubmit}
+        className="border-t p-4 flex gap-2 items-center"
+      >
+        <input
+          type="text"
+          value={inputValue}
+          onChange={(e) => setInputValue(e.target.value)}
+          placeholder="Type a message..."
+          disabled={sending}
+          className="flex-1 rounded-lg border border-gray-300 px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50 disabled:cursor-not-allowed"
+        />
+        <button
+          type="submit"
+          disabled={sending || !inputValue.trim()}
+          className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          Send
+        </button>
+      </form>
     </div>
-  );
-};
-
-export default CEOChat;
+  )
+}

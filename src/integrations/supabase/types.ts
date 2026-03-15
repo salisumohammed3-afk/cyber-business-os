@@ -6,308 +6,285 @@ export type Json =
   | { [key: string]: Json | undefined }
   | Json[]
 
-export type Database = {
-  // Allows to automatically instantiate createClient with right options
-  // instead of createClient<Database, { PostgrestVersion: 'XX' }>(URL, KEY)
-  __InternalSupabase: {
-    PostgrestVersion: "14.4"
-  }
+export type TaskStatus =
+  | 'running'
+  | 'completed'
+  | 'queued'
+  | 'failed'
+  | 'pending'
+  | 'cancelled'
+
+export interface Database {
   public: {
     Tables: {
-      agents: {
+      users: {
         Row: {
-          created_at: string
           id: string
-          last_action: string
-          name: string
-          role: string
-          status: Database["public"]["Enums"]["agent_status"]
-          tasks_completed: number
+          name: string | null
+          email: string | null
+          company_context: Json | null
+          created_at: string
+        }
+        Insert: {
+          id: string
+          name?: string | null
+          email?: string | null
+          company_context?: Json | null
+          created_at?: string
+        }
+        Update: {
+          id?: string
+          name?: string | null
+          email?: string | null
+          company_context?: Json | null
+          created_at?: string
+        }
+      }
+      conversations: {
+        Row: {
+          id: string
+          user_id: string | null
+          title: string | null
+          metadata: Json | null
+          created_at: string
           updated_at: string
         }
         Insert: {
+          id?: string
+          user_id?: string | null
+          title?: string | null
+          metadata?: Json | null
           created_at?: string
-          id: string
-          last_action?: string
-          name: string
-          role: string
-          status?: Database["public"]["Enums"]["agent_status"]
-          tasks_completed?: number
           updated_at?: string
         }
         Update: {
-          created_at?: string
           id?: string
-          last_action?: string
-          name?: string
-          role?: string
-          status?: Database["public"]["Enums"]["agent_status"]
-          tasks_completed?: number
+          user_id?: string | null
+          title?: string | null
+          metadata?: Json | null
+          created_at?: string
           updated_at?: string
         }
-        Relationships: []
+      }
+      agent_definitions: {
+        Row: {
+          id: string
+          name: string | null
+          slug: string
+          description: string | null
+          system_prompt: string | null
+          model: string | null
+          allowed_tools: Json | null
+          is_orchestrator: boolean
+          max_turns: number
+          temperature: number
+          created_at: string
+          updated_at: string
+        }
+        Insert: {
+          id?: string
+          name?: string | null
+          slug: string
+          description?: string | null
+          system_prompt?: string | null
+          model?: string | null
+          allowed_tools?: Json | null
+          is_orchestrator?: boolean
+          max_turns?: number
+          temperature?: number
+          created_at?: string
+          updated_at?: string
+        }
+        Update: {
+          id?: string
+          name?: string | null
+          slug?: string
+          description?: string | null
+          system_prompt?: string | null
+          model?: string | null
+          allowed_tools?: Json | null
+          is_orchestrator?: boolean
+          max_turns?: number
+          temperature?: number
+          created_at?: string
+          updated_at?: string
+        }
+      }
+      agent_tools: {
+        Row: {
+          id: string
+          agent_id: string
+          tool_name: string | null
+          tool_type: string | null
+          mcp_server_url: string | null
+          config: Json | null
+          is_enabled: boolean
+          created_at: string
+        }
+        Insert: {
+          id?: string
+          agent_id: string
+          tool_name?: string | null
+          tool_type?: string | null
+          mcp_server_url?: string | null
+          config?: Json | null
+          is_enabled?: boolean
+          created_at?: string
+        }
+        Update: {
+          id?: string
+          agent_id?: string
+          tool_name?: string | null
+          tool_type?: string | null
+          mcp_server_url?: string | null
+          config?: Json | null
+          is_enabled?: boolean
+          created_at?: string
+        }
       }
       chat_messages: {
         Row: {
-          content: string
-          created_at: string
           id: string
+          conversation_id: string | null
           role: string
-          timestamp: string
+          content: string | null
+          timestamp: string | null
+          tool_calls: Json | null
+          metadata: Json | null
+          created_at?: string
         }
         Insert: {
-          content: string
-          created_at?: string
           id?: string
+          conversation_id?: string | null
           role: string
-          timestamp?: string
+          content?: string | null
+          timestamp?: string | null
+          tool_calls?: Json | null
+          metadata?: Json | null
+          created_at?: string
         }
         Update: {
-          content?: string
-          created_at?: string
           id?: string
+          conversation_id?: string | null
           role?: string
-          timestamp?: string
+          content?: string | null
+          timestamp?: string | null
+          tool_calls?: Json | null
+          metadata?: Json | null
+          created_at?: string
         }
-        Relationships: []
-      }
-      metrics: {
-        Row: {
-          change: string | null
-          id: string
-          label: string
-          positive: boolean | null
-          updated_at: string
-          value: string
-        }
-        Insert: {
-          change?: string | null
-          id?: string
-          label: string
-          positive?: boolean | null
-          updated_at?: string
-          value: string
-        }
-        Update: {
-          change?: string | null
-          id?: string
-          label?: string
-          positive?: boolean | null
-          updated_at?: string
-          value?: string
-        }
-        Relationships: []
       }
       tasks: {
         Row: {
-          agent_id: string
-          agent_name: string
-          category: string
-          created_at: string
           id: string
-          progress: number
-          reasoning: string
-          status: Database["public"]["Enums"]["task_status"]
-          timestamp: string
-          title: string
-          tool_output: string
-          updated_at: string
+          conversation_id: string | null
+          agent_definition_id: string | null
+          parent_task_id: string | null
+          status: TaskStatus
+          title: string | null
+          description: string | null
+          input_data: Json
+          priority: number
+          error_message: string | null
+          retry_count: number
+          max_retries: number
+          started_at: string | null
+          completed_at: string | null
+          created_at?: string
         }
         Insert: {
-          agent_id: string
-          agent_name: string
-          category?: string
+          id?: string
+          conversation_id?: string | null
+          agent_definition_id?: string | null
+          parent_task_id?: string | null
+          status?: TaskStatus
+          title?: string | null
+          description?: string | null
+          input_data?: Json
+          priority?: number
+          error_message?: string | null
+          retry_count?: number
+          max_retries?: number
+          started_at?: string | null
+          completed_at?: string | null
           created_at?: string
-          id: string
-          progress?: number
-          reasoning?: string
-          status?: Database["public"]["Enums"]["task_status"]
-          timestamp?: string
-          title: string
-          tool_output?: string
-          updated_at?: string
         }
         Update: {
-          agent_id?: string
-          agent_name?: string
-          category?: string
-          created_at?: string
           id?: string
-          progress?: number
-          reasoning?: string
-          status?: Database["public"]["Enums"]["task_status"]
-          timestamp?: string
-          title?: string
-          tool_output?: string
-          updated_at?: string
+          conversation_id?: string | null
+          agent_definition_id?: string | null
+          parent_task_id?: string | null
+          status?: TaskStatus
+          title?: string | null
+          description?: string | null
+          input_data?: Json
+          priority?: number
+          error_message?: string | null
+          retry_count?: number
+          max_retries?: number
+          started_at?: string | null
+          completed_at?: string | null
+          created_at?: string
         }
-        Relationships: [
-          {
-            foreignKeyName: "tasks_agent_id_fkey"
-            columns: ["agent_id"]
-            isOneToOne: false
-            referencedRelation: "agents"
-            referencedColumns: ["id"]
-          },
-        ]
       }
-      terminal_logs: {
+      task_results: {
         Row: {
-          created_at: string
           id: string
-          message: string
+          task_id: string
+          result_type: string
+          data: Json | null
+          created_at: string
         }
         Insert: {
-          created_at?: string
           id?: string
-          message: string
+          task_id: string
+          result_type: string
+          data?: Json | null
+          created_at?: string
         }
         Update: {
-          created_at?: string
           id?: string
-          message?: string
+          task_id?: string
+          result_type?: string
+          data?: Json | null
+          created_at?: string
         }
-        Relationships: []
       }
-    }
-    Views: {
-      [_ in never]: never
-    }
-    Functions: {
-      [_ in never]: never
+      memories: {
+        Row: {
+          id: string
+          user_id: string
+          category: string | null
+          content: string | null
+          metadata: Json | null
+          importance: number
+          expires_at: string | null
+          created_at: string
+        }
+        Insert: {
+          id?: string
+          user_id: string
+          category?: string | null
+          content?: string | null
+          metadata?: Json | null
+          importance?: number
+          expires_at?: string | null
+          created_at?: string
+        }
+        Update: {
+          id?: string
+          user_id?: string
+          category?: string | null
+          content?: string | null
+          metadata?: Json | null
+          importance?: number
+          expires_at?: string | null
+          created_at?: string
+        }
+      }
     }
     Enums: {
-      agent_status: "active" | "idle" | "thinking"
-      task_status: "running" | "completed" | "queued" | "failed"
-    }
-    CompositeTypes: {
-      [_ in never]: never
+      task_status: TaskStatus
     }
   }
 }
-
-type DatabaseWithoutInternals = Omit<Database, "__InternalSupabase">
-
-type DefaultSchema = DatabaseWithoutInternals[Extract<keyof Database, "public">]
-
-export type Tables<
-  DefaultSchemaTableNameOrOptions extends
-    | keyof (DefaultSchema["Tables"] & DefaultSchema["Views"])
-    | { schema: keyof DatabaseWithoutInternals },
-  TableName extends DefaultSchemaTableNameOrOptions extends {
-    schema: keyof DatabaseWithoutInternals
-  }
-    ? keyof (DatabaseWithoutInternals[DefaultSchemaTableNameOrOptions["schema"]]["Tables"] &
-        DatabaseWithoutInternals[DefaultSchemaTableNameOrOptions["schema"]]["Views"])
-    : never = never,
-> = DefaultSchemaTableNameOrOptions extends {
-  schema: keyof DatabaseWithoutInternals
-}
-  ? (DatabaseWithoutInternals[DefaultSchemaTableNameOrOptions["schema"]]["Tables"] &
-      DatabaseWithoutInternals[DefaultSchemaTableNameOrOptions["schema"]]["Views"])[TableName] extends {
-      Row: infer R
-    }
-    ? R
-    : never
-  : DefaultSchemaTableNameOrOptions extends keyof (DefaultSchema["Tables"] &
-        DefaultSchema["Views"])
-    ? (DefaultSchema["Tables"] &
-        DefaultSchema["Views"])[DefaultSchemaTableNameOrOptions] extends {
-        Row: infer R
-      }
-      ? R
-      : never
-    : never
-
-export type TablesInsert<
-  DefaultSchemaTableNameOrOptions extends
-    | keyof DefaultSchema["Tables"]
-    | { schema: keyof DatabaseWithoutInternals },
-  TableName extends DefaultSchemaTableNameOrOptions extends {
-    schema: keyof DatabaseWithoutInternals
-  }
-    ? keyof DatabaseWithoutInternals[DefaultSchemaTableNameOrOptions["schema"]]["Tables"]
-    : never = never,
-> = DefaultSchemaTableNameOrOptions extends {
-  schema: keyof DatabaseWithoutInternals
-}
-  ? DatabaseWithoutInternals[DefaultSchemaTableNameOrOptions["schema"]]["Tables"][TableName] extends {
-      Insert: infer I
-    }
-    ? I
-    : never
-  : DefaultSchemaTableNameOrOptions extends keyof DefaultSchema["Tables"]
-    ? DefaultSchema["Tables"][DefaultSchemaTableNameOrOptions] extends {
-        Insert: infer I
-      }
-      ? I
-      : never
-    : never
-
-export type TablesUpdate<
-  DefaultSchemaTableNameOrOptions extends
-    | keyof DefaultSchema["Tables"]
-    | { schema: keyof DatabaseWithoutInternals },
-  TableName extends DefaultSchemaTableNameOrOptions extends {
-    schema: keyof DatabaseWithoutInternals
-  }
-    ? keyof DatabaseWithoutInternals[DefaultSchemaTableNameOrOptions["schema"]]["Tables"]
-    : never = never,
-> = DefaultSchemaTableNameOrOptions extends {
-  schema: keyof DatabaseWithoutInternals
-}
-  ? DatabaseWithoutInternals[DefaultSchemaTableNameOrOptions["schema"]]["Tables"][TableName] extends {
-      Update: infer U
-    }
-    ? U
-    : never
-  : DefaultSchemaTableNameOrOptions extends keyof DefaultSchema["Tables"]
-    ? DefaultSchema["Tables"][DefaultSchemaTableNameOrOptions] extends {
-        Update: infer U
-      }
-      ? U
-      : never
-    : never
-
-export type Enums<
-  DefaultSchemaEnumNameOrOptions extends
-    | keyof DefaultSchema["Enums"]
-    | { schema: keyof DatabaseWithoutInternals },
-  EnumName extends DefaultSchemaEnumNameOrOptions extends {
-    schema: keyof DatabaseWithoutInternals
-  }
-    ? keyof DatabaseWithoutInternals[DefaultSchemaEnumNameOrOptions["schema"]]["Enums"]
-    : never = never,
-> = DefaultSchemaEnumNameOrOptions extends {
-  schema: keyof DatabaseWithoutInternals
-}
-  ? DatabaseWithoutInternals[DefaultSchemaEnumNameOrOptions["schema"]]["Enums"][EnumName]
-  : DefaultSchemaEnumNameOrOptions extends keyof DefaultSchema["Enums"]
-    ? DefaultSchema["Enums"][DefaultSchemaEnumNameOrOptions]
-    : never
-
-export type CompositeTypes<
-  PublicCompositeTypeNameOrOptions extends
-    | keyof DefaultSchema["CompositeTypes"]
-    | { schema: keyof DatabaseWithoutInternals },
-  CompositeTypeName extends PublicCompositeTypeNameOrOptions extends {
-    schema: keyof DatabaseWithoutInternals
-  }
-    ? keyof DatabaseWithoutInternals[PublicCompositeTypeNameOrOptions["schema"]]["CompositeTypes"]
-    : never = never,
-> = PublicCompositeTypeNameOrOptions extends {
-  schema: keyof DatabaseWithoutInternals
-}
-  ? DatabaseWithoutInternals[PublicCompositeTypeNameOrOptions["schema"]]["CompositeTypes"][CompositeTypeName]
-  : PublicCompositeTypeNameOrOptions extends keyof DefaultSchema["CompositeTypes"]
-    ? DefaultSchema["CompositeTypes"][PublicCompositeTypeNameOrOptions]
-    : never
-
-export const Constants = {
-  public: {
-    Enums: {
-      agent_status: ["active", "idle", "thinking"],
-      task_status: ["running", "completed", "queued", "failed"],
-    },
-  },
-} as const

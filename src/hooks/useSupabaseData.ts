@@ -93,3 +93,14 @@ export function useTerminalLogs() {
     },
   });
 }
+
+export function useAgentDefinitions() {
+  return useQuery({
+    queryKey: ["agent_definitions"],
+    queryFn: async () => {
+      const { data, error } = await supabase.from("agent_definitions").select("*").order("name");
+      if (error) throw error;
+      return data;
+    },
+  });
+}

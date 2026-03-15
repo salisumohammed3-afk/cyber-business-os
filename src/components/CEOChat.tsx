@@ -104,3 +104,5 @@ export function CEOChat({ conversationId }: { conversationId?: ConversationIdPro
     </div>
   )
 }
+
+export default CEOChat

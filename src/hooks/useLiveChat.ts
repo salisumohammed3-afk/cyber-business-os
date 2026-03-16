@@ -112,14 +112,29 @@ export function useLiveChat(conversationId: string | null) {
       }
 
       // c) Insert pending task
-      const { error: taskError } = await supabase.from('tasks').insert({
+      const { data: newTask, error: taskError } = await supabase.from('tasks').insert({
         conversation_id: convId,
         agent_definition_id: orchestrator.id,
         status: 'pending',
         title: 'Respond to user message',
         description: text,
-      })
+      }).select('id').single()
       if (taskError) throw new Error(taskError.message)
+
+      // d) Invoke the agent runner
+      try {
+        const resp = await fetch('/api/run-agent', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ task_id: newTask.id, conversation_id: convId }),
+        })
+        if (!resp.ok) {
+          const body = await resp.json().catch(() => ({}))
+          console.error('Agent runner error:', body)
+        }
+      } catch (fnError) {
+        console.error('Agent runner error:', fnError)
+      }
     },
     [effectiveConversationId]
   )

@@ -1,5 +1,6 @@
 import { useAgents, type AgentStatus } from "@/hooks/useSupabaseData";
-import { Bot, Cpu, Globe, Megaphone, Rocket, Search, Sparkles } from "lucide-react";
+import { Bot, Cpu, Globe, Maximize2, Megaphone, Rocket, Search, Sparkles } from "lucide-react";
+import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
 
 const iconMap: Record<string, React.ElementType> = {
@@ -24,6 +25,7 @@ const statusLabel: Record<AgentStatus, string> = {
 
 const AgentSidebar = () => {
   const { data: agents = [], isLoading } = useAgents();
+  const navigate = useNavigate();
 
   const handleSurpriseMe = () => {
     toast("🔍 Business Opportunity Search initiated", {
@@ -34,10 +36,17 @@ const AgentSidebar = () => {
 
   return (
     <div className="w-full border-r border-border bg-background flex flex-col h-full">
-      <div className="p-3 border-b border-border">
+      <div className="p-3 border-b border-border flex items-center justify-between">
         <span className="font-mono text-[10px] text-muted-foreground tracking-widest uppercase">
           Agent Grid
         </span>
+        <button
+          onClick={() => navigate("/agents")}
+          className="p-1 rounded-sm hover:bg-secondary text-muted-foreground hover:text-foreground transition-colors"
+          title="Open Agent Dashboard"
+        >
+          <Maximize2 size={12} />
+        </button>
       </div>
 
       <div className="flex-1 overflow-y-auto p-2 space-y-1">

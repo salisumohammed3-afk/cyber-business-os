@@ -1,42 +1,39 @@
+import Anthropic from "@anthropic-ai/sdk";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 
-// ── Types ───────────────────────────────────────────────────────────────────
+// ── SDK type aliases ────────────────────────────────────────────────────────
 
-interface ToolDef {
-  name: string;
-  description: string;
-  input_schema: Record<string, unknown>;
+type BetaContentBlock = Anthropic.Beta.Messages.BetaContentBlock;
+type BetaContentBlockParam = Anthropic.Beta.Messages.BetaContentBlockParam;
+type BetaMessageParam = Anthropic.Beta.Messages.BetaMessageParam;
+type BetaTool = Anthropic.Beta.Messages.BetaTool;
+type BetaToolUseBlock = Anthropic.Beta.Messages.BetaToolUseBlock;
+type BetaTextBlock = Anthropic.Beta.Messages.BetaTextBlock;
+type BetaMCPToolUseBlock = Anthropic.Beta.Messages.BetaMCPToolUseBlock;
+type BetaMCPToolResultBlock = Anthropic.Beta.Messages.BetaMCPToolResultBlock;
+type McpServerDef = Anthropic.Beta.Messages.BetaRequestMCPServerURLDefinition;
+
+interface ToolContext {
+  conversationId: string;
+  parentTaskId: string;
+  supabaseUrl: string;
+  supabaseKey: string;
+  anthropic: Anthropic;
 }
 
-interface ToolResult {
-  type: "tool_result";
-  tool_use_id: string;
-  content: string;
-}
+// ── Local tool definitions (always available to every agent) ────────────────
 
-type AnthropicMessage = {
-  role: "user" | "assistant";
-  content: string | Array<Record<string, unknown>>;
-};
-
-interface AgentToolRow {
-  id: string;
-  tool_name: string;
-  connection_source: string;
-  composio_action_id: string | null;
-  tool_schema: ToolDef | null;
-  is_enabled: boolean;
-}
-
-// ── Fallback tools (used when agent has no rows in agent_tools) ─────────────
-
-function getDefaultTools(): ToolDef[] {
+function getLocalToolDefs(): BetaTool[] {
   return [
     {
       name: "web_search",
       description: "Search the web for current information. Use for market research, competitor analysis, news, and any real-time data.",
-      input_schema: { type: "object", properties: { query: { type: "string", description: "The search query" } }, required: ["query"] },
+      input_schema: {
+        type: "object",
+        properties: { query: { type: "string", description: "The search query" } },
+        required: ["query"],
+      },
     },
     {
       name: "database_query",
@@ -46,7 +43,19 @@ function getDefaultTools(): ToolDef[] {
         properties: {
           table: { type: "string", description: "Table name to query" },
           select: { type: "string", description: 'Columns to select (default: "*")' },
-          filters: { type: "array", description: "Array of filter objects: { column, operator, value }", items: { type: "object", properties: { column: { type: "string" }, operator: { type: "string" }, value: { type: "string" } }, required: ["column", "operator", "value"] } },
+          filters: {
+            type: "array",
+            description: "Array of filter objects: { column, operator, value }",
+            items: {
+              type: "object",
+              properties: {
+                column: { type: "string" },
+                operator: { type: "string" },
+                value: { type: "string" },
+              },
+              required: ["column", "operator", "value"],
+            },
+          },
           order_by: { type: "string", description: "Column to order by" },
           ascending: { type: "boolean", description: "Sort direction (default: true)" },
           limit: { type: "number", description: "Max rows to return (default: 25)" },
@@ -110,178 +119,52 @@ function getDefaultTools(): ToolDef[] {
   ];
 }
 
-// ── Dynamic tool loading from agent_tools table ─────────────────────────────
+// ── MCP tool allowlist from agent_tools table ───────────────────────────────
+// Reads which external (Rube/MCP) tools an agent is allowed to use.
+// Returns tool names that become the allowed_tools filter on the MCP server.
 
-async function getToolsForAgent(
+async function getMcpToolAllowlist(
   supabase: SupabaseClient,
   agentDefId: string
-): Promise<{ tools: ToolDef[]; toolMap: Map<string, AgentToolRow> }> {
-  const { data: rows, error } = await supabase
+): Promise<string[]> {
+  const { data: rows } = await supabase
     .from("agent_tools")
-    .select("id, tool_name, connection_source, composio_action_id, tool_schema, is_enabled")
+    .select("tool_name, connection_source")
     .eq("agent_id", agentDefId)
-    .eq("is_enabled", true);
+    .eq("is_enabled", true)
+    .in("connection_source", ["composio", "mcp"]);
 
-  if (error || !rows || rows.length === 0) {
-    const defaults = getDefaultTools();
-    const fallbackMap = new Map<string, AgentToolRow>();
-    for (const t of defaults) {
-      fallbackMap.set(t.name, {
-        id: "",
-        tool_name: t.name,
-        connection_source: "internal",
-        composio_action_id: null,
-        tool_schema: t,
-        is_enabled: true,
-      });
-    }
-    return { tools: defaults, toolMap: fallbackMap };
-  }
-
-  const tools: ToolDef[] = [];
-  const toolMap = new Map<string, AgentToolRow>();
-
-  for (const row of rows as AgentToolRow[]) {
-    if (!row.tool_schema || !row.tool_name) continue;
-    const schema = row.tool_schema as ToolDef;
-    tools.push(schema);
-    toolMap.set(schema.name, row);
-  }
-
-  if (tools.length === 0) {
-    const defaults = getDefaultTools();
-    const fallbackMap = new Map<string, AgentToolRow>();
-    for (const t of defaults) {
-      fallbackMap.set(t.name, {
-        id: "",
-        tool_name: t.name,
-        connection_source: "internal",
-        composio_action_id: null,
-        tool_schema: t,
-        is_enabled: true,
-      });
-    }
-    return { tools: defaults, toolMap: fallbackMap };
-  }
-
-  return { tools, toolMap };
+  if (!rows || rows.length === 0) return [];
+  return rows.map((r: { tool_name: string }) => r.tool_name);
 }
 
-// ── Composio execution ──────────────────────────────────────────────────────
+// ── Build MCP servers config ────────────────────────────────────────────────
+// Only returns a config when RUBE_MCP_URL + RUBE_MCP_TOKEN are set AND the
+// agent has at least one MCP tool allowed.
 
-async function executeComposioAction(
-  actionId: string,
-  input: Record<string, unknown>,
-  entityId?: string
-): Promise<string> {
-  const composioKey = process.env.COMPOSIO_API_KEY;
-  if (!composioKey) {
-    return JSON.stringify({
-      error: "Composio not configured (COMPOSIO_API_KEY missing)",
-      suggestion: "Add COMPOSIO_API_KEY to environment variables from your Rube/Composio dashboard.",
-    });
-  }
+function buildMcpServers(allowlist: string[]): McpServerDef[] | undefined {
+  const url = process.env.RUBE_MCP_URL;
+  const token = process.env.RUBE_MCP_TOKEN;
+  if (!url || !token || allowlist.length === 0) return undefined;
 
-  try {
-    const resp = await fetch(
-      `https://backend.composio.dev/api/v2/actions/${encodeURIComponent(actionId)}/execute`,
-      {
-        method: "POST",
-        headers: {
-          "x-api-key": composioKey,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          input,
-          entityId: entityId || "default",
-        }),
-      }
-    );
-
-    if (!resp.ok) {
-      const errText = await resp.text();
-      return JSON.stringify({ error: `Composio API error (${resp.status}): ${errText.slice(0, 500)}` });
-    }
-
-    const result = await resp.json();
-
-    if (result.error) {
-      return JSON.stringify({ error: result.error });
-    }
-
-    const data = result.data ?? result;
-    return typeof data === "string" ? data : JSON.stringify(data, null, 2);
-  } catch (e) {
-    return JSON.stringify({
-      error: `Composio execution error: ${e instanceof Error ? e.message : "unknown"}`,
-    });
-  }
+  return [
+    {
+      type: "url",
+      url,
+      name: "rube",
+      authorization_token: token,
+      tool_configuration: { allowed_tools: allowlist },
+    },
+  ];
 }
 
-// ── Tool routing ────────────────────────────────────────────────────────────
+// ── Local tool execution ────────────────────────────────────────────────────
 
-async function executeTool(
+async function executeLocalTool(
   toolName: string,
   toolInput: Record<string, unknown>,
   supabase: SupabaseClient,
-  context: {
-    conversationId: string;
-    parentTaskId: string;
-    anthropicKey: string;
-    supabaseUrl: string;
-    supabaseKey: string;
-  },
-  toolMap: Map<string, AgentToolRow>
-): Promise<string> {
-  const toolRow = toolMap.get(toolName);
-
-  if (!toolRow) {
-    return executeInternalTool(toolName, toolInput, supabase, context);
-  }
-
-  switch (toolRow.connection_source) {
-    case "composio":
-      if (!toolRow.composio_action_id) {
-        return JSON.stringify({ error: `No composio_action_id configured for tool: ${toolName}` });
-      }
-      return executeComposioAction(toolRow.composio_action_id, toolInput);
-
-    case "direct":
-      return executeDirectTool(toolName, toolInput);
-
-    case "internal":
-    default:
-      return executeInternalTool(toolName, toolInput, supabase, context);
-  }
-}
-
-// ── Direct API tools (API-key based, no Composio) ───────────────────────────
-
-async function executeDirectTool(
-  toolName: string,
-  toolInput: Record<string, unknown>
-): Promise<string> {
-  switch (toolName) {
-    case "web_search":
-      return executeWebSearch(toolInput.query as string);
-    default:
-      return JSON.stringify({ error: `Unknown direct tool: ${toolName}` });
-  }
-}
-
-// ── Internal tools (run inside the runner) ──────────────────────────────────
-
-async function executeInternalTool(
-  toolName: string,
-  toolInput: Record<string, unknown>,
-  supabase: SupabaseClient,
-  context: {
-    conversationId: string;
-    parentTaskId: string;
-    anthropicKey: string;
-    supabaseUrl: string;
-    supabaseKey: string;
-  }
+  context: ToolContext
 ): Promise<string> {
   switch (toolName) {
     case "web_search":
@@ -297,7 +180,7 @@ async function executeInternalTool(
     case "delegate_task":
       return executeDelegateTask(supabase, toolInput, context);
     default:
-      return JSON.stringify({ error: `Unknown internal tool: ${toolName}` });
+      return JSON.stringify({ error: `Unknown tool: ${toolName}` });
   }
 }
 
@@ -346,9 +229,10 @@ async function executeDatabaseQuery(supabase: SupabaseClient, input: Record<stri
 
     let query = supabase.from(table).select(select);
     for (const f of filters) {
-      const method = f.operator as "eq" | "neq" | "gt" | "lt" | "gte" | "lte" | "like" | "ilike";
-      if (typeof query[method] === "function") {
-        query = query[method](f.column, f.value);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const method = f.operator as string;
+      if (typeof (query as any)[method] === "function") {
+        query = (query as any)[method](f.column, f.value);
       }
     }
     if (orderBy) query = query.order(orderBy, { ascending });
@@ -447,13 +331,7 @@ async function executeRecallMemories(supabase: SupabaseClient, input: Record<str
 async function executeDelegateTask(
   supabase: SupabaseClient,
   input: Record<string, unknown>,
-  context: {
-    conversationId: string;
-    parentTaskId: string;
-    anthropicKey: string;
-    supabaseUrl: string;
-    supabaseKey: string;
-  }
+  context: ToolContext
 ): Promise<string> {
   try {
     const agentSlug = input.agent_slug as string;
@@ -488,13 +366,14 @@ async function executeDelegateTask(
 
     if (taskErr) return JSON.stringify({ error: taskErr.message });
 
-    // Load the sub-agent's tools from agent_tools
-    const { tools: subTools, toolMap: subToolMap } = await getToolsForAgent(supabase, agentDef.id);
+    const mcpAllowlist = await getMcpToolAllowlist(supabase, agentDef.id);
+    const mcpServers = buildMcpServers(mcpAllowlist);
+    const localTools = getLocalToolDefs();
 
     const subSystemPrompt = agentDef.system_prompt ||
       `You are the ${agentDef.name} agent. ${agentDef.description || ""}`;
 
-    const subMessages: AnthropicMessage[] = [
+    const subMessages: BetaMessageParam[] = [
       {
         role: "user",
         content: extraContext
@@ -503,82 +382,74 @@ async function executeDelegateTask(
       },
     ];
 
-    // Sub-agent gets its own agentic loop with its own tools
     let subTurnCount = 0;
     const subMaxTurns = agentDef.max_turns || 5;
 
     while (subTurnCount < subMaxTurns) {
       subTurnCount++;
 
-      const anthropicRes = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-api-key": context.anthropicKey,
-          "anthropic-version": "2023-06-01",
-        },
-        body: JSON.stringify({
-          model: agentDef.model || "claude-sonnet-4-20250514",
-          max_tokens: 4096,
-          temperature: parseFloat(agentDef.temperature) || 0.7,
-          system: subSystemPrompt,
-          messages: subMessages,
-          ...(subTools.length > 0 ? { tools: subTools } : {}),
-        }),
+      const response = await context.anthropic.beta.messages.create({
+        model: agentDef.model || "claude-sonnet-4-20250514",
+        max_tokens: 4096,
+        temperature: parseFloat(agentDef.temperature) || 0.7,
+        system: subSystemPrompt,
+        messages: subMessages,
+        tools: localTools,
+        ...(mcpServers ? { mcp_servers: mcpServers } : {}),
+        betas: mcpServers ? ["mcp-client-2025-04-04"] : [],
       });
 
-      if (!anthropicRes.ok) {
-        const errBody = await anthropicRes.text();
-        await supabase.from("tasks").update({
-          status: "failed",
-          error_message: errBody,
-          completed_at: new Date().toISOString(),
-        }).eq("id", childTask.id);
-        return JSON.stringify({ error: `Sub-agent failed: ${errBody}` });
+      for (const block of response.content) {
+        if (block.type === "mcp_tool_use") {
+          await termLog(supabase, `[${agentDef.slug}] MCP tool: ${block.name} (${block.server_name})`, {
+            taskId: childTask.id, agentSlug: agentDef.slug, logType: "tool_call",
+          });
+        }
       }
 
-      const anthropicData = await anthropicRes.json();
+      const toolUseBlocks = response.content.filter(
+        (b): b is BetaToolUseBlock => b.type === "tool_use"
+      );
 
-      if (anthropicData.stop_reason === "tool_use") {
-        subMessages.push({ role: "assistant", content: anthropicData.content });
+      if (response.stop_reason === "tool_use" && toolUseBlocks.length > 0) {
+        subMessages.push({
+          role: "assistant",
+          content: response.content as unknown as BetaContentBlockParam[],
+        });
 
-        const toolResults: ToolResult[] = [];
-        for (const block of anthropicData.content) {
-          if (block.type === "tool_use") {
-            await termLog(supabase, `[${agentDef.slug}] Using tool: ${block.name}`, {
-              taskId: childTask.id, agentSlug: agentDef.slug, logType: "tool_call",
-            });
+        const toolResults: BetaContentBlockParam[] = [];
+        for (const block of toolUseBlocks) {
+          await termLog(supabase, `[${agentDef.slug}] Using tool: ${block.name}`, {
+            taskId: childTask.id, agentSlug: agentDef.slug, logType: "tool_call",
+          });
 
-            const output = await executeTool(
-              block.name,
-              block.input as Record<string, unknown>,
-              supabase,
-              context,
-              subToolMap
-            );
+          const output = await executeLocalTool(
+            block.name,
+            block.input as Record<string, unknown>,
+            supabase,
+            context
+          );
 
-            await termLog(supabase, `[${agentDef.slug}] Tool result (${block.name}): ${output.slice(0, 100)}...`, {
-              taskId: childTask.id, agentSlug: agentDef.slug, logType: "tool_result",
-            });
+          await termLog(supabase, `[${agentDef.slug}] Tool result (${block.name}): ${output.slice(0, 100)}...`, {
+            taskId: childTask.id, agentSlug: agentDef.slug, logType: "tool_result",
+          });
 
-            toolResults.push({ type: "tool_result", tool_use_id: block.id, content: output });
-          }
+          toolResults.push({ type: "tool_result", tool_use_id: block.id, content: output });
         }
 
-        subMessages.push({ role: "user", content: toolResults as unknown as string });
+        subMessages.push({ role: "user", content: toolResults });
         continue;
       }
 
-      // Sub-agent done
-      const result = anthropicData.content
-        ?.filter((b: { type: string }) => b.type === "text")
-        .map((b: { text: string }) => b.text)
+      const result = response.content
+        .filter((b): b is BetaTextBlock => b.type === "text")
+        .map(b => b.text)
         .join("") || "No response from sub-agent.";
 
       await supabase.from("task_results").insert({
         task_id: childTask.id,
         result_type: "text",
-        data: { content: result, model: agentDef.model, usage: anthropicData.usage, turns: subTurnCount },
+        data: { content: result, model: agentDef.model, usage: response.usage, turns: subTurnCount },
       });
 
       await supabase.from("tasks").update({
@@ -588,6 +459,11 @@ async function executeDelegateTask(
 
       return JSON.stringify({ agent: agentDef.name, task_id: childTask.id, result });
     }
+
+    await supabase.from("tasks").update({
+      status: "completed",
+      completed_at: new Date().toISOString(),
+    }).eq("id", childTask.id);
 
     return JSON.stringify({ agent: agentDef.name, task_id: childTask.id, result: "Sub-agent hit max turns." });
   } catch (e) {
@@ -645,6 +521,24 @@ async function getRelevantMemories(supabase: SupabaseClient, userMessage: string
   }
 }
 
+// ── Helpers ─────────────────────────────────────────────────────────────────
+
+function isToolUseBlock(b: BetaContentBlock): b is BetaToolUseBlock {
+  return b.type === "tool_use";
+}
+
+function isTextBlock(b: BetaContentBlock): b is BetaTextBlock {
+  return b.type === "text";
+}
+
+function isMcpToolUseBlock(b: BetaContentBlock): b is BetaMCPToolUseBlock {
+  return b.type === "mcp_tool_use";
+}
+
+function isMcpToolResultBlock(b: BetaContentBlock): b is BetaMCPToolResultBlock {
+  return b.type === "mcp_tool_result";
+}
+
 // ── Main handler ────────────────────────────────────────────────────────────
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
@@ -667,6 +561,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (!anthropicKey)
     return res.status(500).json({ error: "ANTHROPIC_API_KEY not configured" });
 
+  const anthropic = new Anthropic({ apiKey: anthropicKey });
   const supabase = createClient(supabaseUrl, supabaseKey);
 
   try {
@@ -724,14 +619,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       }
     }
 
-    // 3. Load tools for this agent from agent_tools table
-    const { tools, toolMap } = agentDefId
-      ? await getToolsForAgent(supabase, agentDefId)
-      : { tools: getDefaultTools(), toolMap: new Map<string, AgentToolRow>() };
+    // 3. Load tools
+    const localTools = getLocalToolDefs();
+    const mcpAllowlist = agentDefId ? await getMcpToolAllowlist(supabase, agentDefId) : [];
+    const mcpServers = buildMcpServers(mcpAllowlist);
 
-    const composioToolCount = [...toolMap.values()].filter(t => t.connection_source === "composio").length;
-
-    await termLog(supabase, `Loaded ${tools.length} tools (${composioToolCount} via Composio)`, {
+    await termLog(supabase, `Loaded ${localTools.length} local tools, ${mcpAllowlist.length} MCP tools${mcpServers ? " (Rube connected)" : ""}`, {
       taskId: task_id, agentSlug: agentSlugForLog, logType: "tools_loaded",
     });
 
@@ -742,9 +635,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       .eq("conversation_id", conversation_id)
       .order("created_at", { ascending: true });
 
-    const messages: AnthropicMessage[] = (history ?? []).map(
+    const messages: BetaMessageParam[] = (history ?? []).map(
       (m: { role: string; content: string }) => ({
-        role: m.role === "user" ? "user" : "assistant",
+        role: (m.role === "user" ? "user" : "assistant") as "user" | "assistant",
         content: m.content || "",
       })
     );
@@ -765,11 +658,20 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       }
     }
 
-    // 6. Agentic loop
-    let turnCount = 0;
-    const allToolCalls: Array<{ tool: string; input: unknown; output: string }> = [];
+    // 6. Build context for tool execution
+    const toolContext: ToolContext = {
+      conversationId: conversation_id,
+      parentTaskId: task_id,
+      supabaseUrl,
+      supabaseKey,
+      anthropic,
+    };
 
-    await termLog(supabase, `Starting agentic loop — ${tools.length} tools available, max ${maxTurns} turns`, {
+    // 7. Agentic loop
+    let turnCount = 0;
+    const allToolCalls: Array<{ tool: string; input: unknown; output: string; source: string }> = [];
+
+    await termLog(supabase, `Starting agentic loop — ${localTools.length} local + ${mcpAllowlist.length} MCP tools, max ${maxTurns} turns`, {
       taskId: task_id, agentSlug: agentSlugForLog, logType: "loop_start",
     });
 
@@ -780,76 +682,77 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         taskId: task_id, agentSlug: agentSlugForLog, logType: "llm_call",
       });
 
-      const anthropicRes = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-api-key": anthropicKey,
-          "anthropic-version": "2023-06-01",
-        },
-        body: JSON.stringify({
-          model,
-          max_tokens: 4096,
-          temperature,
-          system: systemPrompt,
-          messages,
-          tools,
-        }),
+      const response = await anthropic.beta.messages.create({
+        model,
+        max_tokens: 4096,
+        temperature,
+        system: systemPrompt,
+        messages,
+        tools: localTools,
+        ...(mcpServers ? { mcp_servers: mcpServers } : {}),
+        betas: mcpServers ? ["mcp-client-2025-04-04"] : [],
       });
 
-      if (!anthropicRes.ok) {
-        const errBody = await anthropicRes.text();
-        await supabase.from("tasks").update({
-          status: "failed",
-          error_message: errBody,
-          completed_at: new Date().toISOString(),
-        }).eq("id", task_id);
-        return res.status(502).json({ error: `Anthropic API error: ${errBody}` });
+      // Log any MCP tool activity (already resolved server-side by Anthropic)
+      for (const block of response.content) {
+        if (isMcpToolUseBlock(block)) {
+          const inputSummary = JSON.stringify(block.input).slice(0, 120);
+          await termLog(supabase, `MCP tool: ${block.name} (${block.server_name}) — ${inputSummary}`, {
+            taskId: task_id, agentSlug: agentSlugForLog, logType: "tool_call",
+          });
+          allToolCalls.push({ tool: block.name, input: block.input, output: "(resolved by MCP)", source: "mcp" });
+        }
+        if (isMcpToolResultBlock(block)) {
+          const preview = typeof block.content === "string"
+            ? block.content.slice(0, 100)
+            : JSON.stringify(block.content).slice(0, 100);
+          await termLog(supabase, `MCP result: ${preview}${preview.length >= 100 ? "..." : ""}`, {
+            taskId: task_id, agentSlug: agentSlugForLog, logType: "tool_result",
+          });
+        }
       }
 
-      const anthropicData = await anthropicRes.json();
+      // Check for local tool calls that need our execution
+      const toolUseBlocks = response.content.filter(isToolUseBlock);
 
-      if (anthropicData.stop_reason === "tool_use") {
-        messages.push({ role: "assistant", content: anthropicData.content });
+      if (response.stop_reason === "tool_use" && toolUseBlocks.length > 0) {
+        messages.push({
+          role: "assistant",
+          content: response.content as unknown as BetaContentBlockParam[],
+        });
 
-        const toolResults: ToolResult[] = [];
-        for (const block of anthropicData.content) {
-          if (block.type === "tool_use") {
-            const inputSummary = JSON.stringify(block.input).slice(0, 120);
-            const toolRow = toolMap.get(block.name);
-            const source = toolRow?.connection_source || "internal";
+        const toolResults: BetaContentBlockParam[] = [];
+        for (const block of toolUseBlocks) {
+          const inputSummary = JSON.stringify(block.input).slice(0, 120);
+          await termLog(supabase, `Using tool: ${block.name} — ${inputSummary}`, {
+            taskId: task_id, agentSlug: agentSlugForLog, logType: "tool_call",
+          });
 
-            await termLog(supabase, `Using tool: ${block.name} [${source}] — ${inputSummary}`, {
-              taskId: task_id, agentSlug: agentSlugForLog, logType: "tool_call",
-            });
+          const output = await executeLocalTool(
+            block.name,
+            block.input as Record<string, unknown>,
+            supabase,
+            toolContext
+          );
 
-            const output = await executeTool(
-              block.name,
-              block.input as Record<string, unknown>,
-              supabase,
-              { conversationId: conversation_id, parentTaskId: task_id, anthropicKey, supabaseUrl, supabaseKey },
-              toolMap
-            );
+          const outputPreview = output.slice(0, 100);
+          await termLog(supabase, `Tool result (${block.name}): ${outputPreview}${output.length > 100 ? "..." : ""}`, {
+            taskId: task_id, agentSlug: agentSlugForLog, logType: "tool_result",
+          });
 
-            const outputPreview = output.slice(0, 100);
-            await termLog(supabase, `Tool result (${block.name}): ${outputPreview}${output.length > 100 ? "..." : ""}`, {
-              taskId: task_id, agentSlug: agentSlugForLog, logType: "tool_result",
-            });
-
-            toolResults.push({ type: "tool_result", tool_use_id: block.id, content: output });
-            allToolCalls.push({ tool: block.name, input: block.input, output });
-          }
+          toolResults.push({ type: "tool_result", tool_use_id: block.id, content: output });
+          allToolCalls.push({ tool: block.name, input: block.input, output, source: "local" });
         }
 
-        messages.push({ role: "user", content: toolResults as unknown as string });
+        messages.push({ role: "user", content: toolResults });
         continue;
       }
 
-      // Model is done
+      // Model is done — extract text response
       const assistantContent =
-        anthropicData.content
-          ?.filter((b: { type: string }) => b.type === "text")
-          .map((b: { text: string }) => b.text)
+        response.content
+          .filter(isTextBlock)
+          .map(b => b.text)
           .join("") || "I received your message but had no response.";
 
       const { error: insertErr } = await supabase.from("chat_messages").insert({
@@ -860,10 +763,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         tool_calls: allToolCalls.length > 0 ? allToolCalls : null,
         metadata: {
           model,
-          usage: anthropicData.usage,
-          stop_reason: anthropicData.stop_reason,
+          usage: response.usage,
+          stop_reason: response.stop_reason,
           turns: turnCount,
-          tools_used: allToolCalls.map((tc) => tc.tool),
+          tools_used: allToolCalls.map(tc => tc.tool),
         },
       });
 
@@ -888,7 +791,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(200).json({
         ok: true,
         content: assistantContent,
-        tools_used: allToolCalls.map((tc) => tc.tool),
+        tools_used: allToolCalls.map(tc => tc.tool),
         turns: turnCount,
       });
     }
@@ -896,7 +799,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     // Max turns reached
     const finalContent =
       "I hit the maximum number of processing steps. Here's what I accomplished so far: " +
-      allToolCalls.map((tc) => `Used ${tc.tool}`).join(", ");
+      allToolCalls.map(tc => `Used ${tc.tool}`).join(", ");
 
     await supabase.from("chat_messages").insert({
       conversation_id,

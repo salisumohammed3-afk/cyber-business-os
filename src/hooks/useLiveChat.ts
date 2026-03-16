@@ -121,7 +121,7 @@ export function useLiveChat(conversationId: string | null) {
       }).select('id').single()
       if (taskError) throw new Error(taskError.message)
 
-      // d) Invoke the agent runner
+      // d) Invoke the agent runner and refetch messages when it completes
       try {
         const resp = await fetch('/api/run-agent', {
           method: 'POST',
@@ -134,6 +134,16 @@ export function useLiveChat(conversationId: string | null) {
         }
       } catch (fnError) {
         console.error('Agent runner error:', fnError)
+      }
+
+      // e) Refetch messages to pick up the orchestrator reply
+      const { data: refreshed } = await supabase
+        .from('chat_messages')
+        .select('*')
+        .eq('conversation_id', convId)
+        .order('created_at', { ascending: true })
+      if (refreshed) {
+        setMessages(refreshed as ChatMessageRow[])
       }
     },
     [effectiveConversationId]

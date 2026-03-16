@@ -6,9 +6,12 @@ import TaskBlueprintModal from "./TaskBlueprintModal";
 const statusConfig: Record<string, { icon: React.ElementType; color: string; bg: string; label: string; animate?: boolean }> = {
   completed: { icon: CheckCircle2, color: "text-emerald", bg: "bg-emerald/10", label: "completed" },
   running: { icon: Loader2, color: "text-amber", bg: "bg-amber/10", label: "running", animate: true },
+  pending: { icon: Clock, color: "text-muted-foreground", bg: "bg-secondary", label: "pending" },
   queued: { icon: Clock, color: "text-muted-foreground", bg: "bg-secondary", label: "queued" },
   failed: { icon: AlertCircle, color: "text-destructive", bg: "bg-destructive/10", label: "failed" },
 };
+
+const fallbackConfig = { icon: Clock, color: "text-muted-foreground", bg: "bg-secondary", label: "unknown" };
 
 const ActionPipeline = () => {
   const { data: tasks = [], isLoading } = useTasks();
@@ -41,9 +44,10 @@ const ActionPipeline = () => {
             <div className="p-4 text-xs text-muted-foreground">Loading tasks...</div>
           ) : (
             tasks.map((task) => {
-              const config = statusConfig[task.status];
+              const config = statusConfig[task.status] || fallbackConfig;
               const StatusIcon = config.icon;
               const isExpanded = expandedLogs.has(task.id);
+              const progress = task.status === "completed" ? 100 : task.status === "running" ? 50 : (task.progress ?? 0);
 
               return (
                 <div
@@ -58,16 +62,16 @@ const ActionPipeline = () => {
                     />
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-2 mb-0.5">
-                        <span className="font-mono text-[10px] text-muted-foreground">{task.id}</span>
+                        <span className="font-mono text-[10px] text-muted-foreground">{task.id.slice(0, 8)}</span>
                         <span className={`text-[9px] font-mono px-1.5 py-0.5 rounded-sm ${config.bg} ${config.color}`}>
                           {config.label}
                         </span>
                       </div>
-                      <p className="text-xs text-foreground font-medium truncate">{task.title}</p>
+                      <p className="text-xs text-foreground font-medium truncate">{task.title || task.description || "Untitled task"}</p>
                       <div className="flex items-center gap-2 mt-1">
-                        <span className="text-[10px] text-muted-foreground">{task.agent_name}</span>
+                        <span className="text-[10px] text-muted-foreground">{task.agent_name || "orchestrator"}</span>
                         <span className="text-[10px] text-muted-foreground">·</span>
-                        <span className="text-[10px] text-muted-foreground">{task.timestamp}</span>
+                        <span className="text-[10px] text-muted-foreground">{task.timestamp || task.created_at || ""}</span>
                       </div>
                     </div>
                   </div>
@@ -77,7 +81,7 @@ const ActionPipeline = () => {
                       className={`h-full transition-all duration-500 rounded-sm ${
                         task.status === "completed" ? "bg-emerald" : task.status === "running" ? "bg-amber" : "bg-muted-foreground/30"
                       }`}
-                      style={{ width: `${task.progress}%` }}
+                      style={{ width: `${progress}%` }}
                     />
                   </div>
 
@@ -91,7 +95,7 @@ const ActionPipeline = () => {
 
                   {isExpanded && (
                     <pre className="mt-2 p-2 bg-secondary rounded-sm text-[10px] font-mono text-muted-foreground overflow-x-auto whitespace-pre-wrap leading-relaxed border border-border">
-                      {task.tool_output}
+                      {task.tool_output || task.error_message || "No output yet."}
                     </pre>
                   )}
                 </div>

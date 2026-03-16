@@ -15,14 +15,20 @@ export interface Agent {
 export interface Task {
   id: string;
   title: string;
-  agent_id: string;
-  agent_name: string;
-  status: "running" | "completed" | "queued" | "failed";
-  progress: number;
-  timestamp: string;
-  reasoning: string;
-  tool_output: string;
-  category: string;
+  agent_id?: string;
+  agent_name?: string;
+  status: "pending" | "running" | "completed" | "queued" | "failed";
+  progress?: number;
+  timestamp?: string;
+  reasoning?: string;
+  tool_output?: string;
+  category?: string;
+  description?: string;
+  agent_definition_id?: string;
+  created_at?: string;
+  started_at?: string;
+  completed_at?: string;
+  error_message?: string;
 }
 
 export interface ChatMessage {

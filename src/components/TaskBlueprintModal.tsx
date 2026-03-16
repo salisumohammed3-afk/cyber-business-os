@@ -29,12 +29,12 @@ const TaskBlueprintModal = ({ task, onClose }: Props) => {
           >
             <div className="flex items-center justify-between p-4 border-b border-border">
               <div>
-                <span className="font-mono text-[10px] text-muted-foreground">{task.id}</span>
-                <h2 className="text-sm font-medium text-foreground mt-0.5">{task.title}</h2>
+                <span className="font-mono text-[10px] text-muted-foreground">{task.id.slice(0, 8)}</span>
+                <h2 className="text-sm font-medium text-foreground mt-0.5">{task.title || task.description || "Untitled task"}</h2>
                 <div className="flex items-center gap-2 mt-1">
-                  <span className="text-[10px] text-muted-foreground">{task.agent_name}</span>
+                  <span className="text-[10px] text-muted-foreground">{task.agent_name || "orchestrator"}</span>
                   <span className="text-[10px] text-muted-foreground">·</span>
-                  <span className="text-[10px] text-muted-foreground">{task.timestamp}</span>
+                  <span className="text-[10px] text-muted-foreground">{task.timestamp || task.created_at || ""}</span>
                 </div>
               </div>
               <button
@@ -54,7 +54,7 @@ const TaskBlueprintModal = ({ task, onClose }: Props) => {
                   </span>
                 </div>
                 <p className="text-xs text-foreground leading-relaxed bg-secondary p-3 rounded-sm border border-border">
-                  {task.reasoning}
+                  {task.reasoning || task.description || "No reasoning available."}
                 </p>
               </div>
 
@@ -66,19 +66,19 @@ const TaskBlueprintModal = ({ task, onClose }: Props) => {
                   </span>
                 </div>
                 <pre className="text-[10px] font-mono text-muted-foreground bg-secondary p-3 rounded-sm border border-border overflow-x-auto whitespace-pre-wrap leading-relaxed">
-                  {task.tool_output}
+                  {task.tool_output || task.error_message || "No output yet."}
                 </pre>
               </div>
             </div>
 
             <div className="p-3 border-t border-border flex items-center justify-between">
               <span className="font-mono text-[9px] text-muted-foreground">
-                Task Blueprint · {task.category}
+                Task Blueprint{task.category ? ` · ${task.category}` : ""}
               </span>
               <div className="h-1 w-24 bg-secondary rounded-sm overflow-hidden">
                 <div
                   className={`h-full rounded-sm ${task.status === "completed" ? "bg-emerald" : "bg-amber"}`}
-                  style={{ width: `${task.progress}%` }}
+                  style={{ width: `${task.status === "completed" ? 100 : task.status === "running" ? 50 : (task.progress ?? 0)}%` }}
                 />
               </div>
             </div>

@@ -28,24 +28,57 @@ const LiveTerminal = () => {
   const [activeAgent, setActiveAgent] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
 
-  // Fetch recent logs on mount
+  // Fetch logs and poll for new ones
   useEffect(() => {
-    supabase
-      .from("terminal_logs")
-      .select("*")
-      .order("created_at", { ascending: false })
-      .limit(30)
-      .then(({ data }) => {
-        if (data) {
-          setLines(data.reverse() as LogEntry[]);
-          const latest = data[0];
+    let lastSeenId: string | null = null;
+
+    const fetchLogs = async (initial = false) => {
+      const limit = initial ? 30 : 50;
+      let query = supabase
+        .from("terminal_logs")
+        .select("*")
+        .order("created_at", { ascending: false })
+        .limit(limit);
+
+      if (!initial && lastSeenId) {
+        query = supabase
+          .from("terminal_logs")
+          .select("*")
+          .gt("created_at", lines[lines.length - 1]?.created_at || "2000-01-01")
+          .order("created_at", { ascending: true })
+          .limit(20);
+      }
+
+      const { data } = await query;
+      if (!data || data.length === 0) return;
+
+      if (initial) {
+        const sorted = data.reverse();
+        setLines(sorted as LogEntry[]);
+        lastSeenId = sorted[sorted.length - 1]?.id || null;
+        const latest = data[0];
+        if (latest?.agent_slug) setActiveAgent(latest.agent_slug);
+      } else {
+        const sorted = data as LogEntry[];
+        if (sorted.length > 0 && sorted[sorted.length - 1].id !== lastSeenId) {
+          setLines((prev) => {
+            const existingIds = new Set(prev.map(l => l.id));
+            const newEntries = sorted.filter(l => !existingIds.has(l.id));
+            if (newEntries.length === 0) return prev;
+            const next = [...prev, ...newEntries];
+            return next.length > 100 ? next.slice(-100) : next;
+          });
+          lastSeenId = sorted[sorted.length - 1].id;
+          const latest = sorted[sorted.length - 1];
           if (latest?.agent_slug) setActiveAgent(latest.agent_slug);
         }
-      });
-  }, []);
+      }
+    };
 
-  // Subscribe to new log inserts via realtime
-  useEffect(() => {
+    fetchLogs(true);
+    const interval = setInterval(() => fetchLogs(false), 2000);
+
+    // Also try realtime (works when Supabase WS is available)
     const channel = supabase
       .channel("terminal_logs_realtime")
       .on(
@@ -54,16 +87,18 @@ const LiveTerminal = () => {
         (payload) => {
           const row = payload.new as LogEntry;
           setLines((prev) => {
+            if (prev.some(l => l.id === row.id)) return prev;
             const next = [...prev, row];
-            // Keep last 100 lines in memory
             return next.length > 100 ? next.slice(-100) : next;
           });
           if (row.agent_slug) setActiveAgent(row.agent_slug);
+          lastSeenId = row.id;
         }
       )
       .subscribe();
 
     return () => {
+      clearInterval(interval);
       supabase.removeChannel(channel);
     };
   }, []);

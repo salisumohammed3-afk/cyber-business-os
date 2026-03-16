@@ -1,6 +1,5 @@
 -- Align schema to match types.ts and seed orchestrator agent
--- Uses IF NOT EXISTS / ADD COLUMN IF NOT EXISTS so it's safe to run
--- even if tables were created via the Supabase dashboard.
+-- Uses IF NOT EXISTS so it's safe to run even if tables were created via dashboard.
 
 -- ── New tables ──────────────────────────────────────────────
 
@@ -66,22 +65,20 @@ CREATE TABLE IF NOT EXISTS public.memories (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- ── Evolve chat_messages (add columns the new schema needs) ──
+-- ── Evolve chat_messages ──
 
 ALTER TABLE public.chat_messages
   ADD COLUMN IF NOT EXISTS conversation_id UUID,
   ADD COLUMN IF NOT EXISTS tool_calls JSONB,
   ADD COLUMN IF NOT EXISTS metadata JSONB;
 
--- Allow content to be nullable (orchestrator may send tool_calls only)
 ALTER TABLE public.chat_messages ALTER COLUMN content DROP NOT NULL;
 
--- Relax the role CHECK so we can use 'assistant' alongside 'orchestrator'
 ALTER TABLE public.chat_messages DROP CONSTRAINT IF EXISTS chat_messages_role_check;
 ALTER TABLE public.chat_messages
   ADD CONSTRAINT chat_messages_role_check CHECK (role IN ('user', 'orchestrator', 'assistant'));
 
--- ── Evolve tasks table (add new columns) ──
+-- ── Evolve tasks ──
 
 DO $$ BEGIN
   ALTER TYPE public.task_status ADD VALUE IF NOT EXISTS 'pending';
@@ -106,12 +103,11 @@ ALTER TABLE public.tasks
   ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ,
   ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ;
 
--- Make agent_id nullable (new tasks use agent_definition_id)
 ALTER TABLE public.tasks ALTER COLUMN agent_id DROP NOT NULL;
 ALTER TABLE public.tasks ALTER COLUMN agent_name DROP NOT NULL;
 ALTER TABLE public.tasks ALTER COLUMN title DROP NOT NULL;
 
--- ── RLS on new tables ──
+-- ── RLS ──
 
 ALTER TABLE public.users ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.conversations ENABLE ROW LEVEL SECURITY;
@@ -120,21 +116,43 @@ ALTER TABLE public.agent_tools ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.task_results ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.memories ENABLE ROW LEVEL SECURITY;
 
--- Public read
-CREATE POLICY IF NOT EXISTS "Public read users" ON public.users FOR SELECT USING (true);
-CREATE POLICY IF NOT EXISTS "Public read conversations" ON public.conversations FOR SELECT USING (true);
-CREATE POLICY IF NOT EXISTS "Public read agent_definitions" ON public.agent_definitions FOR SELECT USING (true);
-CREATE POLICY IF NOT EXISTS "Public read agent_tools" ON public.agent_tools FOR SELECT USING (true);
-CREATE POLICY IF NOT EXISTS "Public read task_results" ON public.task_results FOR SELECT USING (true);
-CREATE POLICY IF NOT EXISTS "Public read memories" ON public.memories FOR SELECT USING (true);
+DO $$ BEGIN
+  CREATE POLICY "Public read users" ON public.users FOR SELECT USING (true);
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+DO $$ BEGIN
+  CREATE POLICY "Public read conversations" ON public.conversations FOR SELECT USING (true);
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+DO $$ BEGIN
+  CREATE POLICY "Public read agent_definitions" ON public.agent_definitions FOR SELECT USING (true);
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+DO $$ BEGIN
+  CREATE POLICY "Public read agent_tools" ON public.agent_tools FOR SELECT USING (true);
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+DO $$ BEGIN
+  CREATE POLICY "Public read task_results" ON public.task_results FOR SELECT USING (true);
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+DO $$ BEGIN
+  CREATE POLICY "Public read memories" ON public.memories FOR SELECT USING (true);
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
--- Anon/authenticated can write (service role bypasses RLS anyway)
-CREATE POLICY IF NOT EXISTS "Allow write users" ON public.users FOR ALL USING (true) WITH CHECK (true);
-CREATE POLICY IF NOT EXISTS "Allow write conversations" ON public.conversations FOR ALL USING (true) WITH CHECK (true);
-CREATE POLICY IF NOT EXISTS "Allow write agent_definitions" ON public.agent_definitions FOR ALL USING (true) WITH CHECK (true);
-CREATE POLICY IF NOT EXISTS "Allow write agent_tools" ON public.agent_tools FOR ALL USING (true) WITH CHECK (true);
-CREATE POLICY IF NOT EXISTS "Allow write task_results" ON public.task_results FOR ALL USING (true) WITH CHECK (true);
-CREATE POLICY IF NOT EXISTS "Allow write memories" ON public.memories FOR ALL USING (true) WITH CHECK (true);
+DO $$ BEGIN
+  CREATE POLICY "Allow write users" ON public.users FOR ALL USING (true) WITH CHECK (true);
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+DO $$ BEGIN
+  CREATE POLICY "Allow write conversations" ON public.conversations FOR ALL USING (true) WITH CHECK (true);
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+DO $$ BEGIN
+  CREATE POLICY "Allow write agent_definitions" ON public.agent_definitions FOR ALL USING (true) WITH CHECK (true);
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+DO $$ BEGIN
+  CREATE POLICY "Allow write agent_tools" ON public.agent_tools FOR ALL USING (true) WITH CHECK (true);
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+DO $$ BEGIN
+  CREATE POLICY "Allow write task_results" ON public.task_results FOR ALL USING (true) WITH CHECK (true);
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+DO $$ BEGIN
+  CREATE POLICY "Allow write memories" ON public.memories FOR ALL USING (true) WITH CHECK (true);
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
 -- ── Indexes ──
 
@@ -162,7 +180,14 @@ ON CONFLICT (slug) DO UPDATE SET
   model = EXCLUDED.model,
   updated_at = now();
 
--- Enable realtime for key tables
-ALTER PUBLICATION supabase_realtime ADD TABLE public.conversations;
-ALTER PUBLICATION supabase_realtime ADD TABLE public.agent_definitions;
-ALTER PUBLICATION supabase_realtime ADD TABLE public.task_results;
+-- ── Enable realtime ──
+
+DO $$ BEGIN
+  ALTER PUBLICATION supabase_realtime ADD TABLE public.conversations;
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+DO $$ BEGIN
+  ALTER PUBLICATION supabase_realtime ADD TABLE public.agent_definitions;
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+DO $$ BEGIN
+  ALTER PUBLICATION supabase_realtime ADD TABLE public.task_results;
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;

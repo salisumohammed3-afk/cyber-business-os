@@ -1,84 +1,93 @@
 import { useState, useEffect, useRef } from "react";
 import { X, Minimize2, Maximize2 } from "lucide-react";
+import { supabase } from "@/integrations/supabase/client";
 
-const liveLogLines = [
-  "> Initializing cold outreach pipeline...",
-  "> Loading ICP criteria from knowledge base...",
-  "> Searching web for: Vodafone CTO digital transformation AI strategy Europe...",
-  "> Found: [contact verified]",
-  "> Searching web for: UniCredit Chief AI Officer fintech enterprise...",
-  "> Found: [email]",
-  "> Finding email addresses...",
-  "> Searching web for: BNY Mellon CDO AI deployment enterprise agents...",
-  "> Found: [email]",
-  "> Found: [email]",
-  "> Searching web for: MTN Group CEO Africa telecom AI digital transformation...",
-  "> Found: [email]",
-  "> Finding email addresses...",
-  "> Searching web for: Siemens AG Chief Technology Officer digital transformation AI strategy Europe...",
-  "> Found: [email]",
-  "> Searching web for: Safaricom MTN Africa telecommunications CEO CTO AI digital transformation strate......",
-  "> Found: [email]",
-  "> Found: [email]",
-  "> Finding email addresses...",
-  "> Finding email addresses...",
-  "> Finding email addresses...",
-  "> Searching web for: BBVA Chief Digital Officer AI strategy Spain Europe 2026 leadership...",
-  "> Found: [email]",
-  "> Found: [email]",
-  "> Finding email addresses...",
-  "> Searching web for: ABB Switzerland CEO CTO Chief Technology Ofstdout:ficer AI transformation Europe...",
-  "> Found: [email]",
-  "> Using company_email:add_lead...",
-  "> Using company_email:add_lead...",
-  "> Lead pipeline updated. 10/10 contacts verified.",
-  "> Generating personalized outreach sequences...",
-  "> Sequence 1/10: Scott Petty (Vodafone) — 3 emails drafted",
-  "> Sequence 2/10: Anabel Almagro (UniCredit) — 3 emails drafted",
-  "> Applying tone: consultative, enterprise, AI-native...",
-  "> Sequence 3/10: Eric Hirschhorn (BNY Mellon) — 3 emails drafted",
-  "> Cross-referencing CRM for prior touchpoints...",
-  "> No prior contact found. Cold sequence confirmed.",
-  "> Sequence 4/10: Ralph Mupita (MTN Group) — customizing for Africa market...",
-];
+interface LogEntry {
+  id: string;
+  message: string;
+  source: string | null;
+  agent_slug: string | null;
+  log_type: string | null;
+  created_at: string;
+}
+
+const logTypeColor: Record<string, string> = {
+  task_start: "text-amber-400",
+  agent_loaded: "text-blue-400",
+  llm_call: "text-purple-400",
+  tool_call: "text-cyan-400",
+  tool_result: "text-emerald-400",
+  task_complete: "text-green-400",
+  memory_recall: "text-yellow-400",
+  error: "text-red-400",
+};
 
 const LiveTerminal = () => {
-  const [lines, setLines] = useState<string[]>([]);
+  const [lines, setLines] = useState<LogEntry[]>([]);
   const [isExpanded, setIsExpanded] = useState(true);
+  const [activeAgent, setActiveAgent] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
-  const indexRef = useRef(0);
 
+  // Fetch recent logs on mount
   useEffect(() => {
-    // Start with a few lines
-    setLines(liveLogLines.slice(0, 5));
-    indexRef.current = 5;
-
-    const interval = setInterval(() => {
-      if (indexRef.current < liveLogLines.length) {
-        setLines((prev) => [...prev, liveLogLines[indexRef.current]]);
-        indexRef.current++;
-      } else {
-        // Loop back
-        indexRef.current = 0;
-        setLines([]);
-      }
-    }, 800);
-
-    return () => clearInterval(interval);
+    supabase
+      .from("terminal_logs")
+      .select("*")
+      .order("created_at", { ascending: false })
+      .limit(30)
+      .then(({ data }) => {
+        if (data) {
+          setLines(data.reverse() as LogEntry[]);
+          const latest = data[0];
+          if (latest?.agent_slug) setActiveAgent(latest.agent_slug);
+        }
+      });
   }, []);
 
+  // Subscribe to new log inserts via realtime
+  useEffect(() => {
+    const channel = supabase
+      .channel("terminal_logs_realtime")
+      .on(
+        "postgres_changes",
+        { event: "INSERT", schema: "public", table: "terminal_logs" },
+        (payload) => {
+          const row = payload.new as LogEntry;
+          setLines((prev) => {
+            const next = [...prev, row];
+            // Keep last 100 lines in memory
+            return next.length > 100 ? next.slice(-100) : next;
+          });
+          if (row.agent_slug) setActiveAgent(row.agent_slug);
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, []);
+
+  // Auto-scroll
   useEffect(() => {
     if (scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
   }, [lines]);
 
+  const hasLogs = lines.length > 0;
+  const latestLog = lines[lines.length - 1];
+
   if (!isExpanded) {
     return (
       <div className="bg-[hsl(var(--terminal-bg))] border-b border-[hsl(0,0%,15%)] px-4 py-1.5 flex items-center justify-between">
         <div className="flex items-center gap-2">
-          <div className="w-1.5 h-1.5 rounded-full bg-[hsl(var(--terminal-fg))] pulse-active" />
-          <span className="font-mono text-[10px] text-[hsl(var(--terminal-fg))]">LIVE EXECUTION — agent:growth running</span>
+          <div className={`w-1.5 h-1.5 rounded-full ${hasLogs ? "bg-emerald-400 pulse-active" : "bg-[hsl(0,0%,30%)]"}`} />
+          <span className="font-mono text-[10px] text-[hsl(var(--terminal-fg))]">
+            {hasLogs
+              ? `LIVE — ${activeAgent || "system"} — ${latestLog?.message.slice(0, 60)}...`
+              : "TERMINAL — no recent activity"}
+          </span>
         </div>
         <button onClick={() => setIsExpanded(true)} className="text-[hsl(0,0%,50%)] hover:text-[hsl(0,0%,80%)] transition-colors">
           <Maximize2 size={10} />
@@ -97,7 +106,12 @@ const LiveTerminal = () => {
             <div className="w-2.5 h-2.5 rounded-full bg-[hsl(45,90%,55%)]" />
             <div className="w-2.5 h-2.5 rounded-full bg-[hsl(142,71%,45%)]" />
           </div>
-          <span className="font-mono text-[10px] text-[hsl(0,0%,50%)] ml-2">aura-os — agent:growth — cold_outreach_pipeline</span>
+          <span className="font-mono text-[10px] text-[hsl(0,0%,50%)] ml-2">
+            aura-os — {activeAgent ? `agent:${activeAgent}` : "system"} — live execution
+          </span>
+          {hasLogs && (
+            <span className="font-mono text-[9px] text-emerald-500 ml-2">{lines.length} events</span>
+          )}
         </div>
         <div className="flex items-center gap-2">
           <button onClick={() => setIsExpanded(false)} className="text-[hsl(0,0%,50%)] hover:text-[hsl(0,0%,80%)] transition-colors">
@@ -111,11 +125,24 @@ const LiveTerminal = () => {
 
       {/* Log output */}
       <div ref={scrollRef} className="h-40 overflow-y-auto px-4 py-2">
-        {lines.map((line, i) => (
-          <div key={i} className="font-mono text-[11px] leading-5 text-[hsl(var(--terminal-fg))]">
-            {line}
+        {!hasLogs && (
+          <div className="font-mono text-[11px] text-[hsl(0,0%,40%)] leading-5">
+            &gt; Waiting for agent activity...
           </div>
-        ))}
+        )}
+        {lines.map((line) => {
+          const color = logTypeColor[line.log_type || ""] || "text-[hsl(var(--terminal-fg))]";
+          return (
+            <div key={line.id} className="font-mono text-[11px] leading-5 flex gap-2">
+              <span className="text-[hsl(0,0%,35%)] shrink-0 select-none">
+                {new Date(line.created_at).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", second: "2-digit" })}
+              </span>
+              <span className={color}>
+                &gt; {line.message}
+              </span>
+            </div>
+          );
+        })}
         <span className="font-mono text-[11px] text-[hsl(var(--terminal-fg))] animate-pulse">█</span>
       </div>
     </div>

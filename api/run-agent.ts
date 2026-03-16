@@ -507,6 +507,26 @@ async function executeDelegateTask(
   }
 }
 
+// ── Terminal logging ────────────────────────────────────────────────────────
+
+async function termLog(
+  supabase: SupabaseClient,
+  message: string,
+  opts: { source?: string; agentSlug?: string; taskId?: string; logType?: string } = {}
+) {
+  try {
+    await supabase.from("terminal_logs").insert({
+      message,
+      source: opts.source || "agent-runner",
+      agent_slug: opts.agentSlug || null,
+      task_id: opts.taskId || null,
+      log_type: opts.logType || "info",
+    });
+  } catch {
+    // Non-critical — don't let logging failures break the agent
+  }
+}
+
 // ── Memory injection ────────────────────────────────────────────────────────
 
 async function getRelevantMemories(supabase: SupabaseClient, userMessage: string): Promise<string> {
@@ -594,6 +614,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       .update({ status: "running", started_at: new Date().toISOString() })
       .eq("id", task_id);
 
+    const agentSlugForLog = "orchestrator";
+
+    await termLog(supabase, `Task ${task_id.slice(0, 8)} started — loading agent config...`, {
+      taskId: task_id, agentSlug: agentSlugForLog, logType: "task_start",
+    });
+
     // 2. Read agent definition
     let systemPrompt =
       "You are the Orchestrator of a Cyber Business Operating System — the CEO's right-hand AI. " +
@@ -613,6 +639,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         model = agentDef.model || model;
         temperature = parseFloat(agentDef.temperature) || temperature;
         maxTurns = agentDef.max_turns || maxTurns;
+
+        await termLog(supabase, `Agent loaded: ${agentDef.name} (${agentDef.slug}) — model: ${model}`, {
+          taskId: task_id, agentSlug: agentDef.slug, logType: "agent_loaded",
+        });
       }
     }
 
@@ -630,12 +660,19 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       })
     );
 
+    await termLog(supabase, `Loaded ${messages.length} messages from conversation history`, {
+      taskId: task_id, agentSlug: agentSlugForLog, logType: "context_loaded",
+    });
+
     // 4. Inject relevant memories into system prompt
     const lastUserMsg = messages.filter(m => m.role === "user").pop();
     if (lastUserMsg && typeof lastUserMsg.content === "string") {
       const memoryContext = await getRelevantMemories(supabase, lastUserMsg.content);
       if (memoryContext) {
         systemPrompt += memoryContext;
+        await termLog(supabase, `Injected relevant memories into context`, {
+          taskId: task_id, agentSlug: agentSlugForLog, logType: "memory_recall",
+        });
       }
     }
 
@@ -646,8 +683,16 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     let turnCount = 0;
     const allToolCalls: Array<{ tool: string; input: unknown; output: string }> = [];
 
+    await termLog(supabase, `Starting agentic loop — ${tools.length} tools available, max ${maxTurns} turns`, {
+      taskId: task_id, agentSlug: agentSlugForLog, logType: "loop_start",
+    });
+
     while (turnCount < maxTurns) {
       turnCount++;
+
+      await termLog(supabase, `Turn ${turnCount}/${maxTurns} — calling ${model}...`, {
+        taskId: task_id, agentSlug: agentSlugForLog, logType: "llm_call",
+      });
 
       const anthropicRes = await fetch(
         "https://api.anthropic.com/v1/messages",
@@ -698,6 +743,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         const toolResults: ToolResult[] = [];
         for (const block of anthropicData.content) {
           if (block.type === "tool_use") {
+            const inputSummary = JSON.stringify(block.input).slice(0, 120);
+            await termLog(supabase, `Using tool: ${block.name} — ${inputSummary}`, {
+              taskId: task_id, agentSlug: agentSlugForLog, logType: "tool_call",
+            });
+
             const output = await executeTool(
               block.name,
               block.input as Record<string, unknown>,
@@ -710,6 +760,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
                 supabaseKey,
               }
             );
+
+            const outputPreview = output.slice(0, 100);
+            await termLog(supabase, `Tool result (${block.name}): ${outputPreview}${output.length > 100 ? "..." : ""}`, {
+              taskId: task_id, agentSlug: agentSlugForLog, logType: "tool_result",
+            });
 
             toolResults.push({
               type: "tool_result",
@@ -778,6 +833,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         .from("tasks")
         .update({ status: "completed", completed_at: new Date().toISOString() })
         .eq("id", task_id);
+
+      const toolsSummary = allToolCalls.length > 0
+        ? ` — used ${allToolCalls.length} tool(s): ${[...new Set(allToolCalls.map(tc => tc.tool))].join(", ")}`
+        : "";
+      await termLog(supabase, `Task ${task_id.slice(0, 8)} completed in ${turnCount} turn(s)${toolsSummary}`, {
+        taskId: task_id, agentSlug: agentSlugForLog, logType: "task_complete",
+      });
 
       return res.status(200).json({
         ok: true,

@@ -254,6 +254,7 @@ export interface Database {
         Row: {
           id: string
           user_id: string
+          agent_definition_id: string | null
           category: string | null
           content: string | null
           metadata: Json | null
@@ -263,7 +264,8 @@ export interface Database {
         }
         Insert: {
           id?: string
-          user_id: string
+          user_id?: string
+          agent_definition_id?: string | null
           category?: string | null
           content?: string | null
           metadata?: Json | null
@@ -274,11 +276,76 @@ export interface Database {
         Update: {
           id?: string
           user_id?: string
+          agent_definition_id?: string | null
           category?: string | null
           content?: string | null
           metadata?: Json | null
           importance?: number
           expires_at?: string | null
+          created_at?: string
+        }
+      }
+      training_examples: {
+        Row: {
+          id: string
+          agent_definition_id: string | null
+          user_message: string
+          assistant_response: string
+          quality_score: number
+          tags: Json
+          is_active: boolean
+          created_at: string
+        }
+        Insert: {
+          id?: string
+          agent_definition_id?: string | null
+          user_message: string
+          assistant_response: string
+          quality_score?: number
+          tags?: Json
+          is_active?: boolean
+          created_at?: string
+        }
+        Update: {
+          id?: string
+          agent_definition_id?: string | null
+          user_message?: string
+          assistant_response?: string
+          quality_score?: number
+          tags?: Json
+          is_active?: boolean
+          created_at?: string
+        }
+      }
+      knowledge_chunks: {
+        Row: {
+          id: string
+          source_name: string
+          source_type: string
+          chunk_index: number
+          content: string
+          metadata: Json
+          agent_definition_id: string | null
+          created_at: string
+        }
+        Insert: {
+          id?: string
+          source_name: string
+          source_type?: string
+          chunk_index?: number
+          content: string
+          metadata?: Json
+          agent_definition_id?: string | null
+          created_at?: string
+        }
+        Update: {
+          id?: string
+          source_name?: string
+          source_type?: string
+          chunk_index?: number
+          content?: string
+          metadata?: Json
+          agent_definition_id?: string | null
           created_at?: string
         }
       }

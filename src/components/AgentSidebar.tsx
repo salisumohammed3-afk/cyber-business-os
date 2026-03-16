@@ -33,7 +33,7 @@ const AgentSidebar = () => {
   };
 
   return (
-    <div className="w-56 border-r border-border bg-background flex flex-col h-full">
+    <div className="w-full border-r border-border bg-background flex flex-col h-full">
       <div className="p-3 border-b border-border">
         <span className="font-mono text-[10px] text-muted-foreground tracking-widest uppercase">
           Agent Grid

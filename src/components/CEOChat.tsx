@@ -1,4 +1,5 @@
 import { useRef, useEffect, useState } from 'react'
+import ReactMarkdown from 'react-markdown'
 import { useLiveChat } from '@/hooks/useLiveChat'
 
 type ConversationIdProp = string | null
@@ -69,7 +70,13 @@ export function CEOChat({ conversationId }: { conversationId?: ConversationIdPro
                     : 'rounded-lg px-4 py-2 max-w-[80%] bg-gray-200 text-gray-900'
                 }
               >
-                <p className="text-sm whitespace-pre-wrap">{msg.content ?? ''}</p>
+                {msg.role === 'user' ? (
+                  <p className="text-sm whitespace-pre-wrap">{msg.content ?? ''}</p>
+                ) : (
+                  <div className="prose prose-sm prose-gray max-w-none [&_p]:my-1 [&_ul]:my-1 [&_ol]:my-1 [&_li]:my-0.5 [&_h1]:text-base [&_h2]:text-sm [&_h3]:text-sm [&_code]:text-xs [&_pre]:text-xs">
+                    <ReactMarkdown>{msg.content ?? ''}</ReactMarkdown>
+                  </div>
+                )}
               </div>
             </div>
           ))}

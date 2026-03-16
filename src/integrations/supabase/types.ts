@@ -120,6 +120,9 @@ export interface Database {
           config: Json | null
           is_enabled: boolean
           created_at: string
+          connection_source: string
+          composio_action_id: string | null
+          tool_schema: Json | null
         }
         Insert: {
           id?: string
@@ -130,6 +133,9 @@ export interface Database {
           config?: Json | null
           is_enabled?: boolean
           created_at?: string
+          connection_source?: string
+          composio_action_id?: string | null
+          tool_schema?: Json | null
         }
         Update: {
           id?: string
@@ -140,6 +146,9 @@ export interface Database {
           config?: Json | null
           is_enabled?: boolean
           created_at?: string
+          connection_source?: string
+          composio_action_id?: string | null
+          tool_schema?: Json | null
         }
       }
       chat_messages: {

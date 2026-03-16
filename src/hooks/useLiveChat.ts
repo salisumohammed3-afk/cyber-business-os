@@ -111,13 +111,14 @@ export function useLiveChat(conversationId: string | null) {
         throw new Error(agentError?.message ?? 'Orchestrator agent not found')
       }
 
-      // c) Insert pending task
+      // c) Insert pending task (marked internal so it stays hidden from the task pipeline)
       const { data: newTask, error: taskError } = await supabase.from('tasks').insert({
         conversation_id: convId,
         agent_definition_id: orchestrator.id,
         status: 'pending',
         title: 'Respond to user message',
         description: text,
+        source: 'internal',
       }).select('id').single()
       if (taskError) throw new Error(taskError.message)
 

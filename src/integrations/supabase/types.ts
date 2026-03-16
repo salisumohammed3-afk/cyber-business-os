@@ -191,6 +191,10 @@ export interface Database {
           started_at: string | null
           completed_at: string | null
           created_at?: string
+          tags: Json
+          is_recurring: boolean
+          recurrence_schedule: string | null
+          source: string | null
         }
         Insert: {
           id?: string
@@ -208,6 +212,10 @@ export interface Database {
           started_at?: string | null
           completed_at?: string | null
           created_at?: string
+          tags?: Json
+          is_recurring?: boolean
+          recurrence_schedule?: string | null
+          source?: string | null
         }
         Update: {
           id?: string
@@ -225,6 +233,10 @@ export interface Database {
           started_at?: string | null
           completed_at?: string | null
           created_at?: string
+          tags?: Json
+          is_recurring?: boolean
+          recurrence_schedule?: string | null
+          source?: string | null
         }
       }
       task_results: {

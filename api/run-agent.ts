@@ -186,7 +186,8 @@ async function buildComposioMcp(
   if (!apiKey || toolkits.length === 0) return undefined;
 
   const composio = new Composio({ apiKey });
-  const session = await composio.create("ubs_agent", {
+  const userId = process.env.COMPOSIO_USER_ID || "default";
+  const session = await composio.create(userId, {
     toolkits,
   });
 

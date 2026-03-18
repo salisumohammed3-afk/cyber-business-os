@@ -23,6 +23,7 @@ interface ToolContext {
   supabaseUrl: string;
   supabaseKey: string;
   anthropic: Anthropic;
+  currentAgentSlug: string;
 }
 
 // ── Local tool definitions (always available to every agent) ────────────────
@@ -452,6 +453,10 @@ async function executeDelegateTask(
       return JSON.stringify({ error: `Agent '${agentSlug}' not found. Available: engineering, growth, sales, research, outreach` });
     }
 
+    if (agentDef.slug === context.currentAgentSlug) {
+      return JSON.stringify({ error: `Cannot delegate to yourself (${agentDef.slug}). Choose a different agent.` });
+    }
+
     const { data: childTask, error: taskErr } = await supabase
       .from("tasks")
       .insert({
@@ -696,6 +701,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       supabaseUrl,
       supabaseKey,
       anthropic,
+      currentAgentSlug: agentSlugForLog,
     };
 
     // 7. Agentic loop
@@ -808,7 +814,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         response.content
           .filter(isTextBlock)
           .map(b => b.text)
-          .join("") || "I received your message but had no response.";
+          .join("") || "I wasn't able to complete this task. You can retry it from the task pipeline.";
 
       const { error: insertErr } = await supabase.from("chat_messages").insert({
         conversation_id,

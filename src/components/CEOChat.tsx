@@ -1,5 +1,6 @@
 import { useRef, useEffect, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
+import { Bot } from 'lucide-react'
 import { useLiveChat } from '@/hooks/useLiveChat'
 
 type ConversationIdProp = string | null
@@ -81,9 +82,10 @@ export function CEOChat({ conversationId }: { conversationId?: ConversationIdPro
             </div>
           ))}
         {isWaitingForResponse && (
-          <div className="flex justify-start">
+          <div className="flex justify-start items-center gap-2">
+            <Bot size={14} className="text-gray-400 animate-pulse" />
             <span className="text-sm text-gray-500 animate-pulse">
-              thinking...
+              Thinking...
             </span>
           </div>
         )}

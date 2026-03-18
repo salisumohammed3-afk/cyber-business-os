@@ -8,14 +8,18 @@ import {
   XCircle,
   Repeat,
   ChevronRight,
+  Lightbulb,
+  Wrench,
+  Zap,
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import TaskBlueprintModal from "./TaskBlueprintModal";
 
-type TabKey = "todo" | "recurring" | "running" | "completed" | "rejected" | "failed";
+type TabKey = "proposed" | "todo" | "recurring" | "running" | "completed" | "rejected" | "failed";
 
 const tabs: { key: TabKey; label: string }[] = [
-  { key: "todo", label: "To Do" },
+  { key: "proposed", label: "Proposed" },
+  { key: "todo", label: "Approved" },
   { key: "recurring", label: "Recurring" },
   { key: "running", label: "In Progress" },
   { key: "completed", label: "Completed" },
@@ -27,9 +31,10 @@ const statusConfig: Record<
   string,
   { icon: React.ElementType; color: string; bg: string; label: string; animate?: boolean }
 > = {
+  proposed: { icon: Lightbulb, color: "text-violet-500", bg: "bg-violet-500/10", label: "proposed" },
   completed: { icon: CheckCircle2, color: "text-emerald-500", bg: "bg-emerald-500/10", label: "completed" },
   running: { icon: Loader2, color: "text-amber-500", bg: "bg-amber-500/10", label: "running", animate: true },
-  pending: { icon: Clock, color: "text-muted-foreground", bg: "bg-secondary", label: "pending" },
+  pending: { icon: Clock, color: "text-muted-foreground", bg: "bg-secondary", label: "approved" },
   queued: { icon: Clock, color: "text-muted-foreground", bg: "bg-secondary", label: "queued" },
   failed: { icon: AlertCircle, color: "text-red-500", bg: "bg-red-500/10", label: "failed" },
   cancelled: { icon: XCircle, color: "text-orange-500", bg: "bg-orange-500/10", label: "rejected" },
@@ -39,6 +44,8 @@ const fallbackConfig = { icon: Clock, color: "text-muted-foreground", bg: "bg-se
 
 function filterTasks(tasks: Task[], tab: TabKey): Task[] {
   switch (tab) {
+    case "proposed":
+      return tasks.filter((t) => t.status === "proposed");
     case "todo":
       return tasks.filter((t) => (t.status === "pending" || t.status === "queued") && !t.is_recurring);
     case "recurring":
@@ -70,12 +77,13 @@ function relativeTime(dateStr?: string | null): string {
 
 const ActionPipeline = () => {
   const { data: tasks = [], isLoading } = useTasks();
-  const [activeTab, setActiveTab] = useState<TabKey>("todo");
+  const [activeTab, setActiveTab] = useState<TabKey>("proposed");
   const [selectedTask, setSelectedTask] = useState<Task | null>(null);
 
   const tabCounts = useMemo(() => {
-    const counts: Record<TabKey, number> = { todo: 0, recurring: 0, running: 0, completed: 0, rejected: 0, failed: 0 };
+    const counts: Record<TabKey, number> = { proposed: 0, todo: 0, recurring: 0, running: 0, completed: 0, rejected: 0, failed: 0 };
     for (const t of tasks) {
+      if (t.status === "proposed") counts.proposed++;
       if (t.is_recurring) counts.recurring++;
       if ((t.status === "pending" || t.status === "queued") && !t.is_recurring) counts.todo++;
       if (t.status === "running") counts.running++;
@@ -139,7 +147,11 @@ const ActionPipeline = () => {
                 <div
                   key={task.id}
                   onClick={() => setSelectedTask(task)}
-                  className="border border-border rounded-md p-3 hover:border-foreground/20 transition-colors cursor-pointer group"
+                  className={`rounded-md p-3 transition-colors cursor-pointer group ${
+                    task.status === "proposed"
+                      ? "border border-dashed border-violet-500/40 hover:border-violet-500/70 bg-violet-500/[0.03]"
+                      : "border border-border hover:border-foreground/20"
+                  }`}
                 >
                   <div className="flex items-start gap-2.5">
                     <StatusIcon
@@ -153,6 +165,28 @@ const ActionPipeline = () => {
                       {task.description && task.description !== task.title && (
                         <p className="text-[11px] text-muted-foreground mt-0.5 line-clamp-2">
                           {task.description}
+                        </p>
+                      )}
+                      {/* Result preview for completed tasks */}
+                      {task.status === "completed" && task.result && (
+                        <div className="flex items-center gap-2 mt-1.5 text-[10px] text-muted-foreground">
+                          {task.result.turns != null && (
+                            <span className="flex items-center gap-0.5">
+                              <Zap size={9} className="text-amber-500" />
+                              {task.result.turns} turn{task.result.turns !== 1 ? "s" : ""}
+                            </span>
+                          )}
+                          {task.result.tools_used && task.result.tools_used.length > 0 && (
+                            <span className="flex items-center gap-0.5">
+                              <Wrench size={9} className="text-blue-500" />
+                              {task.result.tools_used.join(", ")}
+                            </span>
+                          )}
+                        </div>
+                      )}
+                      {task.status === "completed" && task.result?.response && (
+                        <p className="text-[10px] text-muted-foreground mt-1 line-clamp-1 italic">
+                          {task.result.response.slice(0, 120)}
                         </p>
                       )}
                       <div className="flex items-center gap-2 mt-1.5 flex-wrap">

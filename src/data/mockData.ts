@@ -146,7 +146,7 @@ export const tasks: Task[] = [
     progress: 100,
     timestamp: "32 min ago",
     reasoning: "Analyzed last 7-day performance across 6 active creatives. Identified 2 with CTR < 0.8% and CPA > $45 (2x target). Paused both and reallocated budget to top performer (Creative #3, CTR 2.1%, CPA $18).",
-    toolOutput: `Campaign: AuraOS_Launch_Q1
+    toolOutput: `Campaign: SalOS_Launch_Q1
   Creative #1: CTR 0.6%, CPA $52 → PAUSED
   Creative #2: CTR 1.4%, CPA $24 → ACTIVE
   Creative #3: CTR 2.1%, CPA $18 → BUDGET +40%
@@ -222,10 +222,9 @@ export const chatMessages: ChatMessage[] = [
 ];
 
 export const metrics: Metric[] = [
-  { label: "ARR", value: "$48.2K", change: "+12%", positive: true },
-  { label: "Active Users", value: "1,247", change: "+8%", positive: true },
-  { label: "Tasks Executed", value: "312", change: "+23", positive: true },
-  { label: "Wallet", value: "$2,847", change: "-$47/day", positive: false },
+  { label: "Time Reclaimed", value: "42.5h", change: "+6.2h", positive: true },
+  { label: "System Burn Rate", value: "$47/day", change: "-$12", positive: true },
+  { label: "Av Time Per Task", value: "1m 24s", change: "-18s", positive: true },
 ];
 
 export const terminalLogs: string[] = [

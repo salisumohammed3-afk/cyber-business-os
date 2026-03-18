@@ -11,6 +11,10 @@ import {
   Loader2,
   AlertCircle,
   Bot,
+  Lightbulb,
+  Check,
+  Wrench,
+  Zap,
 } from "lucide-react";
 import { AnimatePresence, motion } from "framer-motion";
 import { Badge } from "@/components/ui/badge";
@@ -23,7 +27,8 @@ interface Props {
 }
 
 const statusDisplay: Record<string, { icon: React.ElementType; label: string; color: string }> = {
-  pending: { icon: Clock, label: "Pending", color: "text-muted-foreground" },
+  proposed: { icon: Lightbulb, label: "Proposed", color: "text-violet-500" },
+  pending: { icon: Clock, label: "Approved", color: "text-muted-foreground" },
   queued: { icon: Clock, label: "Queued", color: "text-muted-foreground" },
   running: { icon: Loader2, label: "In Progress", color: "text-amber-500" },
   completed: { icon: CheckCircle2, label: "Completed", color: "text-emerald-500" },
@@ -42,7 +47,7 @@ function formatTimestamp(ts?: string | null): string {
 }
 
 const TaskBlueprintModal = ({ task, onClose }: Props) => {
-  const { runTask, rejectTask, retryTask, deleteTask, repeatTask } = useTaskActions();
+  const { approveTask, runTask, rejectTask, retryTask, deleteTask, repeatTask } = useTaskActions();
   const [actionLoading, setActionLoading] = useState<string | null>(null);
 
   const handleAction = async (action: string, fn: () => Promise<void>) => {
@@ -105,7 +110,7 @@ const TaskBlueprintModal = ({ task, onClose }: Props) => {
             </div>
 
             {/* Body */}
-            <div className="flex-1 overflow-y-auto p-4 space-y-4">
+            <div className="flex-1 min-h-0 overflow-y-auto p-4 space-y-4">
               {/* Agent assignment */}
               <div className="flex items-center gap-2">
                 <Bot size={12} className="text-muted-foreground" />
@@ -161,8 +166,61 @@ const TaskBlueprintModal = ({ task, onClose }: Props) => {
                 </div>
               </div>
 
-              {/* Tool output / results */}
-              {(task.tool_output || task.reasoning) && (
+              {/* Execution result */}
+              {task.result && (
+                <div className="space-y-3">
+                  <span className="font-mono text-[10px] text-muted-foreground tracking-wider uppercase block">
+                    Execution Result
+                  </span>
+
+                  {/* Execution stats bar */}
+                  <div className="flex flex-wrap items-center gap-3 text-[10px]">
+                    {task.result.turns != null && (
+                      <div className="flex items-center gap-1 text-muted-foreground">
+                        <Zap size={10} className="text-amber-500" />
+                        <span>{task.result.turns} turn{task.result.turns !== 1 ? "s" : ""}</span>
+                      </div>
+                    )}
+                    {task.result.tools_used && task.result.tools_used.length > 0 && (
+                      <div className="flex items-center gap-1 text-muted-foreground">
+                        <Wrench size={10} className="text-blue-500" />
+                        <span>{task.result.tools_used.length} tool{task.result.tools_used.length !== 1 ? "s" : ""} used</span>
+                      </div>
+                    )}
+                    {task.result.model && (
+                      <div className="flex items-center gap-1 text-muted-foreground">
+                        <Bot size={10} />
+                        <span>{task.result.model}</span>
+                      </div>
+                    )}
+                    {task.result.max_turns_reached && (
+                      <Badge variant="secondary" className="text-[9px] text-amber-500">max turns</Badge>
+                    )}
+                  </div>
+
+                  {/* Tools used chips */}
+                  {task.result.tools_used && task.result.tools_used.length > 0 && (
+                    <div className="flex flex-wrap gap-1.5">
+                      {task.result.tools_used.map((tool) => (
+                        <Badge key={tool} variant="outline" className="text-[9px] font-mono gap-1">
+                          <Wrench size={8} />
+                          {tool}
+                        </Badge>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* Agent response */}
+                  {task.result.response && (
+                    <div className="text-xs text-foreground leading-relaxed bg-secondary p-3 rounded-md border border-border prose prose-sm prose-gray max-w-none [&_p]:my-1 [&_ul]:my-1 [&_li]:my-0.5 max-h-56 overflow-y-auto">
+                      <ReactMarkdown>{task.result.response}</ReactMarkdown>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* Legacy tool output fallback */}
+              {!task.result && (task.tool_output || task.reasoning) && (
                 <div>
                   <span className="font-mono text-[10px] text-muted-foreground tracking-wider uppercase block mb-1.5">
                     Output
@@ -187,7 +245,28 @@ const TaskBlueprintModal = ({ task, onClose }: Props) => {
             </div>
 
             {/* Footer with action buttons */}
-            <div className="p-3 border-t border-border flex items-center justify-end gap-2">
+            <div className="p-3 border-t border-border flex flex-wrap items-center justify-end gap-2 flex-shrink-0">
+              {task.status === "proposed" && (
+                <>
+                  <button
+                    onClick={() => handleAction("reject", () => rejectTask(task.id))}
+                    disabled={actionLoading !== null}
+                    className="flex items-center justify-center gap-1.5 px-4 py-2 text-xs font-medium rounded-md border border-border text-muted-foreground hover:text-foreground hover:bg-secondary transition-colors disabled:opacity-50"
+                  >
+                    <XCircle size={13} />
+                    Reject
+                  </button>
+                  <button
+                    onClick={() => handleAction("approve", () => approveTask(task.id))}
+                    disabled={actionLoading !== null}
+                    className="flex items-center justify-center gap-1.5 px-4 py-2 text-xs font-medium rounded-md bg-emerald text-white hover:brightness-110 transition-all disabled:opacity-50"
+                  >
+                    {actionLoading === "approve" ? <Loader2 size={13} className="animate-spin" /> : <Check size={13} />}
+                    Approve & Run
+                  </button>
+                </>
+              )}
+
               {(task.status === "pending" || task.status === "queued") && (
                 <>
                   <button
@@ -196,7 +275,7 @@ const TaskBlueprintModal = ({ task, onClose }: Props) => {
                     className="flex items-center gap-1.5 px-3 py-1.5 text-[11px] font-medium rounded-md border border-border text-muted-foreground hover:text-foreground hover:bg-secondary transition-colors disabled:opacity-50"
                   >
                     <XCircle size={12} />
-                    Reject
+                    Cancel
                   </button>
                   <button
                     onClick={() => handleAction("run", () => runTask(task.id))}

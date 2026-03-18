@@ -7,6 +7,7 @@ export type Json =
   | Json[]
 
 export type TaskStatus =
+  | 'proposed'
   | 'running'
   | 'completed'
   | 'queued'

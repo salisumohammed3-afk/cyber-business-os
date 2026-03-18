@@ -1,37 +1,56 @@
 import { useNavigate } from "react-router-dom";
-import { ArrowLeft, Bot, Brain, Cpu, Globe, Megaphone, Rocket, Search, Mail, Wrench, Zap, Database, MessageSquare, BookOpen, FileSearch } from "lucide-react";
+import { ArrowLeft, Bot, Brain, Cpu, Globe, Megaphone, Rocket, Search, Mail, Wrench, Zap, Database, MessageSquare, BookOpen, FileSearch, Link2 } from "lucide-react";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { useAgentDefinitions } from "@/hooks/useSupabaseData";
+import { useAgentDefinitions, useAgentTools, type AgentToolRow } from "@/hooks/useSupabaseData";
+import { useMemo } from "react";
 
 interface ToolInfo {
   name: string;
   icon: React.ElementType;
   description: string;
+  isExternal?: boolean;
 }
 
 interface AgentConfig {
   icon: React.ElementType;
   color: string;
-  tools: ToolInfo[];
   skills: string[];
 }
 
-const allTools: Record<string, ToolInfo> = {
+const localTools: Record<string, ToolInfo> = {
   web_search: { name: "Web Search", icon: Globe, description: "Search the web for real-time data, market research, and news" },
   database_query: { name: "Database Query", icon: Database, description: "Query the business database for metrics, agents, tasks, and history" },
-  create_task: { name: "Create Task", icon: Zap, description: "Create and assign tasks to specialist agents" },
+  create_task: { name: "Create Task", icon: Zap, description: "Propose tasks for specialist agents (requires user approval)" },
   store_memory: { name: "Store Memory", icon: BookOpen, description: "Save important facts and decisions for future reference" },
   recall_memories: { name: "Recall Memories", icon: FileSearch, description: "Search stored memories for relevant context" },
-  delegate_task: { name: "Delegate Task", icon: MessageSquare, description: "Delegate work to specialist sub-agents and collect results" },
+  delegate_task: { name: "Delegate Task", icon: MessageSquare, description: "Propose work for specialist sub-agents (requires user approval)" },
 };
+
+const composioToolMeta: Record<string, { label: string; description: string }> = {
+  apollo: { label: "Apollo", description: "People and company search, lead enrichment, contact discovery" },
+  linkedin: { label: "LinkedIn", description: "Professional networking, prospect research, connection outreach" },
+  agent_mail: { label: "AgentMail", description: "Send and manage emails from the agent's dedicated email address" },
+  gmail: { label: "Gmail", description: "Send, read, and manage email campaigns" },
+  exa: { label: "Exa", description: "AI-powered web search for deep research and content discovery" },
+  firecrawl: { label: "Firecrawl", description: "Web scraping, crawling, and structured data extraction" },
+  metaads: { label: "Meta Ads", description: "Create, manage, and optimize Facebook/Instagram ad campaigns" },
+  elevenlabs: { label: "ElevenLabs", description: "Text-to-speech, voice generation, and audio content creation" },
+  slack: { label: "Slack", description: "Team messaging, channel management, and notifications" },
+  instantly: { label: "Instantly", description: "Cold email automation and deliverability optimization" },
+  googlecalendar: { label: "Google Calendar", description: "Schedule meetings, manage events, and check availability" },
+  monday: { label: "Monday.com", description: "Project boards, task tracking, and team collaboration" },
+  figma: { label: "Figma", description: "Design file access, component inspection, and asset export" },
+};
+
+const orchestratorLocalTools = ["web_search", "database_query", "create_task", "store_memory", "recall_memories", "delegate_task"];
+const specialistLocalTools = ["web_search", "database_query", "store_memory", "recall_memories"];
 
 const agentConfigs: Record<string, AgentConfig> = {
   orchestrator: {
     icon: Brain,
     color: "text-emerald-400",
-    tools: [allTools.web_search, allTools.database_query, allTools.create_task, allTools.store_memory, allTools.recall_memories, allTools.delegate_task],
     skills: [
       "Receive and interpret CEO directives",
       "Coordinate specialist sub-agents",
@@ -44,7 +63,6 @@ const agentConfigs: Record<string, AgentConfig> = {
   engineering: {
     icon: Cpu,
     color: "text-blue-400",
-    tools: [allTools.web_search, allTools.database_query, allTools.store_memory, allTools.recall_memories],
     skills: [
       "Software architecture and system design",
       "Code review and technical debt assessment",
@@ -57,7 +75,6 @@ const agentConfigs: Record<string, AgentConfig> = {
   growth: {
     icon: Rocket,
     color: "text-purple-400",
-    tools: [allTools.web_search, allTools.database_query, allTools.store_memory, allTools.recall_memories],
     skills: [
       "User acquisition and activation strategies",
       "Retention and churn analysis",
@@ -70,7 +87,6 @@ const agentConfigs: Record<string, AgentConfig> = {
   sales: {
     icon: Megaphone,
     color: "text-amber-400",
-    tools: [allTools.web_search, allTools.database_query, allTools.store_memory, allTools.recall_memories],
     skills: [
       "Pipeline management and deal qualification",
       "Pricing strategy and packaging",
@@ -83,7 +99,6 @@ const agentConfigs: Record<string, AgentConfig> = {
   research: {
     icon: Search,
     color: "text-cyan-400",
-    tools: [allTools.web_search, allTools.database_query, allTools.store_memory, allTools.recall_memories],
     skills: [
       "Market size estimation (TAM/SAM/SOM)",
       "Competitive landscape analysis",
@@ -96,7 +111,6 @@ const agentConfigs: Record<string, AgentConfig> = {
   outreach: {
     icon: Mail,
     color: "text-orange-400",
-    tools: [allTools.web_search, allTools.database_query, allTools.store_memory, allTools.recall_memories],
     skills: [
       "Cold email and LinkedIn outreach",
       "Lead scoring and qualification",
@@ -110,9 +124,41 @@ const agentConfigs: Record<string, AgentConfig> = {
 
 const specialistSlugs = ["engineering", "growth", "sales", "research", "outreach"];
 
-function OrgChart({ agents }: { agents: Array<{ slug: string; name: string | null; description: string | null; model: string | null }> }) {
-  const orchestrator = agents.find(a => a.slug === "orchestrator");
-  const specialists = agents.filter(a => specialistSlugs.includes(a.slug));
+function buildToolList(
+  slug: string,
+  agentId: string | undefined,
+  externalTools: AgentToolRow[]
+): ToolInfo[] {
+  const localKeys = slug === "orchestrator" ? orchestratorLocalTools : specialistLocalTools;
+  const tools: ToolInfo[] = localKeys.map((k) => localTools[k]).filter(Boolean);
+
+  if (agentId) {
+    const agentExternal = externalTools.filter((t) => t.agent_id === agentId);
+    for (const ext of agentExternal) {
+      const meta = composioToolMeta[ext.tool_name] || { label: ext.tool_name, description: `Connected via Composio (${ext.connection_source})` };
+      tools.push({
+        name: meta.label,
+        icon: Link2,
+        description: meta.description,
+        isExternal: true,
+      });
+    }
+  }
+
+  return tools;
+}
+
+function OrgChart({
+  agents,
+  externalTools,
+}: {
+  agents: Array<{ id: string; slug: string; name: string | null; description: string | null; model: string | null }>;
+  externalTools: AgentToolRow[];
+}) {
+  const orchestrator = agents.find((a) => a.slug === "orchestrator");
+  const specialists = agents.filter((a) => specialistSlugs.includes(a.slug));
+
+  const orchTools = buildToolList("orchestrator", orchestrator?.id, externalTools);
 
   return (
     <div className="flex flex-col items-center gap-0 py-8 px-4">
@@ -120,7 +166,6 @@ function OrgChart({ agents }: { agents: Array<{ slug: string; name: string | nul
         The Orchestrator receives your directives and coordinates specialist agents as needed. Each agent has its own system prompt, tools, and expertise.
       </p>
 
-      {/* Orchestrator card */}
       <Card className="w-80 border-emerald-500/30 bg-emerald-500/5">
         <CardHeader className="pb-2">
           <div className="flex items-center gap-3">
@@ -136,32 +181,31 @@ function OrgChart({ agents }: { agents: Array<{ slug: string; name: string | nul
         <CardContent className="pt-0">
           <div className="flex flex-wrap gap-1 mt-1">
             <Badge variant="outline" className="text-[10px] font-mono">{orchestrator?.model || "claude-sonnet"}</Badge>
-            <Badge variant="secondary" className="text-[10px]">6 tools</Badge>
+            <Badge variant="secondary" className="text-[10px]">{orchTools.length} tools</Badge>
             <Badge variant="secondary" className="text-[10px]">Delegates work</Badge>
           </div>
         </CardContent>
       </Card>
 
-      {/* Connector lines */}
       <svg width="100%" height="60" className="max-w-3xl" viewBox="0 0 800 60" preserveAspectRatio="xMidYMid meet">
         <line x1="400" y1="0" x2="400" y2="30" stroke="currentColor" strokeOpacity="0.2" strokeWidth="2" />
         <line x1="80" y1="30" x2="720" y2="30" stroke="currentColor" strokeOpacity="0.2" strokeWidth="2" />
         {specialists.map((_, i) => {
-          const x = 80 + (i * (640 / Math.max(specialists.length - 1, 1)));
+          const x = 80 + i * (640 / Math.max(specialists.length - 1, 1));
           return <line key={i} x1={x} y1="30" x2={x} y2="60" stroke="currentColor" strokeOpacity="0.2" strokeWidth="2" />;
         })}
       </svg>
 
-      {/* Specialist agent cards */}
       <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-3 w-full max-w-4xl">
-        {specialists.map(agent => {
-          const config = agentConfigs[agent.slug] || { icon: Bot, color: "text-muted-foreground", tools: [], skills: [] };
+        {specialists.map((agent) => {
+          const config = agentConfigs[agent.slug] || { icon: Bot, color: "text-muted-foreground", skills: [] };
           const Icon = config.icon;
+          const tools = buildToolList(agent.slug, agent.id, externalTools);
           return (
             <Card key={agent.slug} className="hover:border-foreground/20 transition-colors">
               <CardHeader className="pb-2 px-3 pt-3">
                 <div className="flex items-center gap-2">
-                  <div className={`w-8 h-8 rounded-lg bg-secondary flex items-center justify-center`}>
+                  <div className="w-8 h-8 rounded-lg bg-secondary flex items-center justify-center">
                     <Icon size={16} className={config.color} />
                   </div>
                   <div className="min-w-0">
@@ -172,7 +216,7 @@ function OrgChart({ agents }: { agents: Array<{ slug: string; name: string | nul
               <CardContent className="px-3 pb-3 pt-0">
                 <p className="text-[10px] text-muted-foreground leading-snug line-clamp-2">{agent.description}</p>
                 <div className="flex flex-wrap gap-1 mt-2">
-                  <Badge variant="outline" className="text-[9px] font-mono">{config.tools.length} tools</Badge>
+                  <Badge variant="outline" className="text-[9px] font-mono">{tools.length} tools</Badge>
                   <Badge variant="outline" className="text-[9px] font-mono">{config.skills.length} skills</Badge>
                 </div>
               </CardContent>
@@ -181,7 +225,6 @@ function OrgChart({ agents }: { agents: Array<{ slug: string; name: string | nul
         })}
       </div>
 
-      {/* Data flow explanation */}
       <div className="mt-10 max-w-2xl w-full">
         <h3 className="font-mono text-[10px] text-muted-foreground tracking-widest uppercase mb-3">How It Works</h3>
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
@@ -203,17 +246,21 @@ function OrgChart({ agents }: { agents: Array<{ slug: string; name: string | nul
   );
 }
 
-function AgentDetail({ agent, config }: {
+function AgentDetail({
+  agent,
+  tools,
+  config,
+}: {
   agent: { name: string | null; slug: string; description: string | null; model: string | null; temperature: number; max_turns: number };
+  tools: ToolInfo[];
   config: AgentConfig;
 }) {
   const Icon = config.icon;
 
   return (
     <div className="py-6 px-4">
-      {/* Agent header */}
       <div className="flex items-center gap-4 mb-6">
-        <div className={`w-12 h-12 rounded-lg bg-secondary flex items-center justify-center`}>
+        <div className="w-12 h-12 rounded-lg bg-secondary flex items-center justify-center">
           <Icon size={24} className={config.color} />
         </div>
         <div>
@@ -227,22 +274,25 @@ function AgentDetail({ agent, config }: {
         </div>
       </div>
 
-      {/* Tools and Skills columns */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-        {/* Tools column */}
         <div>
           <div className="flex items-center gap-2 mb-4 pb-2 border-b border-border">
             <Wrench size={14} className="text-muted-foreground" />
             <h3 className="font-mono text-xs tracking-widest uppercase text-muted-foreground">Tools</h3>
           </div>
           <div className="space-y-2">
-            {config.tools.map(tool => (
+            {tools.map((tool) => (
               <div key={tool.name} className="flex items-start gap-3 p-3 rounded-sm border border-border hover:border-foreground/20 transition-colors">
-                <div className="w-8 h-8 rounded bg-secondary flex items-center justify-center shrink-0 mt-0.5">
-                  <tool.icon size={14} className="text-muted-foreground" />
+                <div className={`w-8 h-8 rounded flex items-center justify-center shrink-0 mt-0.5 ${tool.isExternal ? "bg-violet-500/10" : "bg-secondary"}`}>
+                  <tool.icon size={14} className={tool.isExternal ? "text-violet-400" : "text-muted-foreground"} />
                 </div>
                 <div>
-                  <div className="text-xs font-medium">{tool.name}</div>
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs font-medium">{tool.name}</span>
+                    {tool.isExternal && (
+                      <Badge variant="outline" className="text-[8px] px-1 py-0 h-3.5 text-violet-400 border-violet-500/30">composio</Badge>
+                    )}
+                  </div>
                   <p className="text-[10px] text-muted-foreground mt-0.5 leading-snug">{tool.description}</p>
                 </div>
               </div>
@@ -250,7 +300,6 @@ function AgentDetail({ agent, config }: {
           </div>
         </div>
 
-        {/* Skills column */}
         <div>
           <div className="flex items-center gap-2 mb-4 pb-2 border-b border-border">
             <Zap size={14} className="text-muted-foreground" />
@@ -273,24 +322,33 @@ function AgentDetail({ agent, config }: {
 const Agents = () => {
   const navigate = useNavigate();
   const { data: agentDefs = [], isLoading } = useAgentDefinitions();
+  const { data: externalTools = [] } = useAgentTools();
 
-  const typedAgents = (agentDefs as Array<{
-    id: string;
-    name: string | null;
-    slug: string;
-    description: string | null;
-    system_prompt: string | null;
-    model: string | null;
-    temperature: number;
-    max_turns: number;
-    is_orchestrator: boolean;
-  }>) || [];
+  const typedAgents =
+    (agentDefs as Array<{
+      id: string;
+      name: string | null;
+      slug: string;
+      description: string | null;
+      system_prompt: string | null;
+      model: string | null;
+      temperature: number;
+      max_turns: number;
+      is_orchestrator: boolean;
+    }>) || [];
 
-  const tabAgents = typedAgents.filter(a => specialistSlugs.includes(a.slug));
+  const tabAgents = typedAgents.filter((a) => specialistSlugs.includes(a.slug));
+
+  const agentToolsMap = useMemo(() => {
+    const map: Record<string, ToolInfo[]> = {};
+    for (const agent of typedAgents) {
+      map[agent.slug] = buildToolList(agent.slug, agent.id, externalTools);
+    }
+    return map;
+  }, [typedAgents, externalTools]);
 
   return (
     <div className="h-screen flex flex-col bg-background">
-      {/* Header */}
       <div className="h-12 border-b border-border flex items-center px-4 gap-3 shrink-0">
         <button
           onClick={() => navigate("/")}
@@ -302,12 +360,9 @@ const Agents = () => {
           <Bot size={16} className="text-muted-foreground" />
           <span className="font-mono text-sm font-medium">Agent Dashboard</span>
         </div>
-        {!isLoading && (
-          <Badge variant="secondary" className="ml-2 text-[10px]">{typedAgents.length} agents</Badge>
-        )}
+        {!isLoading && <Badge variant="secondary" className="ml-2 text-[10px]">{typedAgents.length} agents</Badge>}
       </div>
 
-      {/* Content */}
       <div className="flex-1 overflow-y-auto">
         {isLoading ? (
           <div className="flex items-center justify-center h-full">
@@ -320,7 +375,7 @@ const Agents = () => {
                 <TabsTrigger value="overview" className="font-mono text-xs data-[state=active]:bg-background rounded-b-none">
                   Overview
                 </TabsTrigger>
-                {tabAgents.map(agent => {
+                {tabAgents.map((agent) => {
                   const config = agentConfigs[agent.slug];
                   const Icon = config?.icon || Bot;
                   return (
@@ -334,14 +389,15 @@ const Agents = () => {
             </div>
 
             <TabsContent value="overview" className="mt-0">
-              <OrgChart agents={typedAgents} />
+              <OrgChart agents={typedAgents} externalTools={externalTools} />
             </TabsContent>
 
-            {tabAgents.map(agent => {
-              const config = agentConfigs[agent.slug] || { icon: Bot, color: "text-muted-foreground", tools: [], skills: [] };
+            {tabAgents.map((agent) => {
+              const config = agentConfigs[agent.slug] || { icon: Bot, color: "text-muted-foreground", skills: [] };
+              const tools = agentToolsMap[agent.slug] || [];
               return (
                 <TabsContent key={agent.slug} value={agent.slug} className="mt-0">
-                  <AgentDetail agent={agent} config={config} />
+                  <AgentDetail agent={agent} tools={tools} config={config} />
                 </TabsContent>
               );
             })}

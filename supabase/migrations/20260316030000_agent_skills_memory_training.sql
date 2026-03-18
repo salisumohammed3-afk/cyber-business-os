@@ -170,7 +170,7 @@ FROM (
   UNION ALL
   SELECT
     'Draft an outreach email to a CTO at a fintech company',
-    E'Here''s a cold outreach template for a fintech CTO:\n\n---\n\n**Subject:** Quick question about [Company]''s AI ops\n\nHi [First Name],\n\nI noticed [Company] recently [specific trigger: raised a round / launched a new product / expanded to X market]. Congrats.\n\nWe built AuraOS — an AI operating system that lets business leaders manage their entire operation through a single chat interface. Engineering, growth, sales, research — all coordinated by AI agents.\n\nTwo fintech CTOs told us it cut their weekly ops overhead by 40%.\n\nWorth a 15-min look? I can show you the dashboard live.\n\n[Your name]\n\n---\n\n**Notes:**\n- Personalize the trigger event (check LinkedIn/Crunchbase)\n- Keep under 100 words\n- Follow up in 3 days if no reply',
+    E'Here''s a cold outreach template for a fintech CTO:\n\n---\n\n**Subject:** Quick question about [Company]''s AI ops\n\nHi [First Name],\n\nI noticed [Company] recently [specific trigger: raised a round / launched a new product / expanded to X market]. Congrats.\n\nWe built SalOS — an AI operating system that lets business leaders manage their entire operation through a single chat interface. Engineering, growth, sales, research — all coordinated by AI agents.\n\nTwo fintech CTOs told us it cut their weekly ops overhead by 40%.\n\nWorth a 15-min look? I can show you the dashboard live.\n\n[Your name]\n\n---\n\n**Notes:**\n- Personalize the trigger event (check LinkedIn/Crunchbase)\n- Keep under 100 words\n- Follow up in 3 days if no reply',
     8,
     '["outreach", "email", "template", "example"]'::jsonb
   UNION ALL

@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { supabase } from '@/integrations/supabase/client'
 import type { RealtimeChannel } from '@supabase/supabase-js'
 import type { Database } from '@/integrations/supabase/types'
@@ -10,42 +10,47 @@ export function useLiveChat(conversationId: string | null) {
   const [conversationIdState, setConversationIdState] = useState<string | null>(conversationId)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<Error | null>(null)
+  const [waitingForReply, setWaitingForReply] = useState(false)
   const effectiveConversationId = conversationId ?? conversationIdState
+  const convIdRef = useRef<string | null>(effectiveConversationId)
+  convIdRef.current = effectiveConversationId
 
-  // Fetch initial messages when we have a conversation id
+  const fetchMessages = useCallback(async (convId: string) => {
+    const { data } = await supabase
+      .from('chat_messages')
+      .select('*')
+      .eq('conversation_id', convId)
+      .order('created_at', { ascending: true })
+    if (data) {
+      setMessages(data as ChatMessageRow[])
+      const hasAssistantReply = data.some((m: { role: string }) => m.role !== 'user')
+      if (hasAssistantReply && data[data.length - 1]?.role !== 'user') {
+        setWaitingForReply(false)
+      }
+    }
+  }, [])
+
+  // Fetch messages when conversation changes
   useEffect(() => {
     if (!effectiveConversationId) {
       setMessages([])
       setLoading(false)
       return
     }
-
-    let cancelled = false
     setLoading(true)
-    setError(null)
+    fetchMessages(effectiveConversationId).finally(() => setLoading(false))
+  }, [effectiveConversationId, fetchMessages])
 
-    supabase
-      .from('chat_messages')
-      .select('*')
-      .eq('conversation_id', effectiveConversationId)
-      .order('created_at', { ascending: true })
-      .then(({ data, error: err }) => {
-        if (cancelled) return
-        if (err) {
-          setError(err as unknown as Error)
-          setMessages([])
-        } else {
-          setMessages((data as ChatMessageRow[]) ?? [])
-        }
-        setLoading(false)
-      })
+  // Poll for new messages while waiting for a reply
+  useEffect(() => {
+    if (!effectiveConversationId || !waitingForReply) return
+    const interval = setInterval(() => {
+      fetchMessages(effectiveConversationId)
+    }, 2000)
+    return () => clearInterval(interval)
+  }, [effectiveConversationId, waitingForReply, fetchMessages])
 
-    return () => {
-      cancelled = true
-    }
-  }, [effectiveConversationId])
-
-  // Realtime: subscribe to INSERT on chat_messages for this conversation
+  // Realtime subscription as primary update mechanism
   useEffect(() => {
     if (!effectiveConversationId) return
 
@@ -64,6 +69,9 @@ export function useLiveChat(conversationId: string | null) {
           setMessages((prev) =>
             prev.some((m) => m.id === row.id) ? prev : [...prev, row]
           )
+          if (row.role !== 'user') {
+            setWaitingForReply(false)
+          }
         }
       )
       .subscribe()
@@ -75,9 +83,8 @@ export function useLiveChat(conversationId: string | null) {
 
   const sendMessage = useCallback(
     async (text: string): Promise<void> => {
-      let convId = effectiveConversationId
+      let convId = convIdRef.current
 
-      // If no conversation yet, create one on first send
       if (!convId) {
         const { data: newConv, error: convError } = await supabase
           .from('conversations')
@@ -90,9 +97,24 @@ export function useLiveChat(conversationId: string | null) {
         }
         convId = newConv.id
         setConversationIdState(convId)
+        convIdRef.current = convId
       }
 
-      // a) Insert user message
+      // Optimistically add user message to UI
+      const optimisticMsg: ChatMessageRow = {
+        id: crypto.randomUUID(),
+        conversation_id: convId,
+        role: 'user',
+        content: text,
+        timestamp: new Date().toISOString(),
+        created_at: new Date().toISOString(),
+        tool_calls: null,
+        metadata: null,
+      }
+      setMessages((prev) => [...prev, optimisticMsg])
+      setWaitingForReply(true)
+
+      // Insert into DB
       const { error: msgError } = await supabase.from('chat_messages').insert({
         conversation_id: convId,
         role: 'user',
@@ -101,7 +123,7 @@ export function useLiveChat(conversationId: string | null) {
       })
       if (msgError) throw new Error(msgError.message)
 
-      // b) Look up orchestrator agent_definition_id
+      // Look up orchestrator
       const { data: orchestrator, error: agentError } = await supabase
         .from('agent_definitions')
         .select('id')
@@ -111,7 +133,7 @@ export function useLiveChat(conversationId: string | null) {
         throw new Error(agentError?.message ?? 'Orchestrator agent not found')
       }
 
-      // c) Insert pending task (marked internal so it stays hidden from the task pipeline)
+      // Create task
       const { data: newTask, error: taskError } = await supabase.from('tasks').insert({
         conversation_id: convId,
         agent_definition_id: orchestrator.id,
@@ -122,32 +144,16 @@ export function useLiveChat(conversationId: string | null) {
       }).select('id').single()
       if (taskError) throw new Error(taskError.message)
 
-      // d) Invoke the agent runner and refetch messages when it completes
-      try {
-        const resp = await fetch('/api/run-agent', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ task_id: newTask.id, conversation_id: convId }),
-        })
-        if (!resp.ok) {
-          const body = await resp.json().catch(() => ({}))
-          console.error('Agent runner error:', body)
-        }
-      } catch (fnError) {
+      // Fire-and-forget: polling + realtime will pick up the response
+      fetch('/api/run-agent', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ task_id: newTask.id, conversation_id: convId }),
+      }).catch((fnError) => {
         console.error('Agent runner error:', fnError)
-      }
-
-      // e) Refetch messages to pick up the orchestrator reply
-      const { data: refreshed } = await supabase
-        .from('chat_messages')
-        .select('*')
-        .eq('conversation_id', convId)
-        .order('created_at', { ascending: true })
-      if (refreshed) {
-        setMessages(refreshed as ChatMessageRow[])
-      }
+      })
     },
-    [effectiveConversationId]
+    []
   )
 
   return {

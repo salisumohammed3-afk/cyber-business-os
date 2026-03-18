@@ -6,5 +6,11 @@
     { "handle": "filesystem" },
     { "src": "/api/(.*)", "dest": "/api/$1" },
     { "src": "/(.*)", "dest": "/index.html" }
+  ],
+  "crons": [
+    {
+      "path": "/api/proactive-planner",
+      "schedule": "0 8 * * *"
+    }
   ]
 }

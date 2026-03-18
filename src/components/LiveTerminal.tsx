@@ -27,58 +27,49 @@ const LiveTerminal = () => {
   const [isExpanded, setIsExpanded] = useState(true);
   const [activeAgent, setActiveAgent] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const lastSeenTimestampRef = useRef<string>("2000-01-01T00:00:00Z");
 
-  // Fetch logs and poll for new ones
   useEffect(() => {
-    let lastSeenId: string | null = null;
-
     const fetchLogs = async (initial = false) => {
-      const limit = initial ? 30 : 50;
-      let query = supabase
-        .from("terminal_logs")
-        .select("*")
-        .order("created_at", { ascending: false })
-        .limit(limit);
-
-      if (!initial && lastSeenId) {
-        query = supabase
+      if (initial) {
+        const { data } = await supabase
           .from("terminal_logs")
           .select("*")
-          .gt("created_at", lines[lines.length - 1]?.created_at || "2000-01-01")
-          .order("created_at", { ascending: true })
-          .limit(20);
-      }
+          .order("created_at", { ascending: false })
+          .limit(30);
+        if (!data || data.length === 0) return;
 
-      const { data } = await query;
-      if (!data || data.length === 0) return;
-
-      if (initial) {
-        const sorted = data.reverse();
+        const sorted = [...data].reverse();
         setLines(sorted as LogEntry[]);
-        lastSeenId = sorted[sorted.length - 1]?.id || null;
-        const latest = data[0];
-        if (latest?.agent_slug) setActiveAgent(latest.agent_slug);
+        lastSeenTimestampRef.current = sorted[sorted.length - 1].created_at;
+        if (data[0]?.agent_slug) setActiveAgent(data[0].agent_slug);
       } else {
-        const sorted = data as LogEntry[];
-        if (sorted.length > 0 && sorted[sorted.length - 1].id !== lastSeenId) {
-          setLines((prev) => {
-            const existingIds = new Set(prev.map(l => l.id));
-            const newEntries = sorted.filter(l => !existingIds.has(l.id));
-            if (newEntries.length === 0) return prev;
-            const next = [...prev, ...newEntries];
-            return next.length > 100 ? next.slice(-100) : next;
-          });
-          lastSeenId = sorted[sorted.length - 1].id;
-          const latest = sorted[sorted.length - 1];
-          if (latest?.agent_slug) setActiveAgent(latest.agent_slug);
-        }
+        const { data } = await supabase
+          .from("terminal_logs")
+          .select("*")
+          .gt("created_at", lastSeenTimestampRef.current)
+          .order("created_at", { ascending: true })
+          .limit(30);
+        if (!data || data.length === 0) return;
+
+        const newRows = data as LogEntry[];
+        lastSeenTimestampRef.current = newRows[newRows.length - 1].created_at;
+        const latestAgent = newRows[newRows.length - 1].agent_slug;
+        if (latestAgent) setActiveAgent(latestAgent);
+
+        setLines((prev) => {
+          const existingIds = new Set(prev.map((l) => l.id));
+          const fresh = newRows.filter((l) => !existingIds.has(l.id));
+          if (fresh.length === 0) return prev;
+          const next = [...prev, ...fresh];
+          return next.length > 200 ? next.slice(-200) : next;
+        });
       }
     };
 
     fetchLogs(true);
-    const interval = setInterval(() => fetchLogs(false), 2000);
+    const interval = setInterval(() => fetchLogs(false), 1500);
 
-    // Also try realtime (works when Supabase WS is available)
     const channel = supabase
       .channel("terminal_logs_realtime")
       .on(
@@ -86,13 +77,13 @@ const LiveTerminal = () => {
         { event: "INSERT", schema: "public", table: "terminal_logs" },
         (payload) => {
           const row = payload.new as LogEntry;
-          setLines((prev) => {
-            if (prev.some(l => l.id === row.id)) return prev;
-            const next = [...prev, row];
-            return next.length > 100 ? next.slice(-100) : next;
-          });
+          lastSeenTimestampRef.current = row.created_at;
           if (row.agent_slug) setActiveAgent(row.agent_slug);
-          lastSeenId = row.id;
+          setLines((prev) => {
+            if (prev.some((l) => l.id === row.id)) return prev;
+            const next = [...prev, row];
+            return next.length > 200 ? next.slice(-200) : next;
+          });
         }
       )
       .subscribe();

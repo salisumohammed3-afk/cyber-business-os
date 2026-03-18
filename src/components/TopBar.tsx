@@ -5,7 +5,7 @@ const TopBar = () => {
   return (
     <div className="h-12 border-b border-border bg-background flex items-center px-4 gap-6">
       <span className="text-lg font-semibold tracking-tight text-foreground mr-4">
-        AuraOS
+        SalOS
       </span>
       <div className="h-4 w-px bg-border" />
       {metrics.map((m) => (

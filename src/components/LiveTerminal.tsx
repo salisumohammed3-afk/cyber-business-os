@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import { X, Minimize2, Maximize2 } from "lucide-react";
 import { supabase } from "@/integrations/supabase/client";
+import { useCompany } from "@/contexts/CompanyContext";
 
 interface LogEntry {
   id: string;
@@ -23,6 +24,8 @@ const logTypeColor: Record<string, string> = {
 };
 
 const LiveTerminal = () => {
+  const { company } = useCompany();
+  const companyId = company?.id;
   const [lines, setLines] = useState<LogEntry[]>([]);
   const [isExpanded, setIsExpanded] = useState(true);
   const [activeAgent, setActiveAgent] = useState<string | null>(null);
@@ -30,11 +33,17 @@ const LiveTerminal = () => {
   const lastSeenTimestampRef = useRef<string>("2000-01-01T00:00:00Z");
 
   useEffect(() => {
+    if (!companyId) return;
+
+    setLines([]);
+    lastSeenTimestampRef.current = "2000-01-01T00:00:00Z";
+
     const fetchLogs = async (initial = false) => {
       if (initial) {
         const { data } = await supabase
           .from("terminal_logs")
           .select("*")
+          .eq("company_id", companyId)
           .order("created_at", { ascending: false })
           .limit(30);
         if (!data || data.length === 0) return;
@@ -47,6 +56,7 @@ const LiveTerminal = () => {
         const { data } = await supabase
           .from("terminal_logs")
           .select("*")
+          .eq("company_id", companyId)
           .gt("created_at", lastSeenTimestampRef.current)
           .order("created_at", { ascending: true })
           .limit(30);
@@ -71,7 +81,7 @@ const LiveTerminal = () => {
     const interval = setInterval(() => fetchLogs(false), 1500);
 
     const channel = supabase
-      .channel("terminal_logs_realtime")
+      .channel(`terminal_logs_${companyId}`)
       .on(
         "postgres_changes",
         { event: "INSERT", schema: "public", table: "terminal_logs" },
@@ -92,7 +102,7 @@ const LiveTerminal = () => {
       clearInterval(interval);
       supabase.removeChannel(channel);
     };
-  }, []);
+  }, [companyId]);
 
   // Auto-scroll
   useEffect(() => {

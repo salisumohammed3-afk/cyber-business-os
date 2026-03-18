@@ -1,6 +1,7 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback } from "react";
 import { supabase } from "@/integrations/supabase/client";
+import { useCompany } from "@/contexts/CompanyContext";
 
 export type AgentStatus = "active" | "idle" | "thinking";
 
@@ -26,6 +27,7 @@ export interface Task {
   category?: string;
   description?: string;
   agent_definition_id?: string;
+  company_id?: string;
   created_at?: string;
   started_at?: string;
   completed_at?: string;
@@ -69,12 +71,17 @@ export function useAgents() {
 }
 
 export function useTasks() {
+  const { company } = useCompany();
+  const companyId = company?.id;
+
   return useQuery({
-    queryKey: ["tasks"],
+    queryKey: ["tasks", companyId],
     queryFn: async () => {
+      if (!companyId) return [];
       const { data, error } = await supabase
         .from("tasks")
         .select("*, agent_definitions(name, slug), task_results(result_type, data)")
+        .eq("company_id", companyId)
         .neq("source", "internal")
         .order("created_at", { ascending: false });
       if (error) throw error;
@@ -92,12 +99,14 @@ export function useTasks() {
       });
     },
     refetchInterval: 4000,
+    enabled: !!companyId,
   });
 }
 
 export function useTaskActions() {
   const queryClient = useQueryClient();
-  const invalidate = () => queryClient.invalidateQueries({ queryKey: ["tasks"] });
+  const { company } = useCompany();
+  const invalidate = () => queryClient.invalidateQueries({ queryKey: ["tasks", company?.id] });
 
   const approveTask = useCallback(async (taskId: string) => {
     await supabase.from("tasks").update({ status: "pending" as const }).eq("id", taskId);
@@ -107,7 +116,7 @@ export function useTaskActions() {
       body: JSON.stringify({ task_id: taskId }),
     }).catch((e) => console.error("Failed to invoke agent runner:", e));
     invalidate();
-  }, []);
+  }, [company?.id]);
 
   const runTask = useCallback(async (taskId: string) => {
     await supabase.from("tasks").update({ status: "pending" as const }).eq("id", taskId);
@@ -117,12 +126,12 @@ export function useTaskActions() {
       body: JSON.stringify({ task_id: taskId }),
     }).catch((e) => console.error("Failed to invoke agent runner:", e));
     invalidate();
-  }, []);
+  }, [company?.id]);
 
   const rejectTask = useCallback(async (taskId: string) => {
     await supabase.from("tasks").update({ status: "cancelled" as const }).eq("id", taskId);
     invalidate();
-  }, []);
+  }, [company?.id]);
 
   const retryTask = useCallback(async (taskId: string) => {
     await supabase.from("tasks").update({ status: "pending" as const, error_message: null, started_at: null, completed_at: null }).eq("id", taskId);
@@ -132,25 +141,26 @@ export function useTaskActions() {
       body: JSON.stringify({ task_id: taskId }),
     }).catch((e) => console.error("Failed to invoke agent runner:", e));
     invalidate();
-  }, []);
+  }, [company?.id]);
 
   const deleteTask = useCallback(async (taskId: string) => {
     await supabase.from("tasks").delete().eq("id", taskId);
     invalidate();
-  }, []);
+  }, [company?.id]);
 
   const repeatTask = useCallback(async (task: Task) => {
     await supabase.from("tasks").insert({
       title: task.title,
       description: task.description,
       agent_definition_id: task.agent_definition_id,
+      company_id: company?.id,
       status: "proposed" as const,
       source: task.source || "agent",
       tags: task.tags ? JSON.stringify(task.tags) : "[]",
       is_recurring: task.is_recurring || false,
     });
     invalidate();
-  }, []);
+  }, [company?.id]);
 
   return { approveTask, runTask, rejectTask, retryTask, deleteTask, repeatTask };
 }
@@ -178,25 +188,44 @@ export function useMetrics() {
 }
 
 export function useTerminalLogs() {
+  const { company } = useCompany();
+  const companyId = company?.id;
+
   return useQuery({
-    queryKey: ["terminal_logs"],
+    queryKey: ["terminal_logs", companyId],
     queryFn: async () => {
-      const { data, error } = await supabase.from("terminal_logs").select("*").order("created_at", { ascending: false }).limit(50);
+      if (!companyId) return [];
+      const { data, error } = await supabase
+        .from("terminal_logs")
+        .select("*")
+        .eq("company_id", companyId)
+        .order("created_at", { ascending: false })
+        .limit(50);
       if (error) throw error;
       return (data || []).map((row: { message: string }) => row.message);
     },
     refetchInterval: 3000,
+    enabled: !!companyId,
   });
 }
 
 export function useAgentDefinitions() {
+  const { company } = useCompany();
+  const companyId = company?.id;
+
   return useQuery({
-    queryKey: ["agent_definitions"],
+    queryKey: ["agent_definitions", companyId],
     queryFn: async () => {
-      const { data, error } = await supabase.from("agent_definitions").select("*").order("name");
+      if (!companyId) return [];
+      const { data, error } = await supabase
+        .from("agent_definitions")
+        .select("*")
+        .eq("company_id", companyId)
+        .order("name");
       if (error) throw error;
       return data;
     },
+    enabled: !!companyId,
   });
 }
 
@@ -210,15 +239,30 @@ export interface AgentToolRow {
 }
 
 export function useAgentTools() {
+  const { company } = useCompany();
+  const companyId = company?.id;
+
   return useQuery({
-    queryKey: ["agent_tools"],
+    queryKey: ["agent_tools", companyId],
     queryFn: async () => {
+      if (!companyId) return [];
+      // Get agent IDs for this company, then fetch their tools
+      const { data: agents } = await supabase
+        .from("agent_definitions")
+        .select("id")
+        .eq("company_id", companyId);
+
+      if (!agents?.length) return [];
+      const agentIds = agents.map((a: { id: string }) => a.id);
+
       const { data, error } = await supabase
         .from("agent_tools")
         .select("id, agent_id, tool_name, tool_type, connection_source, is_enabled")
+        .in("agent_id", agentIds)
         .eq("is_enabled", true);
       if (error) throw error;
       return (data || []) as AgentToolRow[];
     },
+    enabled: !!companyId,
   });
 }

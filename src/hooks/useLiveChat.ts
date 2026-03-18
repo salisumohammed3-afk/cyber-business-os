@@ -5,20 +5,40 @@ import type { Database } from '@/integrations/supabase/types'
 
 type ChatMessageRow = Database['public']['Tables']['chat_messages']['Row']
 
-const CONV_STORAGE_KEY = 'sal-os-conversation-id'
+function convStorageKey(companyId: string) {
+  return `sal-os-conv-${companyId}`
+}
 
-export function useLiveChat(conversationId: string | null) {
+export function useLiveChat(companyId: string | null) {
   const [messages, setMessages] = useState<ChatMessageRow[]>([])
   const [conversationIdState, setConversationIdState] = useState<string | null>(() => {
-    if (conversationId) return conversationId
-    try { return localStorage.getItem(CONV_STORAGE_KEY) } catch { return null }
+    if (!companyId) return null
+    try { return localStorage.getItem(convStorageKey(companyId)) } catch { return null }
   })
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<Error | null>(null)
   const [waitingForReply, setWaitingForReply] = useState(false)
-  const effectiveConversationId = conversationId ?? conversationIdState
-  const convIdRef = useRef<string | null>(effectiveConversationId)
-  convIdRef.current = effectiveConversationId
+  const convIdRef = useRef<string | null>(conversationIdState)
+  convIdRef.current = conversationIdState
+
+  // When companyId changes, load the stored conversation for that company
+  useEffect(() => {
+    if (!companyId) {
+      setConversationIdState(null)
+      setMessages([])
+      setLoading(false)
+      return
+    }
+    try {
+      const stored = localStorage.getItem(convStorageKey(companyId))
+      setConversationIdState(stored)
+      convIdRef.current = stored
+    } catch {
+      setConversationIdState(null)
+    }
+    setMessages([])
+    setWaitingForReply(false)
+  }, [companyId])
 
   const fetchMessages = useCallback(async (convId: string) => {
     const { data } = await supabase
@@ -35,39 +55,36 @@ export function useLiveChat(conversationId: string | null) {
     }
   }, [])
 
-  // Fetch messages when conversation changes
   useEffect(() => {
-    if (!effectiveConversationId) {
+    if (!conversationIdState) {
       setMessages([])
       setLoading(false)
       return
     }
     setLoading(true)
-    fetchMessages(effectiveConversationId).finally(() => setLoading(false))
-  }, [effectiveConversationId, fetchMessages])
+    fetchMessages(conversationIdState).finally(() => setLoading(false))
+  }, [conversationIdState, fetchMessages])
 
-  // Poll for new messages while waiting for a reply
   useEffect(() => {
-    if (!effectiveConversationId || !waitingForReply) return
+    if (!conversationIdState || !waitingForReply) return
     const interval = setInterval(() => {
-      fetchMessages(effectiveConversationId)
+      fetchMessages(conversationIdState)
     }, 2000)
     return () => clearInterval(interval)
-  }, [effectiveConversationId, waitingForReply, fetchMessages])
+  }, [conversationIdState, waitingForReply, fetchMessages])
 
-  // Realtime subscription as primary update mechanism
   useEffect(() => {
-    if (!effectiveConversationId) return
+    if (!conversationIdState) return
 
     const channel: RealtimeChannel = supabase
-      .channel(`chat_messages:${effectiveConversationId}`)
+      .channel(`chat_messages:${conversationIdState}`)
       .on(
         'postgres_changes',
         {
           event: 'INSERT',
           schema: 'public',
           table: 'chat_messages',
-          filter: `conversation_id=eq.${effectiveConversationId}`,
+          filter: `conversation_id=eq.${conversationIdState}`,
         },
         (payload) => {
           const row = payload.new as ChatMessageRow
@@ -84,16 +101,18 @@ export function useLiveChat(conversationId: string | null) {
     return () => {
       supabase.removeChannel(channel)
     }
-  }, [effectiveConversationId])
+  }, [conversationIdState])
 
   const sendMessage = useCallback(
     async (text: string): Promise<void> => {
+      if (!companyId) throw new Error('No company selected')
+
       let convId = convIdRef.current
 
       if (!convId) {
         const { data: newConv, error: convError } = await supabase
           .from('conversations')
-          .insert({ title: 'New conversation' })
+          .insert({ title: 'New conversation', company_id: companyId })
           .select('id')
           .single()
 
@@ -103,10 +122,9 @@ export function useLiveChat(conversationId: string | null) {
         convId = newConv.id
         setConversationIdState(convId)
         convIdRef.current = convId
-        try { localStorage.setItem(CONV_STORAGE_KEY, convId) } catch { /* noop */ }
+        try { localStorage.setItem(convStorageKey(companyId), convId) } catch { /* noop */ }
       }
 
-      // Optimistically add user message to UI
       const optimisticMsg: ChatMessageRow = {
         id: crypto.randomUUID(),
         conversation_id: convId,
@@ -120,7 +138,6 @@ export function useLiveChat(conversationId: string | null) {
       setMessages((prev) => [...prev, optimisticMsg])
       setWaitingForReply(true)
 
-      // Insert into DB
       const { error: msgError } = await supabase.from('chat_messages').insert({
         conversation_id: convId,
         role: 'user',
@@ -129,20 +146,20 @@ export function useLiveChat(conversationId: string | null) {
       })
       if (msgError) throw new Error(msgError.message)
 
-      // Look up orchestrator
       const { data: orchestrator, error: agentError } = await supabase
         .from('agent_definitions')
         .select('id')
         .eq('slug', 'orchestrator')
+        .eq('company_id', companyId)
         .single()
       if (agentError || !orchestrator?.id) {
-        throw new Error(agentError?.message ?? 'Orchestrator agent not found')
+        throw new Error(agentError?.message ?? 'Orchestrator agent not found for this company')
       }
 
-      // Create task
       const { data: newTask, error: taskError } = await supabase.from('tasks').insert({
         conversation_id: convId,
         agent_definition_id: orchestrator.id,
+        company_id: companyId,
         status: 'pending',
         title: 'Respond to user message',
         description: text,
@@ -150,7 +167,6 @@ export function useLiveChat(conversationId: string | null) {
       }).select('id').single()
       if (taskError) throw new Error(taskError.message)
 
-      // Fire-and-forget: polling + realtime will pick up the response
       fetch('/api/run-agent', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -159,12 +175,12 @@ export function useLiveChat(conversationId: string | null) {
         console.error('Agent runner error:', fnError)
       })
     },
-    []
+    [companyId]
   )
 
   return {
     messages,
-    conversationId: effectiveConversationId,
+    conversationId: conversationIdState,
     loading,
     error,
     sendMessage,

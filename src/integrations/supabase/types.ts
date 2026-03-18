@@ -15,9 +15,143 @@ export type TaskStatus =
   | 'pending'
   | 'cancelled'
 
+export type GoalStatus = 'active' | 'achieved' | 'paused' | 'abandoned'
+
+export type BusinessStage = 'idea' | 'building' | 'pre-revenue' | 'early-revenue' | 'scaling' | 'established'
+
+export interface CompanyBrief {
+  what_we_do?: string
+  stage?: BusinessStage
+  target_customers?: string
+  key_products?: Array<{ name: string; description: string }>
+  team?: Array<{ name: string; role: string }>
+  tone_of_voice?: string
+  context_notes?: string
+}
+
 export interface Database {
   public: {
     Tables: {
+      companies: {
+        Row: {
+          id: string
+          owner_id: string
+          name: string
+          slug: string
+          brief: CompanyBrief
+          is_active: boolean
+          created_at: string
+        }
+        Insert: {
+          id?: string
+          owner_id?: string
+          name: string
+          slug: string
+          brief?: Json
+          is_active?: boolean
+          created_at?: string
+        }
+        Update: {
+          id?: string
+          owner_id?: string
+          name?: string
+          slug?: string
+          brief?: Json
+          is_active?: boolean
+          created_at?: string
+        }
+      }
+      company_goals: {
+        Row: {
+          id: string
+          company_id: string
+          title: string
+          description: string | null
+          target_metric: string | null
+          target_value: number | null
+          current_value: number
+          timeframe: string | null
+          status: GoalStatus
+          priority: number
+          created_at: string
+          updated_at: string
+        }
+        Insert: {
+          id?: string
+          company_id: string
+          title: string
+          description?: string | null
+          target_metric?: string | null
+          target_value?: number | null
+          current_value?: number
+          timeframe?: string | null
+          status?: GoalStatus
+          priority?: number
+          created_at?: string
+          updated_at?: string
+        }
+        Update: {
+          id?: string
+          company_id?: string
+          title?: string
+          description?: string | null
+          target_metric?: string | null
+          target_value?: number | null
+          current_value?: number
+          timeframe?: string | null
+          status?: GoalStatus
+          priority?: number
+          created_at?: string
+          updated_at?: string
+        }
+      }
+      base_agent_definitions: {
+        Row: {
+          id: string
+          name: string | null
+          slug: string
+          description: string | null
+          system_prompt: string | null
+          model: string | null
+          allowed_tools: Json | null
+          is_orchestrator: boolean
+          max_turns: number
+          temperature: number
+          default_tools: Json
+          created_at: string
+          updated_at: string
+        }
+        Insert: {
+          id?: string
+          name?: string | null
+          slug: string
+          description?: string | null
+          system_prompt?: string | null
+          model?: string | null
+          allowed_tools?: Json | null
+          is_orchestrator?: boolean
+          max_turns?: number
+          temperature?: number
+          default_tools?: Json
+          created_at?: string
+          updated_at?: string
+        }
+        Update: {
+          id?: string
+          name?: string | null
+          slug?: string
+          description?: string | null
+          system_prompt?: string | null
+          model?: string | null
+          allowed_tools?: Json | null
+          is_orchestrator?: boolean
+          max_turns?: number
+          temperature?: number
+          default_tools?: Json
+          created_at?: string
+          updated_at?: string
+        }
+      }
       users: {
         Row: {
           id: string
@@ -45,6 +179,7 @@ export interface Database {
         Row: {
           id: string
           user_id: string | null
+          company_id: string | null
           title: string | null
           metadata: Json | null
           created_at: string
@@ -53,6 +188,7 @@ export interface Database {
         Insert: {
           id?: string
           user_id?: string | null
+          company_id?: string | null
           title?: string | null
           metadata?: Json | null
           created_at?: string
@@ -61,6 +197,7 @@ export interface Database {
         Update: {
           id?: string
           user_id?: string | null
+          company_id?: string | null
           title?: string | null
           metadata?: Json | null
           created_at?: string
@@ -70,6 +207,7 @@ export interface Database {
       agent_definitions: {
         Row: {
           id: string
+          company_id: string
           name: string | null
           slug: string
           description: string | null
@@ -84,6 +222,7 @@ export interface Database {
         }
         Insert: {
           id?: string
+          company_id: string
           name?: string | null
           slug: string
           description?: string | null
@@ -98,6 +237,7 @@ export interface Database {
         }
         Update: {
           id?: string
+          company_id?: string
           name?: string | null
           slug?: string
           description?: string | null
@@ -187,6 +327,7 @@ export interface Database {
       tasks: {
         Row: {
           id: string
+          company_id: string | null
           conversation_id: string | null
           agent_definition_id: string | null
           parent_task_id: string | null
@@ -208,6 +349,7 @@ export interface Database {
         }
         Insert: {
           id?: string
+          company_id?: string | null
           conversation_id?: string | null
           agent_definition_id?: string | null
           parent_task_id?: string | null
@@ -229,6 +371,7 @@ export interface Database {
         }
         Update: {
           id?: string
+          company_id?: string | null
           conversation_id?: string | null
           agent_definition_id?: string | null
           parent_task_id?: string | null
@@ -276,6 +419,7 @@ export interface Database {
         Row: {
           id: string
           user_id: string
+          company_id: string | null
           agent_definition_id: string | null
           category: string | null
           content: string | null
@@ -287,6 +431,7 @@ export interface Database {
         Insert: {
           id?: string
           user_id?: string
+          company_id?: string | null
           agent_definition_id?: string | null
           category?: string | null
           content?: string | null
@@ -298,6 +443,7 @@ export interface Database {
         Update: {
           id?: string
           user_id?: string
+          company_id?: string | null
           agent_definition_id?: string | null
           category?: string | null
           content?: string | null
@@ -374,6 +520,7 @@ export interface Database {
     }
     Enums: {
       task_status: TaskStatus
+      goal_status: GoalStatus
     }
   }
 }

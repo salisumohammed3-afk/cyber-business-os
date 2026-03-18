@@ -2,14 +2,15 @@ import Anthropic from "@anthropic-ai/sdk";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 
-export const maxDuration = 60;
+export const maxDuration = 120;
 
-const PLANNER_SYSTEM_PROMPT = `You are the Proactive Planner for a Cyber Business Operating System. Your job is to review the current state of the business — recent tasks, agent capabilities, stored memories, and ongoing work — then propose 1-5 high-value tasks that should be done next.
+const PLANNER_SYSTEM_PROMPT = `You are the Proactive Planner for a Cyber Business Operating System. Your job is to review the current state of the business — recent tasks, agent capabilities, stored memories, active goals, and ongoing work — then propose 1-5 high-value tasks that should be done next.
 
 Each task you propose should be:
 - Actionable and specific (not vague like "improve things")
 - Assigned to the most appropriate specialist agent
 - Prioritized by business impact
+- Aligned with the company's active goals
 
 Available agents and their strengths:
 - orchestrator: Overall coordination, strategy, user communication
@@ -40,12 +41,30 @@ Example:
   }
 ]`;
 
-async function getBusinessContext(supabase: SupabaseClient): Promise<string> {
-  const sections: string[] = [];
+async function getBusinessContext(supabase: SupabaseClient, companyId: string, companyName: string): Promise<string> {
+  const sections: string[] = [`# Company: ${companyName}`];
+
+  // Goals
+  const { data: goals } = await supabase
+    .from("company_goals")
+    .select("title, target_metric, target_value, current_value, timeframe, priority, status")
+    .eq("company_id", companyId)
+    .eq("status", "active")
+    .order("priority", { ascending: true });
+
+  if (goals?.length) {
+    sections.push(
+      "## Active Goals\n" +
+        goals.map((g, i) =>
+          `${i + 1}. ${g.title} (${g.current_value ?? 0}/${g.target_value ?? "?"} ${g.target_metric || ""}) — ${g.timeframe || "ongoing"}`
+        ).join("\n")
+    );
+  }
 
   const { data: recentTasks } = await supabase
     .from("tasks")
     .select("title, status, source, created_at")
+    .eq("company_id", companyId)
     .order("created_at", { ascending: false })
     .limit(20);
 
@@ -61,6 +80,7 @@ async function getBusinessContext(supabase: SupabaseClient): Promise<string> {
   const { data: memories } = await supabase
     .from("memories")
     .select("content, category, importance")
+    .eq("company_id", companyId)
     .order("importance", { ascending: false })
     .limit(15);
 
@@ -73,7 +93,8 @@ async function getBusinessContext(supabase: SupabaseClient): Promise<string> {
 
   const { data: agents } = await supabase
     .from("agent_definitions")
-    .select("slug, name, description");
+    .select("slug, name, description")
+    .eq("company_id", companyId);
 
   if (agents?.length) {
     sections.push(
@@ -85,6 +106,7 @@ async function getBusinessContext(supabase: SupabaseClient): Promise<string> {
   const { count: activeCount } = await supabase
     .from("tasks")
     .select("id", { count: "exact", head: true })
+    .eq("company_id", companyId)
     .in("status", ["proposed", "pending", "running"]);
 
   sections.push(`## Pipeline Status\n- Active/proposed tasks: ${activeCount ?? 0}`);
@@ -109,87 +131,114 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   const supabase = createClient(supabaseUrl, supabaseKey);
   const anthropic = new Anthropic({ apiKey: anthropicKey });
 
-  try {
-    await supabase.from("terminal_logs").insert({
-      message: "Proactive planner triggered — gathering business context...",
-      source: "proactive-planner",
-      log_type: "planner_start",
-    });
+  // Load all active companies
+  const { data: companies, error: compErr } = await supabase
+    .from("companies")
+    .select("id, name")
+    .eq("is_active", true);
 
-    const context = await getBusinessContext(supabase);
+  if (compErr || !companies?.length) {
+    return res.status(200).json({ proposed: 0, note: "No active companies" });
+  }
 
-    const response = await anthropic.messages.create({
-      model: "claude-sonnet-4-20250514",
-      max_tokens: 2048,
-      temperature: 0.8,
-      system: PLANNER_SYSTEM_PROMPT,
-      messages: [
-        {
-          role: "user",
-          content: `Here is the current business state. Based on this, propose 1-5 high-value tasks that should be done next.\n\n${context}`,
-        },
-      ],
-    });
+  const results: Array<{ company: string; proposed: number; tasks: string[] }> = [];
 
-    const textContent = response.content.find((b) => b.type === "text");
-    const rawText = textContent?.type === "text" ? textContent.text : "[]";
-
-    let tasks: Array<{
-      title: string;
-      description: string;
-      agent_slug: string;
-      priority: number;
-      tags: string[];
-    }>;
-
+  for (const comp of companies) {
     try {
-      const jsonMatch = rawText.match(/\[[\s\S]*\]/);
-      tasks = jsonMatch ? JSON.parse(jsonMatch[0]) : [];
-    } catch {
       await supabase.from("terminal_logs").insert({
-        message: `Planner returned unparseable response: ${rawText.slice(0, 200)}`,
+        message: `Proactive planner triggered for ${comp.name} — gathering business context...`,
+        source: "proactive-planner",
+        log_type: "planner_start",
+        company_id: comp.id,
+      });
+
+      const context = await getBusinessContext(supabase, comp.id, comp.name);
+
+      const response = await anthropic.messages.create({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 2048,
+        temperature: 0.8,
+        system: PLANNER_SYSTEM_PROMPT,
+        messages: [
+          {
+            role: "user",
+            content: `Here is the current business state for "${comp.name}". Based on this, propose 1-5 high-value tasks that should be done next.\n\n${context}`,
+          },
+        ],
+      });
+
+      const textContent = response.content.find((b) => b.type === "text");
+      const rawText = textContent?.type === "text" ? textContent.text : "[]";
+
+      let tasks: Array<{
+        title: string;
+        description: string;
+        agent_slug: string;
+        priority: number;
+        tags: string[];
+      }>;
+
+      try {
+        const jsonMatch = rawText.match(/\[[\s\S]*\]/);
+        tasks = jsonMatch ? JSON.parse(jsonMatch[0]) : [];
+      } catch {
+        await supabase.from("terminal_logs").insert({
+          message: `Planner returned unparseable response for ${comp.name}: ${rawText.slice(0, 200)}`,
+          source: "proactive-planner",
+          log_type: "planner_error",
+          company_id: comp.id,
+        });
+        results.push({ company: comp.name, proposed: 0, tasks: [] });
+        continue;
+      }
+
+      const { data: agentDefs } = await supabase
+        .from("agent_definitions")
+        .select("id, slug")
+        .eq("company_id", comp.id);
+
+      const slugToId: Record<string, string> = {};
+      for (const a of (agentDefs || []) as Array<{ id: string; slug: string }>) slugToId[a.slug] = a.id;
+
+      let proposed = 0;
+      for (const t of tasks) {
+        const agentId = slugToId[t.agent_slug];
+        if (!agentId) continue;
+
+        const { error } = await supabase.from("tasks").insert({
+          title: t.title,
+          description: t.description,
+          agent_definition_id: agentId,
+          company_id: comp.id,
+          status: "proposed",
+          priority: t.priority || 5,
+          source: "proactive",
+          tags: JSON.stringify(t.tags || []),
+        });
+
+        if (!error) proposed++;
+      }
+
+      await supabase.from("terminal_logs").insert({
+        message: `Proactive planner completed for ${comp.name} — proposed ${proposed} task(s)`,
+        source: "proactive-planner",
+        log_type: "planner_complete",
+        company_id: comp.id,
+      });
+
+      results.push({ company: comp.name, proposed, tasks: tasks.map((t) => t.title) });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Unknown error";
+      await supabase.from("terminal_logs").insert({
+        message: `Proactive planner error for ${comp.name}: ${msg}`,
         source: "proactive-planner",
         log_type: "planner_error",
+        company_id: comp.id,
       });
-      return res.status(200).json({ proposed: 0, error: "Failed to parse planner response" });
+      results.push({ company: comp.name, proposed: 0, tasks: [] });
     }
-
-    const { data: agentDefs } = await supabase.from("agent_definitions").select("id, slug");
-    const slugToId: Record<string, string> = {};
-    for (const a of (agentDefs || []) as Array<{ id: string; slug: string }>) slugToId[a.slug] = a.id;
-
-    let proposed = 0;
-    for (const t of tasks) {
-      const agentId = slugToId[t.agent_slug];
-      if (!agentId) continue;
-
-      const { error } = await supabase.from("tasks").insert({
-        title: t.title,
-        description: t.description,
-        agent_definition_id: agentId,
-        status: "proposed",
-        priority: t.priority || 5,
-        source: "proactive",
-        tags: JSON.stringify(t.tags || []),
-      });
-
-      if (!error) proposed++;
-    }
-
-    await supabase.from("terminal_logs").insert({
-      message: `Proactive planner completed — proposed ${proposed} task(s)`,
-      source: "proactive-planner",
-      log_type: "planner_complete",
-    });
-
-    return res.status(200).json({ proposed, tasks: tasks.map((t) => t.title) });
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : "Unknown error";
-    await supabase.from("terminal_logs").insert({
-      message: `Proactive planner error: ${msg}`,
-      source: "proactive-planner",
-      log_type: "planner_error",
-    });
-    return res.status(500).json({ error: msg });
   }
+
+  const totalProposed = results.reduce((sum, r) => sum + r.proposed, 0);
+  return res.status(200).json({ total_proposed: totalProposed, results });
 }

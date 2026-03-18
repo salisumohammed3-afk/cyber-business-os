@@ -2,16 +2,15 @@ import { useRef, useEffect, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import { Bot } from 'lucide-react'
 import { useLiveChat } from '@/hooks/useLiveChat'
+import { useCompany } from '@/contexts/CompanyContext'
 
-type ConversationIdProp = string | null
-
-export function CEOChat({ conversationId }: { conversationId?: ConversationIdProp }) {
-  const { messages, loading, error, sendMessage } = useLiveChat(conversationId ?? null)
+export function CEOChat() {
+  const { company } = useCompany()
+  const { messages, loading, error, sendMessage } = useLiveChat(company?.id ?? null)
   const scrollContainerRef = useRef<HTMLDivElement>(null)
   const [inputValue, setInputValue] = useState('')
   const [sending, setSending] = useState(false)
 
-  // Auto-scroll to bottom when messages change
   useEffect(() => {
     scrollContainerRef.current?.scrollTo({
       top: scrollContainerRef.current.scrollHeight,
@@ -52,6 +51,13 @@ export function CEOChat({ conversationId }: { conversationId?: ConversationIdPro
         {error && (
           <div className="rounded-lg bg-red-50 p-3 text-sm text-red-700">
             {error.message}
+          </div>
+        )}
+        {!loading && messages.length === 0 && (
+          <div className="flex flex-col items-center justify-center h-full text-center text-muted-foreground">
+            <Bot size={32} className="mb-2 opacity-50" />
+            <p className="text-sm">Chat with your {company?.name || ''} team</p>
+            <p className="text-xs mt-1 opacity-70">Messages are scoped to this company</p>
           </div>
         )}
         {!loading &&
@@ -98,13 +104,13 @@ export function CEOChat({ conversationId }: { conversationId?: ConversationIdPro
           type="text"
           value={inputValue}
           onChange={(e) => setInputValue(e.target.value)}
-          placeholder="Type a message..."
-          disabled={sending}
+          placeholder={company ? `Message ${company.name}...` : 'Select a company first'}
+          disabled={sending || !company}
           className="flex-1 rounded-lg border border-gray-300 px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50 disabled:cursor-not-allowed"
         />
         <button
           type="submit"
-          disabled={sending || !inputValue.trim()}
+          disabled={sending || !inputValue.trim() || !company}
           className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
         >
           Send

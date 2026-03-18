@@ -21,6 +21,7 @@ type McpServerDef = Anthropic.Beta.Messages.BetaRequestMCPServerURLDefinition;
 interface ToolContext {
   conversationId: string;
   parentTaskId: string;
+  companyId: string;
   supabaseUrl: string;
   supabaseKey: string;
   anthropic: Anthropic;
@@ -218,9 +219,9 @@ async function executeLocalTool(
     case "create_task":
       return executeCreateTask(supabase, toolInput, context);
     case "store_memory":
-      return executeStoreMemory(supabase, toolInput);
+      return executeStoreMemory(supabase, toolInput, context);
     case "recall_memories":
-      return executeRecallMemories(supabase, toolInput);
+      return executeRecallMemories(supabase, toolInput, context);
     case "delegate_task":
       return executeDelegateTask(supabase, toolInput, context);
     case "design_system_search":
@@ -303,10 +304,11 @@ async function executeCreateTask(
       .from("agent_definitions")
       .select("id, name")
       .eq("slug", agentSlug)
+      .eq("company_id", context.companyId)
       .single();
 
     if (!agentDef) {
-      return JSON.stringify({ error: `Agent '${agentSlug}' not found` });
+      return JSON.stringify({ error: `Agent '${agentSlug}' not found in this company` });
     }
 
     const { data: task, error } = await supabase
@@ -317,6 +319,7 @@ async function executeCreateTask(
         agent_definition_id: agentDef.id,
         conversation_id: context.conversationId,
         parent_task_id: context.parentTaskId,
+        company_id: context.companyId,
         priority: (input.priority as number) || 5,
         status: "proposed",
         source: "chat",
@@ -331,13 +334,14 @@ async function executeCreateTask(
   }
 }
 
-async function executeStoreMemory(supabase: SupabaseClient, input: Record<string, unknown>): Promise<string> {
+async function executeStoreMemory(supabase: SupabaseClient, input: Record<string, unknown>, context: ToolContext): Promise<string> {
   try {
     const { error } = await supabase.from("memories").insert({
       content: input.content as string,
       category: input.category as string,
       importance: (input.importance as number) || 5,
       user_id: "00000000-0000-0000-0000-000000000000",
+      company_id: context.companyId,
       metadata: { source: "agent" },
     });
 
@@ -348,7 +352,7 @@ async function executeStoreMemory(supabase: SupabaseClient, input: Record<string
   }
 }
 
-async function executeRecallMemories(supabase: SupabaseClient, input: Record<string, unknown>): Promise<string> {
+async function executeRecallMemories(supabase: SupabaseClient, input: Record<string, unknown>, context: ToolContext): Promise<string> {
   try {
     const query = input.query as string;
     const category = input.category as string | undefined;
@@ -357,6 +361,7 @@ async function executeRecallMemories(supabase: SupabaseClient, input: Record<str
     let q = supabase
       .from("memories")
       .select("content, category, importance, created_at")
+      .eq("company_id", context.companyId)
       .order("importance", { ascending: false })
       .limit(limit);
 
@@ -449,10 +454,11 @@ async function executeDelegateTask(
       .from("agent_definitions")
       .select("id, name, slug")
       .eq("slug", agentSlug)
+      .eq("company_id", context.companyId)
       .single();
 
     if (!agentDef) {
-      return JSON.stringify({ error: `Agent '${agentSlug}' not found. Available: engineering, growth, sales, research, outreach` });
+      return JSON.stringify({ error: `Agent '${agentSlug}' not found in this company. Available: engineering, growth, sales, research, outreach, browser, designer, taskmaster` });
     }
 
     if (agentDef.slug === context.currentAgentSlug) {
@@ -467,6 +473,7 @@ async function executeDelegateTask(
         agent_definition_id: agentDef.id,
         conversation_id: context.conversationId,
         parent_task_id: context.parentTaskId,
+        company_id: context.companyId,
         status: "proposed",
         input_data: { instruction, context: extraContext },
         source: "agent",
@@ -497,7 +504,7 @@ async function executeDelegateTask(
 async function termLog(
   supabase: SupabaseClient,
   message: string,
-  opts: { source?: string; agentSlug?: string; taskId?: string; logType?: string } = {}
+  opts: { source?: string; agentSlug?: string; taskId?: string; logType?: string; companyId?: string } = {}
 ) {
   try {
     await supabase.from("terminal_logs").insert({
@@ -506,6 +513,7 @@ async function termLog(
       agent_slug: opts.agentSlug || null,
       task_id: opts.taskId || null,
       log_type: opts.logType || "info",
+      company_id: opts.companyId || null,
     });
   } catch {
     // Non-critical
@@ -514,16 +522,20 @@ async function termLog(
 
 // ── Memory injection ────────────────────────────────────────────────────────
 
-async function getRelevantMemories(supabase: SupabaseClient, userMessage: string): Promise<string> {
+async function getRelevantMemories(supabase: SupabaseClient, userMessage: string, companyId?: string): Promise<string> {
   try {
     const keywords = userMessage.split(/\s+/).filter(w => w.length > 3).slice(0, 5);
     if (keywords.length === 0) return "";
 
-    const { data } = await supabase
+    let q = supabase
       .from("memories")
       .select("content, category, importance")
       .order("importance", { ascending: false })
       .limit(10);
+
+    if (companyId) q = q.eq("company_id", companyId);
+
+    const { data } = await q;
 
     if (!data || data.length === 0) return "";
 
@@ -592,8 +604,9 @@ async function runAgentLoop(params: {
       return;
     }
 
+    const taskCompanyId = task.company_id as string | undefined;
     await termLog(supabase, `Task ${task_id.slice(0, 8)} started — loading agent config...`, {
-      taskId: task_id, agentSlug: agentSlugForLog, logType: "task_start",
+      taskId: task_id, agentSlug: agentSlugForLog, logType: "task_start", companyId: taskCompanyId,
     });
 
     // 2. Read agent definition
@@ -620,10 +633,70 @@ async function runAgentLoop(params: {
         agentSlugForLog = agentDef.slug || agentSlugForLog;
 
         await termLog(supabase, `Agent loaded: ${agentDef.name} (${agentDef.slug}) — model: ${model}`, {
-          taskId: task_id, agentSlug: agentDef.slug, logType: "agent_loaded",
+          taskId: task_id, agentSlug: agentDef.slug, logType: "agent_loaded", companyId: taskCompanyId,
         });
       }
     }
+
+    // 2b. Resolve company_id and inject company brief + goals
+    const companyId = task.company_id as string | null;
+    let resolvedCompanyId = companyId || "11111111-1111-1111-1111-111111111111";
+
+    if (!companyId && task.agent_definition_id) {
+      const { data: agentForCompany } = await supabase
+        .from("agent_definitions")
+        .select("company_id")
+        .eq("id", task.agent_definition_id)
+        .single();
+      if (agentForCompany?.company_id) resolvedCompanyId = agentForCompany.company_id;
+    }
+
+    // Load company brief
+    const { data: company } = await supabase
+      .from("companies")
+      .select("name, brief")
+      .eq("id", resolvedCompanyId)
+      .single();
+
+    if (company?.brief) {
+      const b = company.brief as Record<string, unknown>;
+      const briefParts: string[] = [];
+      if (b.what_we_do) briefParts.push(`Business: ${b.what_we_do}`);
+      if (b.stage) briefParts.push(`Stage: ${b.stage}`);
+      if (b.target_customers) briefParts.push(`Target customers: ${b.target_customers}`);
+      if (b.tone_of_voice) briefParts.push(`Tone: ${b.tone_of_voice}`);
+      if (b.context_notes) briefParts.push(`Notes: ${b.context_notes}`);
+      if (briefParts.length > 0) {
+        systemPrompt += `\n\n## Company Context (${company.name})\n` + briefParts.join("\n");
+      }
+    }
+
+    // Load and inject active goals
+    const { data: goals } = await supabase
+      .from("company_goals")
+      .select("title, target_metric, target_value, current_value, timeframe, priority")
+      .eq("company_id", resolvedCompanyId)
+      .eq("status", "active")
+      .order("priority", { ascending: true });
+
+    if (goals?.length) {
+      const goalLines = goals.map((g, i) =>
+        `${i + 1}. ${g.title}` +
+        (g.target_metric ? ` (${g.current_value ?? 0}/${g.target_value ?? "?"} ${g.target_metric})` : "") +
+        (g.timeframe ? ` — ${g.timeframe}` : "")
+      );
+      systemPrompt += `\n\n## Active Goals for ${company?.name || "this company"} (ordered by priority)\n` +
+        goalLines.join("\n") +
+        "\n\nWhen responding or deciding what to do, reference these goals. If an action could move a goal forward, mention it. Prioritize based on goal urgency and progress.";
+
+      await termLog(supabase, `Injected ${goals.length} active goal(s) into system prompt`, {
+        taskId: task_id, agentSlug: agentSlugForLog, logType: "goals_loaded", companyId: taskCompanyId,
+      });
+    }
+
+    // Scoped terminal logger that auto-includes company_id
+    const clog = (msg: string, opts: { source?: string; agentSlug?: string; taskId?: string; logType?: string } = {}) =>
+      termLog(supabase, msg, { ...opts, companyId: resolvedCompanyId });
 
     // 3. Load tools (base local + agent-specific + Composio MCP)
     const localTools = [
@@ -636,13 +709,13 @@ async function runAgentLoop(params: {
       try {
         mcpServers = await buildComposioMcp(composioToolkits);
       } catch (mcpErr) {
-        await termLog(supabase, `Composio MCP setup failed (${mcpErr instanceof Error ? mcpErr.message : "unknown"}), continuing with local tools only`, {
+        await clog(`Composio MCP setup failed (${mcpErr instanceof Error ? mcpErr.message : "unknown"}), continuing with local tools only`, {
           taskId: task_id, agentSlug: agentSlugForLog, logType: "error",
         });
       }
     }
 
-    await termLog(supabase, `Loaded ${localTools.length} local tools, ${composioToolkits.length} Composio toolkit(s)${mcpServers ? ` (${composioToolkits.join(", ")})` : " (MCP disabled)"}`, {
+    await clog(`Loaded ${localTools.length} local tools, ${composioToolkits.length} Composio toolkit(s)${mcpServers ? ` (${composioToolkits.join(", ")})` : " (MCP disabled)"}`, {
       taskId: task_id, agentSlug: agentSlugForLog, logType: "tools_loaded",
     });
 
@@ -671,17 +744,17 @@ async function runAgentLoop(params: {
       messages.push({ role: "user", content: `YOUR TASK: ${taskInstruction}\n\nUse your available tools to complete this task. Do not just describe what you would do — actually do it.` });
     }
 
-    await termLog(supabase, `Loaded ${messages.length} messages from conversation history`, {
+    await clog(`Loaded ${messages.length} messages from conversation history`, {
       taskId: task_id, agentSlug: agentSlugForLog, logType: "context_loaded",
     });
 
     // 5. Inject relevant memories into system prompt
     const lastUserMsg = messages.filter(m => m.role === "user").pop();
     if (lastUserMsg && typeof lastUserMsg.content === "string") {
-      const memoryContext = await getRelevantMemories(supabase, lastUserMsg.content);
+      const memoryContext = await getRelevantMemories(supabase, lastUserMsg.content, resolvedCompanyId);
       if (memoryContext) {
         systemPrompt += memoryContext;
-        await termLog(supabase, `Injected relevant memories into context`, {
+        await clog(`Injected relevant memories into context`, {
           taskId: task_id, agentSlug: agentSlugForLog, logType: "memory_recall",
         });
       }
@@ -691,6 +764,7 @@ async function runAgentLoop(params: {
     const toolContext: ToolContext = {
       conversationId: conversation_id,
       parentTaskId: task_id,
+      companyId: resolvedCompanyId,
       supabaseUrl,
       supabaseKey,
       anthropic,
@@ -701,14 +775,14 @@ async function runAgentLoop(params: {
     let turnCount = 0;
     const allToolCalls: Array<{ tool: string; input: unknown; output: string; source: string }> = [];
 
-    await termLog(supabase, `Starting agentic loop — ${localTools.length} local + ${composioToolkits.length} Composio toolkit(s), max ${maxTurns} turns`, {
+    await clog(`Starting agentic loop — ${localTools.length} local + ${composioToolkits.length} Composio toolkit(s), max ${maxTurns} turns`, {
       taskId: task_id, agentSlug: agentSlugForLog, logType: "loop_start",
     });
 
     while (turnCount < maxTurns) {
       turnCount++;
 
-      await termLog(supabase, `Turn ${turnCount}/${maxTurns} — calling ${model}...${mcpServers ? " (with MCP)" : ""}`, {
+      await clog(`Turn ${turnCount}/${maxTurns} — calling ${model}...${mcpServers ? " (with MCP)" : ""}`, {
         taskId: task_id, agentSlug: agentSlugForLog, logType: "llm_call",
       });
 
@@ -730,7 +804,7 @@ async function runAgentLoop(params: {
         });
       } catch (apiErr) {
         if (mcpServers) {
-          await termLog(supabase, `Anthropic API error with MCP: ${apiErr instanceof Error ? apiErr.message : "unknown"} — retrying without MCP...`, {
+          await clog(`Anthropic API error with MCP: ${apiErr instanceof Error ? apiErr.message : "unknown"} — retrying without MCP...`, {
             taskId: task_id, agentSlug: agentSlugForLog, logType: "error",
           });
           mcpServers = undefined;
@@ -751,7 +825,7 @@ async function runAgentLoop(params: {
       for (const block of response.content) {
         if (isMcpToolUseBlock(block)) {
           const inputSummary = JSON.stringify(block.input).slice(0, 120);
-          await termLog(supabase, `MCP tool: ${block.name} (${block.server_name}) — ${inputSummary}`, {
+          await clog(`MCP tool: ${block.name} (${block.server_name}) — ${inputSummary}`, {
             taskId: task_id, agentSlug: agentSlugForLog, logType: "tool_call",
           });
           allToolCalls.push({ tool: block.name, input: block.input, output: "(resolved by MCP)", source: "mcp" });
@@ -760,7 +834,7 @@ async function runAgentLoop(params: {
           const preview = typeof block.content === "string"
             ? block.content.slice(0, 100)
             : JSON.stringify(block.content).slice(0, 100);
-          await termLog(supabase, `MCP result: ${preview}${preview.length >= 100 ? "..." : ""}`, {
+          await clog(`MCP result: ${preview}${preview.length >= 100 ? "..." : ""}`, {
             taskId: task_id, agentSlug: agentSlugForLog, logType: "tool_result",
           });
         }
@@ -778,7 +852,7 @@ async function runAgentLoop(params: {
         const toolResults: BetaContentBlockParam[] = [];
         for (const block of toolUseBlocks) {
           const inputSummary = JSON.stringify(block.input).slice(0, 120);
-          await termLog(supabase, `Using tool: ${block.name} — ${inputSummary}`, {
+          await clog(`Using tool: ${block.name} — ${inputSummary}`, {
             taskId: task_id, agentSlug: agentSlugForLog, logType: "tool_call",
           });
 
@@ -790,7 +864,7 @@ async function runAgentLoop(params: {
           );
 
           const outputPreview = output.slice(0, 100);
-          await termLog(supabase, `Tool result (${block.name}): ${outputPreview}${output.length > 100 ? "..." : ""}`, {
+          await clog(`Tool result (${block.name}): ${outputPreview}${output.length > 100 ? "..." : ""}`, {
             taskId: task_id, agentSlug: agentSlugForLog, logType: "tool_result",
           });
 
@@ -843,7 +917,7 @@ async function runAgentLoop(params: {
         },
       });
 
-      await termLog(supabase, `Task ${task_id.slice(0, 8)} completed in ${turnCount} turn(s)${toolsSummary}`, {
+      await clog(`Task ${task_id.slice(0, 8)} completed in ${turnCount} turn(s)${toolsSummary}`, {
         taskId: task_id, agentSlug: agentSlugForLog, logType: "task_complete",
       });
 
@@ -896,7 +970,7 @@ async function runAgentLoop(params: {
     });
 
     await termLog(supabase, `Task ${task_id.slice(0, 8)} FAILED: ${message}`, {
-      taskId: task_id, agentSlug: agentSlugForLog, logType: "error",
+      taskId: task_id, agentSlug: agentSlugForLog, logType: "error", companyId: taskCompanyId,
     });
   }
 }

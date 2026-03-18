@@ -296,7 +296,7 @@ async function executeDatabaseQuery(supabase: SupabaseClient, input: Record<stri
 async function executeCreateTask(
   supabase: SupabaseClient,
   input: Record<string, unknown>,
-  context: { conversationId: string; parentTaskId: string }
+  context: ToolContext
 ): Promise<string> {
   try {
     const agentSlug = input.agent_slug as string;
@@ -588,6 +588,7 @@ async function runAgentLoop(params: {
   const { task_id, conversation_id, supabase, anthropic, supabaseUrl, supabaseKey } = params;
 
   let agentSlugForLog = "orchestrator";
+  let taskCompanyId: string | undefined;
 
   try {
     // 1. Read the task
@@ -604,7 +605,7 @@ async function runAgentLoop(params: {
       return;
     }
 
-    const taskCompanyId = task.company_id as string | undefined;
+    taskCompanyId = task.company_id as string | undefined;
     await termLog(supabase, `Task ${task_id.slice(0, 8)} started — loading agent config...`, {
       taskId: task_id, agentSlug: agentSlugForLog, logType: "task_start", companyId: taskCompanyId,
     });

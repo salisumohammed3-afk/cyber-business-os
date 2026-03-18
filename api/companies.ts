@@ -14,7 +14,8 @@ function slugify(name: string): string {
   return name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
 }
 
-async function mirrorAgents(supabase: ReturnType<typeof createClient>, companyId: string) {
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function mirrorAgents(supabase: any, companyId: string) {
   const { data: templates } = await supabase
     .from("base_agent_definitions")
     .select("*");

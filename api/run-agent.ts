@@ -1,6 +1,9 @@
 import Anthropic from "@anthropic-ai/sdk";
+import { Composio } from "@composio/core";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
 import type { VercelRequest, VercelResponse } from "@vercel/node";
+
+export const maxDuration = 60;
 
 // ── SDK type aliases ────────────────────────────────────────────────────────
 
@@ -65,7 +68,7 @@ function getLocalToolDefs(): BetaTool[] {
     },
     {
       name: "create_task",
-      description: "Create a new task for an agent. Use this to delegate work to specialist agents (engineering, growth, sales, research, outreach).",
+      description: "Propose a new task for an agent. The task enters the pipeline as 'proposed' and requires user approval before execution.",
       input_schema: {
         type: "object",
         properties: {
@@ -105,7 +108,7 @@ function getLocalToolDefs(): BetaTool[] {
     },
     {
       name: "delegate_task",
-      description: "Delegate a task to a specialist sub-agent and wait for the result. The sub-agent will execute the task autonomously and return its output.",
+      description: "Propose a task for a specialist sub-agent. The task will appear in the user's task pipeline for approval before execution.",
       input_schema: {
         type: "object",
         properties: {
@@ -119,41 +122,79 @@ function getLocalToolDefs(): BetaTool[] {
   ];
 }
 
-// ── MCP tool allowlist from agent_tools table ───────────────────────────────
-// Reads which external (Rube/MCP) tools an agent is allowed to use.
-// Returns tool names that become the allowed_tools filter on the MCP server.
+// ── Agent-specific tool definitions ──────────────────────────────────────────
+// Returns extra tools available only to specific agents.
 
-async function getMcpToolAllowlist(
+const DESIGNER_AGENT_ID = "5858f260-e794-482f-aead-ae3650e6d4a6";
+
+function getAgentSpecificToolDefs(agentSlug: string): BetaTool[] {
+  if (agentSlug === "designer") {
+    return [
+      {
+        name: "design_system_search",
+        description:
+          "Search the design knowledge base for UI styles, color palettes, typography pairings, industry-specific design rules, landing page patterns, chart recommendations, and UX guidelines. Use this before proposing any design.",
+        input_schema: {
+          type: "object",
+          properties: {
+            query: {
+              type: "string",
+              description: "Search query (e.g. 'fintech dashboard', 'glassmorphism', 'serif elegant', 'spa wellness')",
+            },
+            domain: {
+              type: "string",
+              enum: ["style", "palette", "typography", "product_rule", "reasoning", "chart", "ux_guideline", "landing_pattern"],
+              description: "Narrow search to a specific domain",
+            },
+          },
+          required: ["query"],
+        },
+      },
+    ];
+  }
+  return [];
+}
+
+// ── Composio toolkit lookup from agent_tools table ──────────────────────────
+// Returns toolkit slugs (e.g. ["apollo", "gmail"]) for agents that have
+// external tool access via Composio.
+
+async function getAgentToolkits(
   supabase: SupabaseClient,
   agentDefId: string
 ): Promise<string[]> {
   const { data: rows } = await supabase
     .from("agent_tools")
-    .select("tool_name, connection_source")
+    .select("tool_name")
     .eq("agent_id", agentDefId)
     .eq("is_enabled", true)
-    .in("connection_source", ["composio", "mcp"]);
+    .eq("connection_source", "composio");
 
   if (!rows || rows.length === 0) return [];
   return rows.map((r: { tool_name: string }) => r.tool_name);
 }
 
-// ── Build MCP servers config ────────────────────────────────────────────────
-// Only returns a config when RUBE_MCP_URL + RUBE_MCP_TOKEN are set AND the
-// agent has at least one MCP tool allowed.
+// ── Build MCP servers config via Composio SDK ───────────────────────────────
+// Creates a Composio Tool Router session scoped to the agent's toolkits,
+// then returns the session's MCP URL for Anthropic's MCP connector.
 
-function buildMcpServers(allowlist: string[]): McpServerDef[] | undefined {
-  const url = process.env.RUBE_MCP_URL;
-  const token = process.env.RUBE_MCP_TOKEN;
-  if (!url || !token || allowlist.length === 0) return undefined;
+async function buildComposioMcp(
+  toolkits: string[]
+): Promise<McpServerDef[] | undefined> {
+  const apiKey = process.env.COMPOSIO_API_KEY;
+  if (!apiKey || toolkits.length === 0) return undefined;
+
+  const composio = new Composio({ apiKey });
+  const session = await composio.create("ubs_agent", {
+    toolkits,
+  });
 
   return [
     {
       type: "url",
-      url,
-      name: "rube",
-      authorization_token: token,
-      tool_configuration: { allowed_tools: allowlist },
+      url: session.mcp.url,
+      name: "composio",
+      authorization_token: apiKey,
     },
   ];
 }
@@ -179,6 +220,8 @@ async function executeLocalTool(
       return executeRecallMemories(supabase, toolInput);
     case "delegate_task":
       return executeDelegateTask(supabase, toolInput, context);
+    case "design_system_search":
+      return executeDesignSystemSearch(supabase, toolInput);
     default:
       return JSON.stringify({ error: `Unknown tool: ${toolName}` });
   }
@@ -272,14 +315,14 @@ async function executeCreateTask(
         conversation_id: context.conversationId,
         parent_task_id: context.parentTaskId,
         priority: (input.priority as number) || 5,
-        status: "pending",
+        status: "proposed",
         source: "chat",
       })
       .select("id")
       .single();
 
     if (error) return JSON.stringify({ error: error.message });
-    return JSON.stringify({ success: true, task_id: task.id, assigned_to: agentDef.name });
+    return JSON.stringify({ success: true, task_id: task.id, assigned_to: agentDef.name, status: "proposed", note: "Task proposed — awaiting user approval in the task pipeline." });
   } catch (e) {
     return JSON.stringify({ error: `Create task error: ${e instanceof Error ? e.message : "unknown"}` });
   }
@@ -328,6 +371,67 @@ async function executeRecallMemories(supabase: SupabaseClient, input: Record<str
   }
 }
 
+// design_system_search queries the designer agent's knowledge base (loaded from
+// UI UX Pro Max skill data: 798 chunks across styles, palettes, typography,
+// product rules, reasoning, UX guidelines, charts, and landing patterns).
+
+const DOMAIN_SOURCE_MAP: Record<string, string> = {
+  style: "uiux-pro-max/styles",
+  palette: "uiux-pro-max/palettes",
+  typography: "uiux-pro-max/typography",
+  product_rule: "uiux-pro-max/product-rules",
+  reasoning: "uiux-pro-max/reasoning",
+  chart: "uiux-pro-max/charts",
+  ux_guideline: "uiux-pro-max/ux-guidelines",
+  landing_pattern: "uiux-pro-max/landing-patterns",
+};
+
+async function executeDesignSystemSearch(
+  supabase: SupabaseClient,
+  input: Record<string, unknown>
+): Promise<string> {
+  try {
+    const query = input.query as string;
+    const domain = input.domain as string | undefined;
+
+    let q = supabase
+      .from("knowledge_chunks")
+      .select("source_name, content")
+      .eq("agent_definition_id", DESIGNER_AGENT_ID)
+      .eq("source_type", "skill-data")
+      .ilike("content", `%${query}%`)
+      .limit(10);
+
+    if (domain && DOMAIN_SOURCE_MAP[domain]) {
+      q = q.eq("source_name", DOMAIN_SOURCE_MAP[domain]);
+    }
+
+    const { data, error } = await q;
+    if (error) return JSON.stringify({ error: error.message });
+    if (!data || data.length === 0) {
+      return JSON.stringify({
+        results: [],
+        note: `No design data found for "${query}". Try broader keywords.`,
+      });
+    }
+    return JSON.stringify({
+      results: data.map((r: { source_name: string; content: string }) => ({
+        domain: r.source_name.replace("uiux-pro-max/", ""),
+        content: r.content,
+      })),
+    });
+  } catch (e) {
+    return JSON.stringify({
+      error: `Design search error: ${e instanceof Error ? e.message : "unknown"}`,
+    });
+  }
+}
+
+// delegate_task is non-blocking: creates a pending task for the sub-agent and
+// returns immediately. The task gets picked up by a separate runner invocation
+// (triggered by the frontend or a cron). This avoids Vercel function timeouts
+// since MCP tool calls via Composio can take significant time.
+
 async function executeDelegateTask(
   supabase: SupabaseClient,
   input: Record<string, unknown>,
@@ -340,7 +444,7 @@ async function executeDelegateTask(
 
     const { data: agentDef } = await supabase
       .from("agent_definitions")
-      .select("*")
+      .select("id, name, slug")
       .eq("slug", agentSlug)
       .single();
 
@@ -356,8 +460,7 @@ async function executeDelegateTask(
         agent_definition_id: agentDef.id,
         conversation_id: context.conversationId,
         parent_task_id: context.parentTaskId,
-        status: "running",
-        started_at: new Date().toISOString(),
+        status: "proposed",
         input_data: { instruction, context: extraContext },
         source: "agent",
       })
@@ -366,106 +469,17 @@ async function executeDelegateTask(
 
     if (taskErr) return JSON.stringify({ error: taskErr.message });
 
-    const mcpAllowlist = await getMcpToolAllowlist(supabase, agentDef.id);
-    const mcpServers = buildMcpServers(mcpAllowlist);
-    const localTools = getLocalToolDefs();
+    await termLog(supabase, `[${agentDef.slug}] Task proposed: ${instruction.slice(0, 80)}`, {
+      taskId: childTask.id, agentSlug: agentDef.slug, logType: "task_proposed",
+    });
 
-    const subSystemPrompt = agentDef.system_prompt ||
-      `You are the ${agentDef.name} agent. ${agentDef.description || ""}`;
-
-    const subMessages: BetaMessageParam[] = [
-      {
-        role: "user",
-        content: extraContext
-          ? `Context: ${extraContext}\n\nTask: ${instruction}`
-          : instruction,
-      },
-    ];
-
-    let subTurnCount = 0;
-    const subMaxTurns = agentDef.max_turns || 5;
-
-    while (subTurnCount < subMaxTurns) {
-      subTurnCount++;
-
-      const response = await context.anthropic.beta.messages.create({
-        model: agentDef.model || "claude-sonnet-4-20250514",
-        max_tokens: 4096,
-        temperature: parseFloat(agentDef.temperature) || 0.7,
-        system: subSystemPrompt,
-        messages: subMessages,
-        tools: localTools,
-        ...(mcpServers ? { mcp_servers: mcpServers } : {}),
-        betas: mcpServers ? ["mcp-client-2025-04-04"] : [],
-      });
-
-      for (const block of response.content) {
-        if (block.type === "mcp_tool_use") {
-          await termLog(supabase, `[${agentDef.slug}] MCP tool: ${block.name} (${block.server_name})`, {
-            taskId: childTask.id, agentSlug: agentDef.slug, logType: "tool_call",
-          });
-        }
-      }
-
-      const toolUseBlocks = response.content.filter(
-        (b): b is BetaToolUseBlock => b.type === "tool_use"
-      );
-
-      if (response.stop_reason === "tool_use" && toolUseBlocks.length > 0) {
-        subMessages.push({
-          role: "assistant",
-          content: response.content as unknown as BetaContentBlockParam[],
-        });
-
-        const toolResults: BetaContentBlockParam[] = [];
-        for (const block of toolUseBlocks) {
-          await termLog(supabase, `[${agentDef.slug}] Using tool: ${block.name}`, {
-            taskId: childTask.id, agentSlug: agentDef.slug, logType: "tool_call",
-          });
-
-          const output = await executeLocalTool(
-            block.name,
-            block.input as Record<string, unknown>,
-            supabase,
-            context
-          );
-
-          await termLog(supabase, `[${agentDef.slug}] Tool result (${block.name}): ${output.slice(0, 100)}...`, {
-            taskId: childTask.id, agentSlug: agentDef.slug, logType: "tool_result",
-          });
-
-          toolResults.push({ type: "tool_result", tool_use_id: block.id, content: output });
-        }
-
-        subMessages.push({ role: "user", content: toolResults });
-        continue;
-      }
-
-      const result = response.content
-        .filter((b): b is BetaTextBlock => b.type === "text")
-        .map(b => b.text)
-        .join("") || "No response from sub-agent.";
-
-      await supabase.from("task_results").insert({
-        task_id: childTask.id,
-        result_type: "text",
-        data: { content: result, model: agentDef.model, usage: response.usage, turns: subTurnCount },
-      });
-
-      await supabase.from("tasks").update({
-        status: "completed",
-        completed_at: new Date().toISOString(),
-      }).eq("id", childTask.id);
-
-      return JSON.stringify({ agent: agentDef.name, task_id: childTask.id, result });
-    }
-
-    await supabase.from("tasks").update({
-      status: "completed",
-      completed_at: new Date().toISOString(),
-    }).eq("id", childTask.id);
-
-    return JSON.stringify({ agent: agentDef.name, task_id: childTask.id, result: "Sub-agent hit max turns." });
+    return JSON.stringify({
+      success: true,
+      agent: agentDef.name,
+      task_id: childTask.id,
+      status: "proposed",
+      note: "Task has been proposed and is awaiting user approval. It will appear in the Proposed tab of the task pipeline.",
+    });
   } catch (e) {
     return JSON.stringify({ error: `Delegation error: ${e instanceof Error ? e.message : "unknown"}` });
   }
@@ -561,13 +575,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (!anthropicKey)
     return res.status(500).json({ error: "ANTHROPIC_API_KEY not configured" });
 
-  const anthropic = new Anthropic({ apiKey: anthropicKey });
+  const anthropic = new Anthropic({ apiKey: anthropicKey, timeout: 10 * 60 * 1000 });
   const supabase = createClient(supabaseUrl, supabaseKey);
 
   try {
-    const { task_id, conversation_id } = req.body;
-    if (!task_id || !conversation_id) {
-      return res.status(400).json({ error: "task_id and conversation_id are required" });
+    const { task_id, conversation_id: bodyConvId } = req.body;
+    if (!task_id) {
+      return res.status(400).json({ error: "task_id is required" });
     }
 
     // 1. Read the task
@@ -578,6 +592,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       .single();
     if (taskErr)
       return res.status(404).json({ error: `Task not found: ${taskErr.message}` });
+
+    const conversation_id = bodyConvId || task.conversation_id;
+    if (!conversation_id) {
+      return res.status(400).json({ error: "conversation_id is required (not in body or task record)" });
+    }
 
     await supabase
       .from("tasks")
@@ -619,12 +638,24 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       }
     }
 
-    // 3. Load tools
-    const localTools = getLocalToolDefs();
-    const mcpAllowlist = agentDefId ? await getMcpToolAllowlist(supabase, agentDefId) : [];
-    const mcpServers = buildMcpServers(mcpAllowlist);
+    // 3. Load tools (base local + agent-specific + Composio MCP)
+    const localTools = [
+      ...getLocalToolDefs(),
+      ...getAgentSpecificToolDefs(agentSlugForLog),
+    ];
+    const composioToolkits = agentDefId ? await getAgentToolkits(supabase, agentDefId) : [];
+    let mcpServers: McpServerDef[] | undefined;
+    if (composioToolkits.length > 0) {
+      try {
+        mcpServers = await buildComposioMcp(composioToolkits);
+      } catch (mcpErr) {
+        await termLog(supabase, `Composio MCP setup failed (${mcpErr instanceof Error ? mcpErr.message : "unknown"}), continuing with local tools only`, {
+          taskId: task_id, agentSlug: agentSlugForLog, logType: "error",
+        });
+      }
+    }
 
-    await termLog(supabase, `Loaded ${localTools.length} local tools, ${mcpAllowlist.length} MCP tools${mcpServers ? " (Rube connected)" : ""}`, {
+    await termLog(supabase, `Loaded ${localTools.length} local tools, ${composioToolkits.length} Composio toolkit(s)${mcpServers ? ` (${composioToolkits.join(", ")})` : " (MCP disabled)"}`, {
       taskId: task_id, agentSlug: agentSlugForLog, logType: "tools_loaded",
     });
 
@@ -671,27 +702,51 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     let turnCount = 0;
     const allToolCalls: Array<{ tool: string; input: unknown; output: string; source: string }> = [];
 
-    await termLog(supabase, `Starting agentic loop — ${localTools.length} local + ${mcpAllowlist.length} MCP tools, max ${maxTurns} turns`, {
+    await termLog(supabase, `Starting agentic loop — ${localTools.length} local + ${composioToolkits.length} Composio toolkit(s), max ${maxTurns} turns`, {
       taskId: task_id, agentSlug: agentSlugForLog, logType: "loop_start",
     });
 
     while (turnCount < maxTurns) {
       turnCount++;
 
-      await termLog(supabase, `Turn ${turnCount}/${maxTurns} — calling ${model}...`, {
+      await termLog(supabase, `Turn ${turnCount}/${maxTurns} — calling ${model}...${mcpServers ? " (with MCP)" : ""}`, {
         taskId: task_id, agentSlug: agentSlugForLog, logType: "llm_call",
       });
 
-      const response = await anthropic.beta.messages.create({
-        model,
-        max_tokens: 4096,
-        temperature,
-        system: systemPrompt,
-        messages,
-        tools: localTools,
-        ...(mcpServers ? { mcp_servers: mcpServers } : {}),
-        betas: mcpServers ? ["mcp-client-2025-04-04"] : [],
-      });
+      const mcpToolset = mcpServers
+        ? [{ type: "mcp_toolset" as const, mcp_server_name: "composio" }]
+        : [];
+
+      let response;
+      try {
+        response = await anthropic.beta.messages.create({
+          model,
+          max_tokens: 4096,
+          temperature,
+          system: systemPrompt,
+          messages,
+          tools: [...localTools, ...mcpToolset],
+          ...(mcpServers ? { mcp_servers: mcpServers } : {}),
+          ...(mcpServers ? { betas: ["mcp-client-2025-11-20" as const] } : {}),
+        });
+      } catch (apiErr) {
+        if (mcpServers) {
+          await termLog(supabase, `Anthropic API error with MCP: ${apiErr instanceof Error ? apiErr.message : "unknown"} — retrying without MCP...`, {
+            taskId: task_id, agentSlug: agentSlugForLog, logType: "error",
+          });
+          mcpServers = undefined;
+          response = await anthropic.beta.messages.create({
+            model,
+            max_tokens: 4096,
+            temperature,
+            system: systemPrompt,
+            messages,
+            tools: localTools,
+          });
+        } else {
+          throw apiErr;
+        }
+      }
 
       // Log any MCP tool activity (already resolved server-side by Anthropic)
       for (const block of response.content) {
@@ -779,11 +834,25 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         return res.status(500).json({ error: `Failed to save reply: ${insertErr.message}` });
       }
 
+      const uniqueTools = [...new Set(allToolCalls.map(tc => tc.tool))];
+      const toolsSummary = allToolCalls.length > 0
+        ? ` — used ${allToolCalls.length} tool(s): ${uniqueTools.join(", ")}`
+        : "";
+
       await supabase.from("tasks").update({ status: "completed", completed_at: new Date().toISOString() }).eq("id", task_id);
 
-      const toolsSummary = allToolCalls.length > 0
-        ? ` — used ${allToolCalls.length} tool(s): ${[...new Set(allToolCalls.map(tc => tc.tool))].join(", ")}`
-        : "";
+      await supabase.from("task_results").insert({
+        task_id,
+        result_type: "agent_response",
+        data: {
+          response: assistantContent,
+          tools_used: uniqueTools,
+          tool_calls: allToolCalls,
+          turns: turnCount,
+          model,
+        },
+      });
+
       await termLog(supabase, `Task ${task_id.slice(0, 8)} completed in ${turnCount} turn(s)${toolsSummary}`, {
         taskId: task_id, agentSlug: agentSlugForLog, logType: "task_complete",
       });
@@ -791,7 +860,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(200).json({
         ok: true,
         content: assistantContent,
-        tools_used: allToolCalls.map(tc => tc.tool),
+        tools_used: uniqueTools,
         turns: turnCount,
       });
     }
@@ -812,9 +881,58 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     await supabase.from("tasks").update({ status: "completed", completed_at: new Date().toISOString() }).eq("id", task_id);
 
+    await supabase.from("task_results").insert({
+      task_id,
+      result_type: "agent_response",
+      data: {
+        response: finalContent,
+        tools_used: [...new Set(allToolCalls.map(tc => tc.tool))],
+        tool_calls: allToolCalls,
+        turns: turnCount,
+        model,
+        max_turns_reached: true,
+      },
+    });
+
     return res.status(200).json({ ok: true, content: finalContent, max_turns_reached: true });
   } catch (e: unknown) {
     const message = e instanceof Error ? e.message : "Internal server error";
+
+    try {
+      const supabaseUrl = process.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL;
+      const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.VITE_SUPABASE_PUBLISHABLE_KEY;
+      if (supabaseUrl && supabaseKey) {
+        const sb = createClient(supabaseUrl, supabaseKey);
+        const { task_id, conversation_id } = req.body || {};
+
+        if (task_id) {
+          await sb.from("tasks").update({
+            status: "failed",
+            error_message: message,
+            completed_at: new Date().toISOString(),
+          }).eq("id", task_id);
+        }
+
+        if (conversation_id) {
+          await sb.from("chat_messages").insert({
+            conversation_id,
+            role: "orchestrator",
+            content: `Sorry, I ran into an error: ${message}. Please try again.`,
+            timestamp: new Date().toISOString(),
+            metadata: { error: true, original_error: message },
+          });
+        }
+
+        if (task_id) {
+          await termLog(sb, `Task ${task_id.slice(0, 8)} FAILED: ${message}`, {
+            taskId: task_id, agentSlug: "system", logType: "error",
+          });
+        }
+      }
+    } catch (_recovery) {
+      // Best-effort recovery; don't throw from error handler
+    }
+
     return res.status(500).json({ error: message });
   }
 }

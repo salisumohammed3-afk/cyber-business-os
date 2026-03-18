@@ -5,9 +5,14 @@ import type { Database } from '@/integrations/supabase/types'
 
 type ChatMessageRow = Database['public']['Tables']['chat_messages']['Row']
 
+const CONV_STORAGE_KEY = 'sal-os-conversation-id'
+
 export function useLiveChat(conversationId: string | null) {
   const [messages, setMessages] = useState<ChatMessageRow[]>([])
-  const [conversationIdState, setConversationIdState] = useState<string | null>(conversationId)
+  const [conversationIdState, setConversationIdState] = useState<string | null>(() => {
+    if (conversationId) return conversationId
+    try { return localStorage.getItem(CONV_STORAGE_KEY) } catch { return null }
+  })
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<Error | null>(null)
   const [waitingForReply, setWaitingForReply] = useState(false)
@@ -98,6 +103,7 @@ export function useLiveChat(conversationId: string | null) {
         convId = newConv.id
         setConversationIdState(convId)
         convIdRef.current = convId
+        try { localStorage.setItem(CONV_STORAGE_KEY, convId) } catch { /* noop */ }
       }
 
       // Optimistically add user message to UI

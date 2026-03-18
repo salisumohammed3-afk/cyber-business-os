@@ -82,12 +82,12 @@ async function getBusinessContext(supabase: SupabaseClient): Promise<string> {
     );
   }
 
-  const { data: pendingCount } = await supabase
+  const { count: activeCount } = await supabase
     .from("tasks")
     .select("id", { count: "exact", head: true })
     .in("status", ["proposed", "pending", "running"]);
 
-  sections.push(`## Pipeline Status\n- Active/proposed tasks: ${pendingCount?.length ?? 0}`);
+  sections.push(`## Pipeline Status\n- Active/proposed tasks: ${activeCount ?? 0}`);
 
   return sections.join("\n\n");
 }

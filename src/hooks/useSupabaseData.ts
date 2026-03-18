@@ -81,7 +81,7 @@ export function useTasks() {
       return (data || []).map((t: Record<string, unknown>) => {
         const agentDef = t.agent_definitions as { name: string; slug: string } | null;
         const results = t.task_results as { result_type: string; data: Record<string, unknown> }[] | null;
-        const agentResult = results?.find(r => r.result_type === "agent_response");
+        const agentResult = results?.find(r => r.result_type === "text" || r.result_type === "agent_response");
         return {
           ...t,
           agent_name: agentDef?.name || (t as Task).agent_name || "Orchestrator",
@@ -101,29 +101,21 @@ export function useTaskActions() {
 
   const approveTask = useCallback(async (taskId: string) => {
     await supabase.from("tasks").update({ status: "pending" as const }).eq("id", taskId);
-    try {
-      await fetch("/api/run-agent", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ task_id: taskId }),
-      });
-    } catch (e) {
-      console.error("Failed to invoke agent runner:", e);
-    }
+    fetch("/api/run-agent", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task_id: taskId }),
+    }).catch((e) => console.error("Failed to invoke agent runner:", e));
     invalidate();
   }, []);
 
   const runTask = useCallback(async (taskId: string) => {
     await supabase.from("tasks").update({ status: "pending" as const }).eq("id", taskId);
-    try {
-      await fetch("/api/run-agent", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ task_id: taskId }),
-      });
-    } catch (e) {
-      console.error("Failed to invoke agent runner:", e);
-    }
+    fetch("/api/run-agent", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task_id: taskId }),
+    }).catch((e) => console.error("Failed to invoke agent runner:", e));
     invalidate();
   }, []);
 
@@ -134,15 +126,11 @@ export function useTaskActions() {
 
   const retryTask = useCallback(async (taskId: string) => {
     await supabase.from("tasks").update({ status: "pending" as const, error_message: null, started_at: null, completed_at: null }).eq("id", taskId);
-    try {
-      await fetch("/api/run-agent", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ task_id: taskId }),
-      });
-    } catch (e) {
-      console.error("Failed to invoke agent runner:", e);
-    }
+    fetch("/api/run-agent", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task_id: taskId }),
+    }).catch((e) => console.error("Failed to invoke agent runner:", e));
     invalidate();
   }, []);
 

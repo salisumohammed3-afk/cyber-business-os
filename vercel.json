@@ -2,6 +2,11 @@
   "buildCommand": "npm run build",
   "outputDirectory": "dist",
   "framework": "vite",
+  "functions": {
+    "api/run-agent.ts": {
+      "maxDuration": 300
+    }
+  },
   "routes": [
     { "handle": "filesystem" },
     { "src": "/api/(.*)", "dest": "/api/$1" },

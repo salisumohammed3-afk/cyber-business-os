@@ -2,8 +2,9 @@ import Anthropic from "@anthropic-ai/sdk";
 import { Composio } from "@composio/core";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
 import type { VercelRequest, VercelResponse } from "@vercel/node";
+import { waitUntil } from "@vercel/functions";
 
-export const maxDuration = 60;
+export const maxDuration = 300;
 
 // ── SDK type aliases ────────────────────────────────────────────────────────
 
@@ -182,11 +183,11 @@ async function getAgentToolkits(
 async function buildComposioMcp(
   toolkits: string[]
 ): Promise<McpServerDef[] | undefined> {
-  const apiKey = process.env.COMPOSIO_API_KEY;
+  const apiKey = process.env.COMPOSIO_API_KEY?.trim();
   if (!apiKey || toolkits.length === 0) return undefined;
 
   const composio = new Composio({ apiKey });
-  const userId = process.env.COMPOSIO_USER_ID || "default";
+  const userId = (process.env.COMPOSIO_USER_ID || "default").trim();
   const session = await composio.create(userId, {
     toolkits,
   });
@@ -559,57 +560,37 @@ function isMcpToolResultBlock(b: BetaContentBlock): b is BetaMCPToolResultBlock 
   return b.type === "mcp_tool_result";
 }
 
-// ── Main handler ────────────────────────────────────────────────────────────
+// ── Background agent execution ──────────────────────────────────────────────
+// Runs the full agentic loop. Called via waitUntil so it continues after the
+// HTTP response has been sent. All results are written to the database;
+// the frontend picks them up via polling / Realtime.
 
-export default async function handler(req: VercelRequest, res: VercelResponse) {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+async function runAgentLoop(params: {
+  task_id: string;
+  conversation_id: string;
+  supabase: SupabaseClient;
+  anthropic: Anthropic;
+  supabaseUrl: string;
+  supabaseKey: string;
+}) {
+  const { task_id, conversation_id, supabase, anthropic, supabaseUrl, supabaseKey } = params;
 
-  if (req.method === "OPTIONS") return res.status(200).end();
-  if (req.method !== "POST")
-    return res.status(405).json({ error: "Method not allowed" });
-
-  const supabaseUrl = process.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL;
-  const supabaseKey =
-    process.env.SUPABASE_SERVICE_ROLE_KEY ||
-    process.env.VITE_SUPABASE_PUBLISHABLE_KEY;
-  const anthropicKey = process.env.ANTHROPIC_API_KEY;
-
-  if (!supabaseUrl || !supabaseKey)
-    return res.status(500).json({ error: "Supabase credentials not configured" });
-  if (!anthropicKey)
-    return res.status(500).json({ error: "ANTHROPIC_API_KEY not configured" });
-
-  const anthropic = new Anthropic({ apiKey: anthropicKey, timeout: 10 * 60 * 1000 });
-  const supabase = createClient(supabaseUrl, supabaseKey);
+  let agentSlugForLog = "orchestrator";
 
   try {
-    const { task_id, conversation_id: bodyConvId } = req.body;
-    if (!task_id) {
-      return res.status(400).json({ error: "task_id is required" });
-    }
-
     // 1. Read the task
-    const { data: task, error: taskErr } = await supabase
+    const { data: task } = await supabase
       .from("tasks")
       .select("*")
       .eq("id", task_id)
       .single();
-    if (taskErr)
-      return res.status(404).json({ error: `Task not found: ${taskErr.message}` });
 
-    const conversation_id = bodyConvId || task.conversation_id;
-    if (!conversation_id) {
-      return res.status(400).json({ error: "conversation_id is required (not in body or task record)" });
+    if (!task) {
+      await termLog(supabase, `Task ${task_id.slice(0, 8)} not found`, {
+        taskId: task_id, agentSlug: "system", logType: "error",
+      });
+      return;
     }
-
-    await supabase
-      .from("tasks")
-      .update({ status: "running", started_at: new Date().toISOString() })
-      .eq("id", task_id);
-
-    let agentSlugForLog = "orchestrator";
 
     await termLog(supabase, `Task ${task_id.slice(0, 8)} started — loading agent config...`, {
       taskId: task_id, agentSlug: agentSlugForLog, logType: "task_start",
@@ -678,6 +659,17 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         content: m.content || "",
       })
     );
+
+    // For delegated tasks, inject the instruction as the final user message
+    // so the sub-agent knows exactly what to do (not just the conversation context).
+    const taskInstruction = task.input_data?.instruction as string | undefined;
+    if (taskInstruction) {
+      const lastRole = messages.length > 0 ? messages[messages.length - 1].role : null;
+      if (lastRole === "user") {
+        messages.push({ role: "assistant", content: "Understood. I'll work on this now." });
+      }
+      messages.push({ role: "user", content: `YOUR TASK: ${taskInstruction}\n\nUse your available tools to complete this task. Do not just describe what you would do — actually do it.` });
+    }
 
     await termLog(supabase, `Loaded ${messages.length} messages from conversation history`, {
       taskId: task_id, agentSlug: agentSlugForLog, logType: "context_loaded",
@@ -817,7 +809,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           .map(b => b.text)
           .join("") || "I wasn't able to complete this task. You can retry it from the task pipeline.";
 
-      const { error: insertErr } = await supabase.from("chat_messages").insert({
+      await supabase.from("chat_messages").insert({
         conversation_id,
         role: "orchestrator",
         content: assistantContent,
@@ -832,15 +824,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         },
       });
 
-      if (insertErr) {
-        await supabase.from("tasks").update({
-          status: "failed",
-          error_message: insertErr.message,
-          completed_at: new Date().toISOString(),
-        }).eq("id", task_id);
-        return res.status(500).json({ error: `Failed to save reply: ${insertErr.message}` });
-      }
-
       const uniqueTools = [...new Set(allToolCalls.map(tc => tc.tool))];
       const toolsSummary = allToolCalls.length > 0
         ? ` — used ${allToolCalls.length} tool(s): ${uniqueTools.join(", ")}`
@@ -850,7 +833,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
       await supabase.from("task_results").insert({
         task_id,
-        result_type: "agent_response",
+        result_type: "text",
         data: {
           response: assistantContent,
           tools_used: uniqueTools,
@@ -864,12 +847,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         taskId: task_id, agentSlug: agentSlugForLog, logType: "task_complete",
       });
 
-      return res.status(200).json({
-        ok: true,
-        content: assistantContent,
-        tools_used: uniqueTools,
-        turns: turnCount,
-      });
+      return;
     }
 
     // Max turns reached
@@ -890,7 +868,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     await supabase.from("task_results").insert({
       task_id,
-      result_type: "agent_response",
+      result_type: "text",
       data: {
         response: finalContent,
         tools_used: [...new Set(allToolCalls.map(tc => tc.tool))],
@@ -900,46 +878,112 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         max_turns_reached: true,
       },
     });
-
-    return res.status(200).json({ ok: true, content: finalContent, max_turns_reached: true });
   } catch (e: unknown) {
     const message = e instanceof Error ? e.message : "Internal server error";
 
-    try {
-      const supabaseUrl = process.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL;
-      const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.VITE_SUPABASE_PUBLISHABLE_KEY;
-      if (supabaseUrl && supabaseKey) {
-        const sb = createClient(supabaseUrl, supabaseKey);
-        const { task_id, conversation_id } = req.body || {};
+    await supabase.from("tasks").update({
+      status: "failed",
+      error_message: message,
+      completed_at: new Date().toISOString(),
+    }).eq("id", task_id);
 
-        if (task_id) {
-          await sb.from("tasks").update({
-            status: "failed",
-            error_message: message,
-            completed_at: new Date().toISOString(),
-          }).eq("id", task_id);
-        }
+    await supabase.from("chat_messages").insert({
+      conversation_id,
+      role: "orchestrator",
+      content: `Sorry, I ran into an error: ${message}. Please try again.`,
+      timestamp: new Date().toISOString(),
+      metadata: { error: true, original_error: message },
+    });
 
-        if (conversation_id) {
-          await sb.from("chat_messages").insert({
-            conversation_id,
-            role: "orchestrator",
-            content: `Sorry, I ran into an error: ${message}. Please try again.`,
-            timestamp: new Date().toISOString(),
-            metadata: { error: true, original_error: message },
-          });
-        }
-
-        if (task_id) {
-          await termLog(sb, `Task ${task_id.slice(0, 8)} FAILED: ${message}`, {
-            taskId: task_id, agentSlug: "system", logType: "error",
-          });
-        }
-      }
-    } catch (_recovery) {
-      // Best-effort recovery; don't throw from error handler
-    }
-
-    return res.status(500).json({ error: message });
+    await termLog(supabase, `Task ${task_id.slice(0, 8)} FAILED: ${message}`, {
+      taskId: task_id, agentSlug: agentSlugForLog, logType: "error",
+    });
   }
+}
+
+// ── Main handler ────────────────────────────────────────────────────────────
+// Validates the request, marks the task as "running", and returns immediately.
+// The actual agent work runs in the background via waitUntil.
+
+export default async function handler(req: VercelRequest, res: VercelResponse) {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
+  if (req.method === "OPTIONS") return res.status(200).end();
+  if (req.method !== "POST")
+    return res.status(405).json({ error: "Method not allowed" });
+
+  const supabaseUrl = process.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL;
+  const supabaseKey =
+    process.env.SUPABASE_SERVICE_ROLE_KEY ||
+    process.env.VITE_SUPABASE_PUBLISHABLE_KEY;
+  const anthropicKey = process.env.ANTHROPIC_API_KEY;
+
+  if (!supabaseUrl || !supabaseKey)
+    return res.status(500).json({ error: "Supabase credentials not configured" });
+  if (!anthropicKey)
+    return res.status(500).json({ error: "ANTHROPIC_API_KEY not configured" });
+
+  const { task_id, conversation_id: bodyConvId } = req.body || {};
+  if (!task_id) {
+    return res.status(400).json({ error: "task_id is required" });
+  }
+
+  const supabase = createClient(supabaseUrl, supabaseKey);
+
+  // Recover stuck tasks: any task running for > 6 minutes is likely dead
+  const sixMinAgo = new Date(Date.now() - 6 * 60 * 1000).toISOString();
+  await supabase
+    .from("tasks")
+    .update({ status: "failed", error_message: "Timed out after 6 minutes", completed_at: new Date().toISOString() })
+    .eq("status", "running")
+    .lt("started_at", sixMinAgo);
+
+  // Validate task exists
+  const { data: task, error: taskErr } = await supabase
+    .from("tasks")
+    .select("id, conversation_id, status")
+    .eq("id", task_id)
+    .single();
+
+  if (taskErr || !task) {
+    return res.status(404).json({ error: `Task not found: ${taskErr?.message}` });
+  }
+
+  // Resolve or auto-create conversation
+  let conversation_id = bodyConvId || task.conversation_id;
+  if (!conversation_id) {
+    const { data: newConv, error: convErr } = await supabase
+      .from("conversations")
+      .insert({ title: task_id.slice(0, 8) + " task" })
+      .select("id")
+      .single();
+    if (convErr || !newConv?.id) {
+      return res.status(500).json({ error: `Failed to create conversation: ${convErr?.message}` });
+    }
+    conversation_id = newConv.id;
+    await supabase.from("tasks").update({ conversation_id }).eq("id", task_id);
+  }
+
+  // Atomic status transition: only start if task is pending (prevents double-runs)
+  const { data: updated, error: updateErr } = await supabase
+    .from("tasks")
+    .update({ status: "running", started_at: new Date().toISOString() })
+    .eq("id", task_id)
+    .in("status", ["pending"])
+    .select("id");
+
+  if (updateErr || !updated?.length) {
+    return res.status(409).json({ error: `Task is not in a runnable state (current: ${task.status})` });
+  }
+
+  // Respond immediately — the task is now running
+  res.status(202).json({ ok: true, status: "running", task_id });
+
+  // Run the agent loop in the background after the response is sent
+  const anthropic = new Anthropic({ apiKey: anthropicKey, timeout: 4 * 60 * 1000 });
+  waitUntil(
+    runAgentLoop({ task_id, conversation_id, supabase, anthropic, supabaseUrl, supabaseKey })
+  );
 }

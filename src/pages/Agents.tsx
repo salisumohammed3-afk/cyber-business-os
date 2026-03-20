@@ -1,5 +1,5 @@
 import { useNavigate } from "react-router-dom";
-import { ArrowLeft, Bot, Brain, Cpu, Globe, Rocket, Search, Wrench, Zap, Database, MessageSquare, BookOpen, FileSearch, Link2, Plus, Trash2, ToggleLeft, ToggleRight, Palette, Briefcase, Lightbulb, Download, XCircle } from "lucide-react";
+import { ArrowLeft, Bot, Brain, Cpu, Globe, Rocket, Search, Wrench, Zap, Database, MessageSquare, BookOpen, FileSearch, Link2, Plus, Trash2, ToggleLeft, ToggleRight, Palette, Briefcase, Lightbulb, Download, XCircle, ChevronDown, ChevronRight, Package } from "lucide-react";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -246,6 +246,157 @@ function OrgChart({
   );
 }
 
+function extractRepoName(url: string): string {
+  const match = url.replace(/\.git$/, "").match(/github\.com\/([^/]+)\/([^/]+)/);
+  return match ? match[2].replace(/[-_]/g, " ") : url;
+}
+
+interface SkillGroup {
+  key: string;
+  label: string;
+  sourceUrl: string | null;
+  links: SkillLinkRow[];
+}
+
+function groupSkillLinks(links: SkillLinkRow[]): SkillGroup[] {
+  const grouped = new Map<string, SkillLinkRow[]>();
+  const ungrouped: SkillLinkRow[] = [];
+
+  for (const link of links) {
+    const src = link.skill?.source_url;
+    if (src) {
+      const existing = grouped.get(src) || [];
+      existing.push(link);
+      grouped.set(src, existing);
+    } else {
+      ungrouped.push(link);
+    }
+  }
+
+  const result: SkillGroup[] = [];
+
+  for (const [sourceUrl, groupLinks] of grouped) {
+    if (groupLinks.length >= 2) {
+      result.push({
+        key: sourceUrl,
+        label: extractRepoName(sourceUrl),
+        sourceUrl,
+        links: groupLinks,
+      });
+    } else {
+      ungrouped.push(...groupLinks);
+    }
+  }
+
+  for (const link of ungrouped) {
+    result.push({
+      key: link.id,
+      label: link.skill?.name || "Unknown",
+      sourceUrl: link.skill?.source_url || null,
+      links: [link],
+    });
+  }
+
+  return result;
+}
+
+function SkillLinkItem({ link }: { link: SkillLinkRow }) {
+  const { toggleSkillLink, removeSkillLink } = useSkillMutations();
+  return (
+    <div
+      className={`flex items-start gap-3 p-3 rounded-sm border transition-colors ${
+        link.is_active ? "border-border hover:border-foreground/20" : "border-border/50 opacity-60"
+      }`}
+    >
+      <div className={`w-2 h-2 rounded-full shrink-0 mt-1.5 ${link.is_active ? "bg-violet-500" : "bg-foreground/20"}`} />
+      <div className="flex-1 min-w-0">
+        <div className="flex items-center gap-2">
+          <span className="text-xs font-medium truncate">{link.skill?.name || "Unknown"}</span>
+          {link.skill?.source_url && (
+            <Badge variant="outline" className="text-[8px] px-1 py-0 h-3.5 shrink-0">github</Badge>
+          )}
+        </div>
+        {link.skill?.description && (
+          <p className="text-[10px] text-muted-foreground mt-0.5 leading-snug line-clamp-2">{link.skill.description}</p>
+        )}
+      </div>
+      <div className="flex items-center gap-1 shrink-0">
+        <button
+          onClick={() => toggleSkillLink.mutate({ linkId: link.id, isActive: !link.is_active })}
+          className="p-1 rounded hover:bg-secondary text-muted-foreground hover:text-foreground transition-colors"
+          title={link.is_active ? "Disable" : "Enable"}
+        >
+          {link.is_active ? <ToggleRight size={14} className="text-violet-400" /> : <ToggleLeft size={14} />}
+        </button>
+        <button
+          onClick={() => removeSkillLink.mutate(link.id)}
+          className="p-1 rounded hover:bg-red-500/10 text-muted-foreground hover:text-red-400 transition-colors"
+          title="Remove"
+        >
+          <Trash2 size={12} />
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function SkillGroupAccordion({ group }: { group: SkillGroup }) {
+  const [open, setOpen] = useState(false);
+  const activeCount = group.links.filter((l) => l.is_active).length;
+  return (
+    <div className="border border-border rounded-sm overflow-hidden">
+      <button
+        onClick={() => setOpen(!open)}
+        className="w-full flex items-center gap-2.5 p-3 text-left hover:bg-secondary/50 transition-colors"
+      >
+        {open ? <ChevronDown size={12} className="text-muted-foreground shrink-0" /> : <ChevronRight size={12} className="text-muted-foreground shrink-0" />}
+        <Package size={13} className="text-violet-400 shrink-0" />
+        <span className="text-xs font-medium flex-1 truncate capitalize">{group.label}</span>
+        <Badge variant="secondary" className="text-[9px] shrink-0">{activeCount}/{group.links.length}</Badge>
+        <Badge variant="outline" className="text-[8px] px-1 py-0 h-3.5 shrink-0">github</Badge>
+      </button>
+      {open && (
+        <div className="border-t border-border bg-secondary/20 p-2 space-y-1.5">
+          {group.links.map((link) => (
+            <SkillLinkItem key={link.id} link={link} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SkillsList({ agentLinks, agentId, onAddSkill }: { agentLinks: SkillLinkRow[]; agentId: string; onAddSkill: (id: string) => void }) {
+  const groups = useMemo(() => groupSkillLinks(agentLinks), [agentLinks]);
+
+  if (agentLinks.length === 0) {
+    return (
+      <div className="flex flex-col items-center justify-center py-8 text-center border border-dashed border-border rounded-md">
+        <BookOpen size={20} className="text-muted-foreground/40 mb-2" />
+        <p className="text-xs text-muted-foreground">No skills assigned</p>
+        <button
+          onClick={() => onAddSkill(agentId)}
+          className="mt-2 text-[10px] text-violet-400 hover:text-violet-300 transition-colors"
+        >
+          Add your first skill
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-2">
+      {groups.map((group) =>
+        group.links.length > 1 ? (
+          <SkillGroupAccordion key={group.key} group={group} />
+        ) : (
+          <SkillLinkItem key={group.key} link={group.links[0]} />
+        )
+      )}
+    </div>
+  );
+}
+
 function AgentDetail({
   agent,
   tools,
@@ -328,58 +479,7 @@ function AgentDetail({
             </button>
           </div>
 
-          {agentLinks.length === 0 ? (
-            <div className="flex flex-col items-center justify-center py-8 text-center border border-dashed border-border rounded-md">
-              <BookOpen size={20} className="text-muted-foreground/40 mb-2" />
-              <p className="text-xs text-muted-foreground">No skills assigned</p>
-              <button
-                onClick={() => onAddSkill(agent.id)}
-                className="mt-2 text-[10px] text-violet-400 hover:text-violet-300 transition-colors"
-              >
-                Add your first skill
-              </button>
-            </div>
-          ) : (
-            <div className="space-y-2">
-              {agentLinks.map((link) => (
-                <div
-                  key={link.id}
-                  className={`flex items-start gap-3 p-3 rounded-sm border transition-colors ${
-                    link.is_active ? "border-border hover:border-foreground/20" : "border-border/50 opacity-60"
-                  }`}
-                >
-                  <div className={`w-2 h-2 rounded-full shrink-0 mt-1.5 ${link.is_active ? "bg-violet-500" : "bg-foreground/20"}`} />
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-2">
-                      <span className="text-xs font-medium truncate">{link.skill?.name || "Unknown"}</span>
-                      {link.skill?.source_url && (
-                        <Badge variant="outline" className="text-[8px] px-1 py-0 h-3.5 shrink-0">github</Badge>
-                      )}
-                    </div>
-                    {link.skill?.description && (
-                      <p className="text-[10px] text-muted-foreground mt-0.5 leading-snug line-clamp-2">{link.skill.description}</p>
-                    )}
-                  </div>
-                  <div className="flex items-center gap-1 shrink-0">
-                    <button
-                      onClick={() => toggleSkillLink.mutate({ linkId: link.id, isActive: !link.is_active })}
-                      className="p-1 rounded hover:bg-secondary text-muted-foreground hover:text-foreground transition-colors"
-                      title={link.is_active ? "Disable" : "Enable"}
-                    >
-                      {link.is_active ? <ToggleRight size={14} className="text-violet-400" /> : <ToggleLeft size={14} />}
-                    </button>
-                    <button
-                      onClick={() => removeSkillLink.mutate(link.id)}
-                      className="p-1 rounded hover:bg-red-500/10 text-muted-foreground hover:text-red-400 transition-colors"
-                      title="Remove"
-                    >
-                      <Trash2 size={12} />
-                    </button>
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
+          <SkillsList agentLinks={agentLinks} agentId={agent.id} onAddSkill={onAddSkill} />
 
           {/* Recommended Skills */}
           {agentRecs.length > 0 && (

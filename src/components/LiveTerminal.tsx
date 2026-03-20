@@ -143,7 +143,7 @@ const LiveTerminal = () => {
             <div className="w-2.5 h-2.5 rounded-full bg-[hsl(142,71%,45%)]" />
           </div>
           <span className="font-mono text-[10px] text-[hsl(0,0%,50%)] ml-2">
-            aura-os — {activeAgent ? `agent:${activeAgent}` : "system"} — live execution
+            sal-os — {activeAgent ? `agent:${activeAgent}` : "system"} — live execution
           </span>
           {hasLogs && (
             <span className="font-mono text-[9px] text-emerald-500 ml-2">{lines.length} events</span>

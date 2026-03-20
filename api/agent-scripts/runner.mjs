@@ -1204,6 +1204,25 @@ async function main() {
       "Step 5: Push each file with github_push_file\n" +
       "Step 6: Register the project with register_project\n\n" +
       "You MUST complete ALL steps. A text description of what you WOULD build is NOT acceptable output.";
+
+    // Project edit mode: inject existing project context
+    let rawInputCheck = task.input_data;
+    if (typeof rawInputCheck === "string") try { rawInputCheck = JSON.parse(rawInputCheck); } catch {}
+    if (rawInputCheck?.project_id) {
+      const pi = rawInputCheck;
+      systemPrompt += "\n\n## ACTIVE PROJECT EDIT MODE\n" +
+        "You are making changes to an EXISTING project. DO NOT create a new repo.\n" +
+        "- Repository: " + (pi.repo_url || "N/A") + "\n" +
+        "- Live URL: " + (pi.deploy_url || "N/A") + "\n" +
+        "- Branch: " + (pi.branch || "main") + "\n" +
+        (pi.file_tree ? "\nCurrent file tree:\n" + pi.file_tree + "\n" : "") +
+        "\nWorkflow for edits:\n" +
+        "1. Read existing files from the repo using github_push_file's update capability or sandbox tools\n" +
+        "2. Make targeted changes based on the user's feedback\n" +
+        "3. Push updated files with github_push_file (it auto-fetches SHA for updates)\n" +
+        "4. Do NOT call register_project again — the project is already registered\n" +
+        "5. Summarise what you changed when done";
+    }
   }
 
   // 6. Select tools for this agent

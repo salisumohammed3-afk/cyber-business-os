@@ -15,11 +15,38 @@ import {
   Check,
   Wrench,
   Zap,
+  Pencil,
 } from "lucide-react";
 import { AnimatePresence, motion } from "framer-motion";
 import { Badge } from "@/components/ui/badge";
 import ReactMarkdown from "react-markdown";
-import { useState } from "react";
+import { useState, useEffect } from "react";
+import { Link } from "react-router-dom";
+import { supabase } from "@/integrations/supabase/client";
+
+function ProjectEditLink({ taskId }: { taskId: string }) {
+  const [projectId, setProjectId] = useState<string | null>(null);
+  useEffect(() => {
+    supabase
+      .from("projects")
+      .select("id")
+      .eq("created_by_task_id", taskId)
+      .limit(1)
+      .then(({ data }) => {
+        if (data?.[0]) setProjectId(data[0].id);
+      });
+  }, [taskId]);
+  if (!projectId) return null;
+  return (
+    <Link
+      to={`/projects/${projectId}/edit`}
+      className="inline-flex items-center gap-1.5 px-3 py-1.5 text-[11px] font-medium rounded-md bg-violet-600 text-white hover:bg-violet-500 transition-colors mt-1"
+    >
+      <Pencil size={11} />
+      Edit Project
+    </Link>
+  );
+}
 
 interface Props {
   task: Task | null;
@@ -187,6 +214,10 @@ const TaskBlueprintModal = ({ task, onClose }: Props) => {
                     {task.tool_output || task.reasoning}
                   </pre>
                 </div>
+              )}
+
+              {task.status === "completed" && (
+                <ProjectEditLink taskId={task.id} />
               )}
 
               {/* Section 3: Steps / What Happened */}

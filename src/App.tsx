@@ -8,6 +8,7 @@ import Index from "./pages/Index.tsx";
 import Agents from "./pages/Agents.tsx";
 import CompanySettings from "./pages/CompanySettings.tsx";
 import Outputs from "./pages/Outputs.tsx";
+import ProjectEditor from "./pages/ProjectEditor.tsx";
 import NotFound from "./pages/NotFound.tsx";
 
 const queryClient = new QueryClient();
@@ -24,6 +25,7 @@ const App = () => (
             <Route path="/agents" element={<Agents />} />
             <Route path="/company-settings" element={<CompanySettings />} />
             <Route path="/outputs" element={<Outputs />} />
+            <Route path="/projects/:projectId/edit" element={<ProjectEditor />} />
             <Route path="*" element={<NotFound />} />
           </Routes>
         </BrowserRouter>

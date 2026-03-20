@@ -1,8 +1,12 @@
-import { useRef, useEffect, useState } from 'react'
+import { useRef, useEffect, useState, useMemo, useCallback } from 'react'
 import ReactMarkdown from 'react-markdown'
-import { Bot } from 'lucide-react'
+import { Bot, Pencil } from 'lucide-react'
 import { useLiveChat } from '@/hooks/useLiveChat'
 import { useCompany } from '@/contexts/CompanyContext'
+import { supabase } from '@/integrations/supabase/client'
+import { Link } from 'react-router-dom'
+
+interface ProjectRef { id: string; deploy_url: string }
 
 export function CEOChat() {
   const { company } = useCompany()
@@ -10,6 +14,32 @@ export function CEOChat() {
   const scrollContainerRef = useRef<HTMLDivElement>(null)
   const [inputValue, setInputValue] = useState('')
   const [sending, setSending] = useState(false)
+  const [projectRefs, setProjectRefs] = useState<ProjectRef[]>([])
+
+  useEffect(() => {
+    if (!company?.id) return
+    supabase
+      .from('projects')
+      .select('id, deploy_url')
+      .eq('company_id', company.id)
+      .not('deploy_url', 'is', null)
+      .then(({ data }) => setProjectRefs((data as ProjectRef[]) || []))
+  }, [company?.id])
+
+  const projectUrlMap = useMemo(() => {
+    const m = new Map<string, string>()
+    for (const p of projectRefs) if (p.deploy_url) m.set(p.deploy_url.replace(/\/$/, ''), p.id)
+    return m
+  }, [projectRefs])
+
+  const findProjectForUrl = useCallback((href: string) => {
+    const clean = href.replace(/\/$/, '')
+    if (projectUrlMap.has(clean)) return projectUrlMap.get(clean)!
+    for (const [url, id] of projectUrlMap) {
+      if (clean.startsWith(url) || url.startsWith(clean)) return id
+    }
+    return null
+  }, [projectUrlMap])
 
   useEffect(() => {
     scrollContainerRef.current?.scrollTo({
@@ -81,7 +111,21 @@ export function CEOChat() {
                   <p className="text-sm whitespace-pre-wrap">{msg.content ?? ''}</p>
                 ) : (
                   <div className="prose prose-sm prose-gray max-w-none [&_p]:my-1 [&_ul]:my-1 [&_ol]:my-1 [&_li]:my-0.5 [&_h1]:text-base [&_h2]:text-sm [&_h3]:text-sm [&_code]:text-xs [&_pre]:text-xs">
-                    <ReactMarkdown>{msg.content ?? ''}</ReactMarkdown>
+                    <ReactMarkdown components={{
+                      a: ({ href, children, ...props }) => {
+                        const pid = href ? findProjectForUrl(href) : null
+                        return (
+                          <>
+                            <a href={href} target="_blank" rel="noreferrer" {...props}>{children}</a>
+                            {pid && (
+                              <Link to={`/projects/${pid}/edit`} className="inline-flex items-center gap-0.5 ml-1 text-violet-600 hover:text-violet-500 no-underline text-[10px] font-medium align-middle">
+                                <Pencil size={9} /> edit
+                              </Link>
+                            )}
+                          </>
+                        )
+                      }
+                    }}>{msg.content ?? ''}</ReactMarkdown>
                   </div>
                 )}
               </div>

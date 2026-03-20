@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, Link } from "react-router-dom";
 import {
   ArrowLeft,
   Search,
@@ -11,6 +11,7 @@ import {
   Clock,
   Database,
   ChevronRight,
+  Pencil,
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent } from "@/components/ui/card";
@@ -74,6 +75,12 @@ function ProjectCard({ project }: { project: Project }) {
               <ExternalLink size={10} /> Live
             </a>
           )}
+          <Link
+            to={`/projects/${project.id}/edit`}
+            className="flex items-center gap-1 text-xs text-violet-600 hover:underline"
+          >
+            <Pencil size={10} /> Edit
+          </Link>
           {project.repo_url && (
             <a
               href={project.repo_url}

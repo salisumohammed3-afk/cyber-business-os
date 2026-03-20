@@ -434,6 +434,7 @@ export interface Database {
           env_vars: Json
           status: 'draft' | 'building' | 'live' | 'archived'
           created_by_task_id: string | null
+          edit_conversation_id: string | null
           created_at: string
           updated_at: string
         }
@@ -449,6 +450,7 @@ export interface Database {
           env_vars?: Json
           status?: 'draft' | 'building' | 'live' | 'archived'
           created_by_task_id?: string | null
+          edit_conversation_id?: string | null
           created_at?: string
           updated_at?: string
         }
@@ -464,6 +466,7 @@ export interface Database {
           env_vars?: Json
           status?: 'draft' | 'building' | 'live' | 'archived'
           created_by_task_id?: string | null
+          edit_conversation_id?: string | null
           created_at?: string
           updated_at?: string
         }

@@ -120,7 +120,11 @@ const AddSkillModal = ({ open, onClose, onSuccess, preselectedAgentId, prefill }
   const [fetching, setFetching] = useState(false);
   const [fetchError, setFetchError] = useState<string | null>(null);
   const [discovered, setDiscovered] = useState<DiscoveredSkill[]>([]);
+  const [selectedSkills, setSelectedSkills] = useState<Set<string>>(new Set());
   const [submitting, setSubmitting] = useState(false);
+  const [batchProgress, setBatchProgress] = useState<{ done: number; total: number } | null>(null);
+
+  const batchMode = discovered.length > 1 && selectedSkills.size > 0;
 
   useEffect(() => {
     if (open && prefill) {
@@ -155,29 +159,29 @@ const AddSkillModal = ({ open, onClose, onSuccess, preselectedAgentId, prefill }
     }
   };
 
-  const loadSkillContent = useCallback(async (rawUrl: string, skillName: string) => {
-    setFetching(true);
-    setFetchError(null);
-    try {
-      const res = await fetch(rawUrl);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const text = await res.text();
-      setContent(text);
-      if (!name) setName(skillName.replace(/[-_]/g, " "));
-      setDiscovered([]);
-      setTab("paste");
-    } catch (err) {
-      setFetchError(err instanceof Error ? err.message : "Failed to fetch content");
-    } finally {
-      setFetching(false);
+  const toggleSkillSelection = (path: string) => {
+    setSelectedSkills((prev) => {
+      const next = new Set(prev);
+      if (next.has(path)) next.delete(path);
+      else next.add(path);
+      return next;
+    });
+  };
+
+  const selectAllSkills = () => {
+    if (selectedSkills.size === discovered.length) {
+      setSelectedSkills(new Set());
+    } else {
+      setSelectedSkills(new Set(discovered.map((s) => s.path)));
     }
-  }, [name]);
+  };
 
   const fetchFromGithub = useCallback(async () => {
     if (!githubUrl.trim()) return;
     setFetching(true);
     setFetchError(null);
     setDiscovered([]);
+    setSelectedSkills(new Set());
 
     try {
       const parsed = parseGithubUrl(githubUrl.trim());
@@ -223,12 +227,46 @@ const AddSkillModal = ({ open, onClose, onSuccess, preselectedAgentId, prefill }
       }
 
       setDiscovered(skills);
+      setSelectedSkills(new Set(skills.map((s) => s.path)));
     } catch (err) {
       setFetchError(err instanceof Error ? err.message : "Failed to fetch");
     } finally {
       setFetching(false);
     }
-  }, [githubUrl, name, loadSkillContent]);
+  }, [githubUrl, name]);
+
+  const handleBatchSubmit = async () => {
+    if (selectedSkills.size === 0 || selectedAgents.size === 0) return;
+    setSubmitting(true);
+    setBatchProgress({ done: 0, total: selectedSkills.size });
+
+    const agentIds = Array.from(selectedAgents);
+    let done = 0;
+    try {
+      for (const skill of discovered.filter((s) => selectedSkills.has(s.path))) {
+        const res = await fetch(skill.rawUrl);
+        if (!res.ok) { done++; setBatchProgress({ done, total: selectedSkills.size }); continue; }
+        const text = await res.text();
+        await createSkill.mutateAsync({
+          name: skill.name.replace(/[-_]/g, " "),
+          description: "",
+          content: text.trim(),
+          source_url: githubUrl.trim() || undefined,
+          agentIds,
+        });
+        done++;
+        setBatchProgress({ done, total: selectedSkills.size });
+      }
+      setName(""); setDescription(""); setContent(""); setGithubUrl("");
+      setDiscovered([]); setSelectedSkills(new Set());
+      setSelectedAgents(preselectedAgentId ? new Set([preselectedAgentId]) : new Set());
+      onSuccess?.();
+      onClose();
+    } finally {
+      setSubmitting(false);
+      setBatchProgress(null);
+    }
+  };
 
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -264,7 +302,8 @@ const AddSkillModal = ({ open, onClose, onSuccess, preselectedAgentId, prefill }
     }
   };
 
-  const canSubmit = name.trim() && content.trim() && selectedAgents.size > 0 && !submitting;
+  const canSubmitSingle = name.trim() && content.trim() && selectedAgents.size > 0 && !submitting;
+  const canSubmitBatch = batchMode && selectedAgents.size > 0 && !submitting;
 
   return (
     <AnimatePresence>
@@ -301,33 +340,35 @@ const AddSkillModal = ({ open, onClose, onSuccess, preselectedAgentId, prefill }
 
             {/* Body */}
             <div className="flex-1 min-h-0 overflow-y-auto p-4 space-y-4">
-              {/* Name + Description */}
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="font-mono text-[10px] text-muted-foreground tracking-wider uppercase block mb-1.5">
-                    Skill Name *
-                  </label>
-                  <input
-                    type="text"
-                    value={name}
-                    onChange={(e) => setName(e.target.value)}
-                    placeholder="e.g. Supabase Expert"
-                    className="w-full px-3 py-2 text-xs bg-secondary border border-border rounded-md focus:outline-none focus:ring-1 focus:ring-violet-500/50"
-                  />
+              {/* Name + Description — hidden in batch mode */}
+              {!batchMode && (
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="font-mono text-[10px] text-muted-foreground tracking-wider uppercase block mb-1.5">
+                      Skill Name *
+                    </label>
+                    <input
+                      type="text"
+                      value={name}
+                      onChange={(e) => setName(e.target.value)}
+                      placeholder="e.g. Supabase Expert"
+                      className="w-full px-3 py-2 text-xs bg-secondary border border-border rounded-md focus:outline-none focus:ring-1 focus:ring-violet-500/50"
+                    />
+                  </div>
+                  <div>
+                    <label className="font-mono text-[10px] text-muted-foreground tracking-wider uppercase block mb-1.5">
+                      Description
+                    </label>
+                    <input
+                      type="text"
+                      value={description}
+                      onChange={(e) => setDescription(e.target.value)}
+                      placeholder="Short description of what this teaches"
+                      className="w-full px-3 py-2 text-xs bg-secondary border border-border rounded-md focus:outline-none focus:ring-1 focus:ring-violet-500/50"
+                    />
+                  </div>
                 </div>
-                <div>
-                  <label className="font-mono text-[10px] text-muted-foreground tracking-wider uppercase block mb-1.5">
-                    Description
-                  </label>
-                  <input
-                    type="text"
-                    value={description}
-                    onChange={(e) => setDescription(e.target.value)}
-                    placeholder="Short description of what this teaches"
-                    className="w-full px-3 py-2 text-xs bg-secondary border border-border rounded-md focus:outline-none focus:ring-1 focus:ring-violet-500/50"
-                  />
-                </div>
-              </div>
+              )}
 
               {/* Content tabs */}
               <Tabs value={tab} onValueChange={setTab}>
@@ -396,28 +437,53 @@ const AddSkillModal = ({ open, onClose, onSuccess, preselectedAgentId, prefill }
 
                   {discovered.length > 1 && (
                     <div className="p-3 bg-secondary border border-border rounded-md space-y-2">
-                      <div className="flex items-center gap-1.5 mb-1">
-                        <FolderOpen size={12} className="text-violet-400" />
-                        <span className="text-[11px] font-medium">
-                          {discovered.length} skills found — pick one to install:
-                        </span>
+                      <div className="flex items-center justify-between mb-1">
+                        <div className="flex items-center gap-1.5">
+                          <FolderOpen size={12} className="text-violet-400" />
+                          <span className="text-[11px] font-medium">
+                            {discovered.length} skills found
+                          </span>
+                        </div>
+                        <button
+                          onClick={selectAllSkills}
+                          className="text-[10px] text-violet-400 hover:text-violet-300 transition-colors"
+                        >
+                          {selectedSkills.size === discovered.length ? "Deselect all" : "Select all"}
+                        </button>
                       </div>
                       <div className="grid gap-1.5 max-h-48 overflow-y-auto">
-                        {discovered.map((s) => (
-                          <button
-                            key={s.path}
-                            onClick={() => loadSkillContent(s.rawUrl, s.name)}
-                            disabled={fetching}
-                            className="flex items-center gap-2 p-2 rounded-md border border-border bg-background hover:border-violet-500/50 hover:bg-violet-500/5 transition-all text-left"
-                          >
-                            <BookOpen size={12} className="text-violet-400 shrink-0" />
-                            <div className="min-w-0">
-                              <span className="text-xs font-medium block truncate">{s.name}</span>
-                              <span className="text-[10px] text-muted-foreground block truncate">{s.path}</span>
-                            </div>
-                          </button>
-                        ))}
+                        {discovered.map((s) => {
+                          const checked = selectedSkills.has(s.path);
+                          return (
+                            <button
+                              key={s.path}
+                              onClick={() => toggleSkillSelection(s.path)}
+                              className={`flex items-center gap-2 p-2 rounded-md border transition-all text-left ${
+                                checked
+                                  ? "border-violet-500/50 bg-violet-500/10"
+                                  : "border-border bg-background hover:border-foreground/20"
+                              }`}
+                            >
+                              <div
+                                className={`w-4 h-4 rounded border flex items-center justify-center shrink-0 transition-colors ${
+                                  checked ? "bg-violet-500 border-violet-500" : "border-foreground/20"
+                                }`}
+                              >
+                                {checked && <Check size={10} className="text-white" />}
+                              </div>
+                              <div className="min-w-0">
+                                <span className="text-xs font-medium block truncate">{s.name}</span>
+                                <span className="text-[10px] text-muted-foreground block truncate">{s.path}</span>
+                              </div>
+                            </button>
+                          );
+                        })}
                       </div>
+                      {selectedSkills.size > 0 && (
+                        <p className="text-[10px] text-muted-foreground">
+                          {selectedSkills.size} of {discovered.length} skill{discovered.length !== 1 ? "s" : ""} selected
+                        </p>
+                      )}
                     </div>
                   )}
 
@@ -485,27 +551,49 @@ const AddSkillModal = ({ open, onClose, onSuccess, preselectedAgentId, prefill }
             {/* Footer */}
             <div className="p-3 border-t border-border flex items-center justify-between">
               <div className="text-[10px] text-muted-foreground">
-                {content ? `${content.length} chars` : "No content yet"}
+                {batchProgress
+                  ? `Installing ${batchProgress.done}/${batchProgress.total}...`
+                  : batchMode
+                    ? `${selectedSkills.size} skill${selectedSkills.size !== 1 ? "s" : ""} selected`
+                    : content
+                      ? `${content.length.toLocaleString()} chars`
+                      : "No content yet"}
               </div>
               <div className="flex items-center gap-2">
                 <button
                   onClick={onClose}
-                  className="px-3 py-1.5 text-[11px] font-medium rounded-md border border-border text-muted-foreground hover:text-foreground hover:bg-secondary transition-colors"
+                  disabled={submitting}
+                  className="px-3 py-1.5 text-[11px] font-medium rounded-md border border-border text-muted-foreground hover:text-foreground hover:bg-secondary transition-colors disabled:opacity-50"
                 >
                   Cancel
                 </button>
-                <button
-                  onClick={handleSubmit}
-                  disabled={!canSubmit}
-                  className="flex items-center gap-1.5 px-4 py-1.5 text-[11px] font-medium rounded-md bg-violet-600 text-white hover:bg-violet-500 transition-colors disabled:opacity-50"
-                >
-                  {submitting ? (
-                    <Loader2 size={12} className="animate-spin" />
-                  ) : (
-                    <BookOpen size={12} />
-                  )}
-                  Add Skill
-                </button>
+                {batchMode ? (
+                  <button
+                    onClick={handleBatchSubmit}
+                    disabled={!canSubmitBatch}
+                    className="flex items-center gap-1.5 px-4 py-1.5 text-[11px] font-medium rounded-md bg-violet-600 text-white hover:bg-violet-500 transition-colors disabled:opacity-50"
+                  >
+                    {submitting ? (
+                      <Loader2 size={12} className="animate-spin" />
+                    ) : (
+                      <BookOpen size={12} />
+                    )}
+                    Install {selectedSkills.size} Skill{selectedSkills.size !== 1 ? "s" : ""}
+                  </button>
+                ) : (
+                  <button
+                    onClick={handleSubmit}
+                    disabled={!canSubmitSingle}
+                    className="flex items-center gap-1.5 px-4 py-1.5 text-[11px] font-medium rounded-md bg-violet-600 text-white hover:bg-violet-500 transition-colors disabled:opacity-50"
+                  >
+                    {submitting ? (
+                      <Loader2 size={12} className="animate-spin" />
+                    ) : (
+                      <BookOpen size={12} />
+                    )}
+                    Add Skill
+                  </button>
+                )}
               </div>
             </div>
           </motion.div>

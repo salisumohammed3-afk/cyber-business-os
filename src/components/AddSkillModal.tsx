@@ -1,6 +1,6 @@
 import { useState, useCallback, useEffect } from "react";
 import { AnimatePresence, motion } from "framer-motion";
-import { X, Upload, Github, Loader2, BookOpen, Check } from "lucide-react";
+import { X, Upload, Github, Loader2, BookOpen, Check, FolderOpen } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useAgentDefinitions, useSkillMutations } from "@/hooks/useSupabaseData";
@@ -19,11 +19,90 @@ interface Props {
   prefill?: SkillPrefill;
 }
 
+interface DiscoveredSkill {
+  name: string;
+  path: string;
+  rawUrl: string;
+}
+
+type ParsedGithub =
+  | { type: "file"; owner: string; repo: string; branch: string; path: string }
+  | { type: "tree"; owner: string; repo: string; branch: string; path: string }
+  | { type: "repo"; owner: string; repo: string }
+  | null;
+
+function parseGithubUrl(url: string): ParsedGithub {
+  const cleaned = url.replace(/\.git$/, "").replace(/\/$/, "");
+
+  const blob = cleaned.match(/github\.com\/([^/]+)\/([^/]+)\/blob\/([^/]+)\/(.+)/);
+  if (blob) return { type: "file", owner: blob[1], repo: blob[2], branch: blob[3], path: blob[4] };
+
+  const tree = cleaned.match(/github\.com\/([^/]+)\/([^/]+)\/tree\/([^/]+)\/(.+)/);
+  if (tree) return { type: "tree", owner: tree[1], repo: tree[2], branch: tree[3], path: tree[4] };
+
+  const repo = cleaned.match(/github\.com\/([^/]+)\/([^/]+)\/?$/);
+  if (repo) return { type: "repo", owner: repo[1], repo: repo[2] };
+
+  return null;
+}
+
 function resolveRawUrl(url: string): string {
   const gh = url.match(/github\.com\/([^/]+)\/([^/]+)\/blob\/([^/]+)\/(.+)/);
   if (gh) return `https://raw.githubusercontent.com/${gh[1]}/${gh[2]}/${gh[3]}/${gh[4]}`;
   if (url.includes("raw.githubusercontent.com")) return url;
   return url;
+}
+
+async function discoverSkillFiles(owner: string, repo: string, basePath?: string): Promise<DiscoveredSkill[]> {
+  const skills: DiscoveredSkill[] = [];
+  const searchPaths = basePath ? [basePath] : [".claude/skills", ".cursor/skills", "skills", ""];
+
+  for (const sp of searchPaths) {
+    try {
+      const apiUrl = sp
+        ? `https://api.github.com/repos/${owner}/${repo}/contents/${sp}`
+        : `https://api.github.com/repos/${owner}/${repo}/contents`;
+      const res = await fetch(apiUrl);
+      if (!res.ok) continue;
+      const items: Array<{ name: string; type: string; path: string; download_url: string | null }> = await res.json();
+
+      const skillMd = items.find((i) => i.type === "file" && /^skill\.md$/i.test(i.name));
+      if (skillMd?.download_url) {
+        const label = sp ? sp.split("/").pop()! : repo;
+        skills.push({ name: label, path: skillMd.path, rawUrl: skillMd.download_url });
+      }
+
+      const dirs = items.filter((i) => i.type === "dir");
+      for (const dir of dirs) {
+        try {
+          const subRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/contents/${dir.path}`);
+          if (!subRes.ok) continue;
+          const subItems: Array<{ name: string; type: string; path: string; download_url: string | null }> = await subRes.json();
+          const sub = subItems.find((i) => i.type === "file" && /^skill\.md$/i.test(i.name));
+          if (sub?.download_url) {
+            skills.push({ name: dir.name, path: sub.path, rawUrl: sub.download_url });
+          }
+        } catch { /* skip subdirectory errors */ }
+      }
+
+      if (skills.length > 0) break;
+    } catch { /* try next path */ }
+  }
+
+  if (skills.length === 0) {
+    for (const candidate of ["SKILL.md", "README.md"]) {
+      try {
+        const raw = `https://raw.githubusercontent.com/${owner}/${repo}/main/${candidate}`;
+        const res = await fetch(raw, { method: "HEAD" });
+        if (res.ok) {
+          skills.push({ name: repo, path: candidate, rawUrl: raw });
+          break;
+        }
+      } catch { /* skip */ }
+    }
+  }
+
+  return skills;
 }
 
 const AddSkillModal = ({ open, onClose, onSuccess, preselectedAgentId, prefill }: Props) => {
@@ -40,6 +119,7 @@ const AddSkillModal = ({ open, onClose, onSuccess, preselectedAgentId, prefill }
   );
   const [fetching, setFetching] = useState(false);
   const [fetchError, setFetchError] = useState<string | null>(null);
+  const [discovered, setDiscovered] = useState<DiscoveredSkill[]>([]);
   const [submitting, setSubmitting] = useState(false);
 
   useEffect(() => {
@@ -75,28 +155,80 @@ const AddSkillModal = ({ open, onClose, onSuccess, preselectedAgentId, prefill }
     }
   };
 
-  const fetchFromGithub = useCallback(async () => {
-    if (!githubUrl.trim()) return;
+  const loadSkillContent = useCallback(async (rawUrl: string, skillName: string) => {
     setFetching(true);
     setFetchError(null);
     try {
-      const rawUrl = resolveRawUrl(githubUrl.trim());
       const res = await fetch(rawUrl);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const text = await res.text();
       setContent(text);
-
-      if (!name) {
-        const match = githubUrl.match(/\/([^/]+)\.(md|txt)$/i);
-        if (match) setName(match[1].replace(/[-_]/g, " "));
-      }
+      if (!name) setName(skillName.replace(/[-_]/g, " "));
+      setDiscovered([]);
       setTab("paste");
+    } catch (err) {
+      setFetchError(err instanceof Error ? err.message : "Failed to fetch content");
+    } finally {
+      setFetching(false);
+    }
+  }, [name]);
+
+  const fetchFromGithub = useCallback(async () => {
+    if (!githubUrl.trim()) return;
+    setFetching(true);
+    setFetchError(null);
+    setDiscovered([]);
+
+    try {
+      const parsed = parseGithubUrl(githubUrl.trim());
+
+      if (!parsed) {
+        if (githubUrl.includes("raw.githubusercontent.com")) {
+          const res = await fetch(githubUrl.trim());
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          setContent(await res.text());
+          setTab("paste");
+          return;
+        }
+        throw new Error("Unrecognised URL format. Paste a GitHub repo, folder, or file URL.");
+      }
+
+      if (parsed.type === "file") {
+        const rawUrl = `https://raw.githubusercontent.com/${parsed.owner}/${parsed.repo}/${parsed.branch}/${parsed.path}`;
+        const res = await fetch(rawUrl);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        setContent(await res.text());
+        if (!name) {
+          const n = parsed.path.split("/").slice(-2, -1)[0] || parsed.path.replace(/\.md$/i, "");
+          setName(n.replace(/[-_]/g, " "));
+        }
+        setTab("paste");
+        return;
+      }
+
+      const basePath = parsed.type === "tree" ? parsed.path : undefined;
+      const skills = await discoverSkillFiles(parsed.owner, parsed.repo, basePath);
+
+      if (skills.length === 0) {
+        throw new Error("No SKILL.md files found in this repository. Try linking directly to a .md file.");
+      }
+
+      if (skills.length === 1) {
+        const res = await fetch(skills[0].rawUrl);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        setContent(await res.text());
+        if (!name) setName(skills[0].name.replace(/[-_]/g, " "));
+        setTab("paste");
+        return;
+      }
+
+      setDiscovered(skills);
     } catch (err) {
       setFetchError(err instanceof Error ? err.message : "Failed to fetch");
     } finally {
       setFetching(false);
     }
-  }, [githubUrl, name]);
+  }, [githubUrl, name, loadSkillContent]);
 
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -235,14 +367,14 @@ const AddSkillModal = ({ open, onClose, onSuccess, preselectedAgentId, prefill }
                 <TabsContent value="github" className="mt-3 space-y-3">
                   <div>
                     <label className="font-mono text-[10px] text-muted-foreground tracking-wider uppercase block mb-1.5">
-                      GitHub File URL
+                      GitHub URL
                     </label>
                     <div className="flex gap-2">
                       <input
                         type="text"
                         value={githubUrl}
-                        onChange={(e) => setGithubUrl(e.target.value)}
-                        placeholder="https://github.com/user/repo/blob/main/SKILL.md"
+                        onChange={(e) => { setGithubUrl(e.target.value); setDiscovered([]); setFetchError(null); }}
+                        placeholder="https://github.com/user/repo or .../blob/main/SKILL.md"
                         className="flex-1 px-3 py-2 text-xs bg-secondary border border-border rounded-md focus:outline-none focus:ring-1 focus:ring-violet-500/50"
                       />
                       <button
@@ -254,16 +386,47 @@ const AddSkillModal = ({ open, onClose, onSuccess, preselectedAgentId, prefill }
                         Fetch
                       </button>
                     </div>
+                    <p className="text-[10px] text-muted-foreground mt-1">
+                      Paste a repo URL, folder URL, or direct file link. We'll auto-discover SKILL.md files.
+                    </p>
                     {fetchError && (
                       <p className="text-[10px] text-red-400 mt-1">{fetchError}</p>
                     )}
                   </div>
+
+                  {discovered.length > 1 && (
+                    <div className="p-3 bg-secondary border border-border rounded-md space-y-2">
+                      <div className="flex items-center gap-1.5 mb-1">
+                        <FolderOpen size={12} className="text-violet-400" />
+                        <span className="text-[11px] font-medium">
+                          {discovered.length} skills found — pick one to install:
+                        </span>
+                      </div>
+                      <div className="grid gap-1.5 max-h-48 overflow-y-auto">
+                        {discovered.map((s) => (
+                          <button
+                            key={s.path}
+                            onClick={() => loadSkillContent(s.rawUrl, s.name)}
+                            disabled={fetching}
+                            className="flex items-center gap-2 p-2 rounded-md border border-border bg-background hover:border-violet-500/50 hover:bg-violet-500/5 transition-all text-left"
+                          >
+                            <BookOpen size={12} className="text-violet-400 shrink-0" />
+                            <div className="min-w-0">
+                              <span className="text-xs font-medium block truncate">{s.name}</span>
+                              <span className="text-[10px] text-muted-foreground block truncate">{s.path}</span>
+                            </div>
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
                   {content && (
                     <div className="p-3 bg-secondary border border-border rounded-md">
                       <div className="flex items-center gap-1.5 mb-2">
                         <Check size={10} className="text-emerald-500" />
                         <span className="text-[10px] text-emerald-500 font-medium">Content loaded</span>
-                        <span className="text-[10px] text-muted-foreground ml-auto">{content.length} chars</span>
+                        <span className="text-[10px] text-muted-foreground ml-auto">{content.length.toLocaleString()} chars</span>
                       </div>
                       <pre className="text-[10px] font-mono text-muted-foreground whitespace-pre-wrap max-h-24 overflow-y-auto leading-snug">
                         {content.slice(0, 500)}{content.length > 500 ? "..." : ""}

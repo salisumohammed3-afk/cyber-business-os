@@ -1,10 +1,11 @@
 import { useNavigate } from "react-router-dom";
-import { ArrowLeft, Bot, Brain, Cpu, Globe, Megaphone, Rocket, Search, Mail, Wrench, Zap, Database, MessageSquare, BookOpen, FileSearch, Link2 } from "lucide-react";
+import { ArrowLeft, Bot, Brain, Cpu, Globe, Rocket, Search, Wrench, Zap, Database, MessageSquare, BookOpen, FileSearch, Link2, Plus, Trash2, ToggleLeft, ToggleRight, Palette, Briefcase, Lightbulb, Download, XCircle } from "lucide-react";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { useAgentDefinitions, useAgentTools, type AgentToolRow } from "@/hooks/useSupabaseData";
-import { useMemo } from "react";
+import { useAgentDefinitions, useAgentTools, useAgentSkillLinks, useSkillMutations, useSkillRecommendations, useSkillRecommendationMutations, type AgentToolRow, type SkillLinkRow, type SkillRecommendationRow } from "@/hooks/useSupabaseData";
+import { useMemo, useState } from "react";
+import AddSkillModal, { type SkillPrefill } from "@/components/AddSkillModal";
 
 interface ToolInfo {
   name: string;
@@ -68,8 +69,8 @@ const agentConfigs: Record<string, AgentConfig> = {
       "Code review and technical debt assessment",
       "Infrastructure and deployment strategy",
       "Performance optimization",
+      "Web scraping and browser automation",
       "Security best practices",
-      "Effort estimation in hours/days",
     ],
   },
   growth: {
@@ -77,23 +78,13 @@ const agentConfigs: Record<string, AgentConfig> = {
     color: "text-purple-400",
     skills: [
       "User acquisition and activation strategies",
-      "Retention and churn analysis",
-      "Product-market fit assessment",
-      "Growth experiment design (A/B tests)",
-      "Funnel optimization and conversion rates",
-      "ICE scoring (Impact, Confidence, Ease)",
-    ],
-  },
-  sales: {
-    icon: Megaphone,
-    color: "text-amber-400",
-    skills: [
+      "Growth experiments and funnel optimization",
       "Pipeline management and deal qualification",
-      "Pricing strategy and packaging",
-      "Outbound outreach and email sequences",
-      "Discovery calls and demo preparation",
-      "Competitive positioning",
-      "Revenue forecasting",
+      "Pricing strategy and revenue forecasting",
+      "Cold email and LinkedIn outreach",
+      "Lead scoring and ICP refinement",
+      "Follow-up sequences and cadence design",
+      "Retention and churn analysis",
     ],
   },
   research: {
@@ -108,21 +99,30 @@ const agentConfigs: Record<string, AgentConfig> = {
       "Structured frameworks (PESTLE, Porter's 5, SWOT)",
     ],
   },
-  outreach: {
-    icon: Mail,
-    color: "text-orange-400",
+  designer: {
+    icon: Palette,
+    color: "text-pink-400",
     skills: [
-      "Cold email and LinkedIn outreach",
-      "Lead scoring and qualification",
-      "Personalization at scale",
-      "Follow-up sequences and cadence design",
-      "ICP (Ideal Customer Profile) refinement",
-      "Response handling and objection management",
+      "UI/UX design review",
+      "Design system management",
+      "Visual asset creation guidance",
+      "Brand consistency verification",
+    ],
+  },
+  "executive-assistant": {
+    icon: Briefcase,
+    color: "text-teal-400",
+    skills: [
+      "Email triage and drafting",
+      "Meeting notes to action items",
+      "Monday.com board management",
+      "Client reporting and status updates",
+      "Calendar and scheduling coordination",
     ],
   },
 };
 
-const specialistSlugs = ["engineering", "growth", "sales", "research", "outreach"];
+const specialistSlugs = ["engineering", "growth", "research", "designer", "executive-assistant"];
 
 function buildToolList(
   slug: string,
@@ -163,7 +163,7 @@ function OrgChart({
   return (
     <div className="flex flex-col items-center gap-0 py-8 px-4">
       <p className="text-sm text-muted-foreground mb-8 text-center max-w-lg">
-        The Orchestrator receives your directives and coordinates specialist agents as needed. Each agent has its own system prompt, tools, and expertise.
+        The Orchestrator receives Sal's directives and coordinates specialist agents as needed. Each agent has its own system prompt, tools, and expertise.
       </p>
 
       <Card className="w-80 border-emerald-500/30 bg-emerald-500/5">
@@ -172,14 +172,14 @@ function OrgChart({
             <div className="w-10 h-10 rounded-lg bg-emerald-500/10 flex items-center justify-center">
               <Brain size={20} className="text-emerald-400" />
             </div>
-            <div>
+            <div className="text-left">
               <CardTitle className="text-sm">{orchestrator?.name || "Orchestrator"}</CardTitle>
-              <CardDescription className="text-xs">CEO's right-hand AI</CardDescription>
+              <CardDescription className="text-xs">Sal's right-hand AI</CardDescription>
             </div>
           </div>
         </CardHeader>
         <CardContent className="pt-0">
-          <div className="flex flex-wrap gap-1 mt-1">
+          <div className="flex flex-wrap gap-1 mt-1 justify-center">
             <Badge variant="outline" className="text-[10px] font-mono">{orchestrator?.model || "claude-sonnet"}</Badge>
             <Badge variant="secondary" className="text-[10px]">{orchTools.length} tools</Badge>
             <Badge variant="secondary" className="text-[10px]">Delegates work</Badge>
@@ -229,16 +229,16 @@ function OrgChart({
         <h3 className="font-mono text-[10px] text-muted-foreground tracking-widest uppercase mb-3">How It Works</h3>
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
           <div className="p-3 rounded-sm border border-border">
-            <div className="text-xs font-medium mb-1">1. You direct</div>
-            <p className="text-[10px] text-muted-foreground">Send a message in the CEO chat. The Orchestrator receives it.</p>
+            <div className="text-xs font-medium mb-1">1. Sal directs</div>
+            <p className="text-[10px] text-muted-foreground">Sal sends a message in the chat. The Orchestrator receives it and plans the work.</p>
           </div>
           <div className="p-3 rounded-sm border border-border">
             <div className="text-xs font-medium mb-1">2. Agents execute</div>
             <p className="text-[10px] text-muted-foreground">The Orchestrator uses tools or delegates to specialists who have domain expertise.</p>
           </div>
           <div className="p-3 rounded-sm border border-border">
-            <div className="text-xs font-medium mb-1">3. Results synthesized</div>
-            <p className="text-[10px] text-muted-foreground">Results flow back to you as a clear, actionable response with memories stored for context.</p>
+            <div className="text-xs font-medium mb-1">3. Results to Sal</div>
+            <p className="text-[10px] text-muted-foreground">Results flow back to Sal as a clear, actionable response with memories stored for context.</p>
           </div>
         </div>
       </div>
@@ -250,12 +250,24 @@ function AgentDetail({
   agent,
   tools,
   config,
+  skillLinks,
+  recommendations,
+  onAddSkill,
+  onInstallRecommendation,
 }: {
-  agent: { name: string | null; slug: string; description: string | null; model: string | null; temperature: number; max_turns: number };
+  agent: { id: string; name: string | null; slug: string; description: string | null; model: string | null; temperature: number; max_turns: number };
   tools: ToolInfo[];
   config: AgentConfig;
+  skillLinks: SkillLinkRow[];
+  recommendations: SkillRecommendationRow[];
+  onAddSkill: (agentId: string) => void;
+  onInstallRecommendation: (rec: SkillRecommendationRow) => void;
 }) {
   const Icon = config.icon;
+  const { toggleSkillLink, removeSkillLink } = useSkillMutations();
+  const { dismissRecommendation } = useSkillRecommendationMutations();
+  const agentLinks = skillLinks.filter((l) => l.agent_definition_id === agent.id);
+  const agentRecs = recommendations.filter((r) => r.agent_definition_id === agent.id);
 
   return (
     <div className="py-6 px-4">
@@ -301,17 +313,133 @@ function AgentDetail({
         </div>
 
         <div>
-          <div className="flex items-center gap-2 mb-4 pb-2 border-b border-border">
-            <Zap size={14} className="text-muted-foreground" />
-            <h3 className="font-mono text-xs tracking-widest uppercase text-muted-foreground">Skills</h3>
+          <div className="flex items-center justify-between mb-4 pb-2 border-b border-border">
+            <div className="flex items-center gap-2">
+              <BookOpen size={14} className="text-muted-foreground" />
+              <h3 className="font-mono text-xs tracking-widest uppercase text-muted-foreground">Skills</h3>
+              <Badge variant="secondary" className="text-[9px]">{agentLinks.length}</Badge>
+            </div>
+            <button
+              onClick={() => onAddSkill(agent.id)}
+              className="flex items-center gap-1 px-2 py-1 text-[10px] font-medium rounded-md bg-violet-600 text-white hover:bg-violet-500 transition-colors"
+            >
+              <Plus size={10} />
+              Add Skill
+            </button>
           </div>
-          <div className="space-y-2">
-            {config.skills.map((skill, i) => (
-              <div key={i} className="flex items-center gap-3 p-3 rounded-sm border border-border">
-                <div className="w-2 h-2 rounded-full bg-foreground/20 shrink-0" />
-                <span className="text-xs">{skill}</span>
+
+          {agentLinks.length === 0 ? (
+            <div className="flex flex-col items-center justify-center py-8 text-center border border-dashed border-border rounded-md">
+              <BookOpen size={20} className="text-muted-foreground/40 mb-2" />
+              <p className="text-xs text-muted-foreground">No skills assigned</p>
+              <button
+                onClick={() => onAddSkill(agent.id)}
+                className="mt-2 text-[10px] text-violet-400 hover:text-violet-300 transition-colors"
+              >
+                Add your first skill
+              </button>
+            </div>
+          ) : (
+            <div className="space-y-2">
+              {agentLinks.map((link) => (
+                <div
+                  key={link.id}
+                  className={`flex items-start gap-3 p-3 rounded-sm border transition-colors ${
+                    link.is_active ? "border-border hover:border-foreground/20" : "border-border/50 opacity-60"
+                  }`}
+                >
+                  <div className={`w-2 h-2 rounded-full shrink-0 mt-1.5 ${link.is_active ? "bg-violet-500" : "bg-foreground/20"}`} />
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs font-medium truncate">{link.skill?.name || "Unknown"}</span>
+                      {link.skill?.source_url && (
+                        <Badge variant="outline" className="text-[8px] px-1 py-0 h-3.5 shrink-0">github</Badge>
+                      )}
+                    </div>
+                    {link.skill?.description && (
+                      <p className="text-[10px] text-muted-foreground mt-0.5 leading-snug line-clamp-2">{link.skill.description}</p>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-1 shrink-0">
+                    <button
+                      onClick={() => toggleSkillLink.mutate({ linkId: link.id, isActive: !link.is_active })}
+                      className="p-1 rounded hover:bg-secondary text-muted-foreground hover:text-foreground transition-colors"
+                      title={link.is_active ? "Disable" : "Enable"}
+                    >
+                      {link.is_active ? <ToggleRight size={14} className="text-violet-400" /> : <ToggleLeft size={14} />}
+                    </button>
+                    <button
+                      onClick={() => removeSkillLink.mutate(link.id)}
+                      className="p-1 rounded hover:bg-red-500/10 text-muted-foreground hover:text-red-400 transition-colors"
+                      title="Remove"
+                    >
+                      <Trash2 size={12} />
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Recommended Skills */}
+          {agentRecs.length > 0 && (
+            <div className="mt-4 pt-3 border-t border-amber-500/20">
+              <div className="flex items-center gap-2 mb-3">
+                <Lightbulb size={12} className="text-amber-400" />
+                <span className="font-mono text-[10px] text-amber-400 tracking-wider uppercase">
+                  Recommended
+                </span>
+                <Badge variant="secondary" className="text-[9px] bg-amber-500/10 text-amber-400">{agentRecs.length}</Badge>
               </div>
-            ))}
+              <div className="space-y-2">
+                {agentRecs.map((rec) => (
+                  <div key={rec.id} className="p-3 rounded-sm border border-amber-500/20 bg-amber-500/5">
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2">
+                          <span className="text-xs font-medium">{rec.title}</span>
+                          <Badge variant="outline" className="text-[8px] px-1 py-0 h-3.5 text-amber-400 border-amber-500/30">
+                            priority {rec.priority}
+                          </Badge>
+                        </div>
+                        <p className="text-[10px] text-muted-foreground mt-1 leading-snug">{rec.reason}</p>
+                      </div>
+                      <div className="flex items-center gap-1 shrink-0">
+                        <button
+                          onClick={() => onInstallRecommendation(rec)}
+                          className="flex items-center gap-1 px-2 py-1 text-[9px] font-medium rounded bg-amber-500/20 text-amber-400 hover:bg-amber-500/30 transition-colors"
+                          title="Install this skill"
+                        >
+                          <Download size={10} />
+                          Install
+                        </button>
+                        <button
+                          onClick={() => dismissRecommendation.mutate(rec.id)}
+                          className="p-1 rounded hover:bg-secondary text-muted-foreground hover:text-foreground transition-colors"
+                          title="Dismiss"
+                        >
+                          <XCircle size={12} />
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Hardcoded base capabilities */}
+          <div className="mt-4 pt-3 border-t border-border/50">
+            <span className="font-mono text-[9px] text-muted-foreground/60 tracking-wider uppercase block mb-2">
+              Base Capabilities
+            </span>
+            <div className="flex flex-wrap gap-1">
+              {config.skills.map((skill, i) => (
+                <Badge key={i} variant="outline" className="text-[9px] text-muted-foreground/60 border-border/50">
+                  {skill}
+                </Badge>
+              ))}
+            </div>
           </div>
         </div>
       </div>
@@ -323,6 +451,13 @@ const Agents = () => {
   const navigate = useNavigate();
   const { data: agentDefs = [], isLoading } = useAgentDefinitions();
   const { data: externalTools = [] } = useAgentTools();
+  const { data: skillLinks = [] } = useAgentSkillLinks();
+  const { data: recommendations = [] } = useSkillRecommendations();
+  const { markInstalled } = useSkillRecommendationMutations();
+  const [skillModalOpen, setSkillModalOpen] = useState(false);
+  const [skillModalAgentId, setSkillModalAgentId] = useState<string | undefined>();
+  const [skillPrefill, setSkillPrefill] = useState<SkillPrefill | undefined>();
+  const [pendingRecId, setPendingRecId] = useState<string | null>(null);
 
   const typedAgents =
     (agentDefs as Array<{
@@ -346,6 +481,36 @@ const Agents = () => {
     }
     return map;
   }, [typedAgents, externalTools]);
+
+  const handleAddSkill = (agentId: string) => {
+    setSkillModalAgentId(agentId);
+    setSkillPrefill(undefined);
+    setPendingRecId(null);
+    setSkillModalOpen(true);
+  };
+
+  const handleInstallRecommendation = (rec: SkillRecommendationRow) => {
+    setSkillModalAgentId(rec.agent_definition_id);
+    setSkillPrefill({
+      name: rec.title,
+      description: rec.reason,
+      content: rec.suggested_content || "",
+    });
+    setPendingRecId(rec.id);
+    setSkillModalOpen(true);
+  };
+
+  const handleModalSuccess = () => {
+    if (pendingRecId) {
+      markInstalled.mutate(pendingRecId);
+    }
+  };
+
+  const handleModalClose = () => {
+    setSkillModalOpen(false);
+    setSkillPrefill(undefined);
+    setPendingRecId(null);
+  };
 
   return (
     <div className="h-screen flex flex-col bg-background">
@@ -397,13 +562,21 @@ const Agents = () => {
               const tools = agentToolsMap[agent.slug] || [];
               return (
                 <TabsContent key={agent.slug} value={agent.slug} className="mt-0">
-                  <AgentDetail agent={agent} tools={tools} config={config} />
+                  <AgentDetail agent={agent} tools={tools} config={config} skillLinks={skillLinks} recommendations={recommendations} onAddSkill={handleAddSkill} onInstallRecommendation={handleInstallRecommendation} />
                 </TabsContent>
               );
             })}
           </Tabs>
         )}
       </div>
+
+      <AddSkillModal
+        open={skillModalOpen}
+        onClose={handleModalClose}
+        onSuccess={handleModalSuccess}
+        preselectedAgentId={skillModalAgentId}
+        prefill={skillPrefill}
+      />
     </div>
   );
 };

@@ -7,6 +7,7 @@ import { CompanyProvider } from "@/contexts/CompanyContext";
 import Index from "./pages/Index.tsx";
 import Agents from "./pages/Agents.tsx";
 import CompanySettings from "./pages/CompanySettings.tsx";
+import Outputs from "./pages/Outputs.tsx";
 import NotFound from "./pages/NotFound.tsx";
 
 const queryClient = new QueryClient();
@@ -22,6 +23,7 @@ const App = () => (
             <Route path="/" element={<Index />} />
             <Route path="/agents" element={<Agents />} />
             <Route path="/company-settings" element={<CompanySettings />} />
+            <Route path="/outputs" element={<Outputs />} />
             <Route path="*" element={<NotFound />} />
           </Routes>
         </BrowserRouter>

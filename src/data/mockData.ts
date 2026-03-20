@@ -135,7 +135,7 @@ export const tasks: Task[] = [
 > Lead 4: Ralph Mupita (MTN Group CEO) - In progress...
 > Personalizing based on recent AI deployment announcement
 > 8/10 sequences complete`,
-    category: "outreach",
+    category: "growth",
   },
   {
     id: "TASK-0039",

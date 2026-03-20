@@ -4,7 +4,11 @@
   "framework": "vite",
   "functions": {
     "api/run-agent.ts": {
-      "maxDuration": 300
+      "maxDuration": 120,
+      "includeFiles": "api/agent-scripts/**"
+    },
+    "api/daily-digest.ts": {
+      "maxDuration": 120
     }
   },
   "routes": [
@@ -16,6 +20,14 @@
     {
       "path": "/api/proactive-planner",
       "schedule": "0 8 * * *"
+    },
+    {
+      "path": "/api/daily-digest",
+      "schedule": "5 8 * * *"
+    },
+    {
+      "path": "/api/skill-recommender",
+      "schedule": "10 8 * * *"
     }
   ]
 }

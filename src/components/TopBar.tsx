@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { Building2, ChevronDown, Plus, Settings } from "lucide-react";
+import { Building2, ChevronDown, Plus, Settings, FolderOpen } from "lucide-react";
 import { useCompany } from "@/contexts/CompanyContext";
 import {
   DropdownMenu,
@@ -137,6 +137,13 @@ const TopBar = () => {
           >
             <Settings size={12} />
             Settings
+          </button>
+          <button
+            onClick={() => navigate("/outputs")}
+            className="flex items-center gap-1.5 px-3 py-1 rounded-sm border border-border text-xs font-medium text-foreground hover:bg-secondary transition-colors"
+          >
+            <FolderOpen size={12} />
+            Outputs
           </button>
           <button
             onClick={() => navigate("/agents")}

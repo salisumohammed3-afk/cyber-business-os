@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
 import { useNavigate } from "react-router-dom";
-import { ArrowLeft, Save, Plus, Trash2, Target, Bot, Wrench, FileText } from "lucide-react";
+import { ArrowLeft, Save, Plus, Trash2, Target, Bot, Wrench, FileText, Bell } from "lucide-react";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -446,6 +446,82 @@ function ToolsTab() {
   );
 }
 
+// ── Notifications Tab ──────────────────────────────────────────────────────
+
+function NotificationsTab() {
+  const { company, refreshCompanies } = useCompany();
+  const [digestEmail, setDigestEmail] = useState("");
+  const [digestEnabled, setDigestEnabled] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+
+  useEffect(() => {
+    if (company) {
+      setDigestEmail(company.digest_email || "");
+      setDigestEnabled(company.digest_enabled ?? true);
+    }
+  }, [company]);
+
+  const save = async () => {
+    if (!company) return;
+    setSaving(true);
+    await supabase.from("companies").update({
+      digest_email: digestEmail || null,
+      digest_enabled: digestEnabled,
+    }).eq("id", company.id);
+    await refreshCompanies();
+    setSaving(false);
+    setSaved(true);
+    setTimeout(() => setSaved(false), 2000);
+  };
+
+  return (
+    <div className="space-y-6 max-w-2xl">
+      <div>
+        <h3 className="text-sm font-medium mb-1">Daily Digest Email</h3>
+        <p className="text-xs text-muted-foreground mb-3">
+          Receive a daily briefing at 8:05 AM UTC summarizing your agents' activity from the last 24 hours.
+        </p>
+      </div>
+
+      <div className="flex items-center gap-3">
+        <label className="flex items-center gap-2 cursor-pointer">
+          <input
+            type="checkbox"
+            checked={digestEnabled}
+            onChange={(e) => { setDigestEnabled(e.target.checked); setSaved(false); }}
+            className="rounded"
+          />
+          <span className="text-sm">Enable daily digest</span>
+        </label>
+      </div>
+
+      <div>
+        <label className="text-sm font-medium">Email address</label>
+        <input
+          type="email"
+          value={digestEmail}
+          onChange={(e) => { setDigestEmail(e.target.value); setSaved(false); }}
+          placeholder="you@example.com"
+          className="mt-1 w-full rounded-lg border px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+        />
+        <p className="text-xs text-muted-foreground mt-1">
+          The digest will be sent to this address every morning.
+        </p>
+      </div>
+
+      <button
+        onClick={save}
+        disabled={saving}
+        className="flex items-center gap-2 px-4 py-2 rounded-lg bg-blue-600 text-white text-sm font-medium hover:bg-blue-700 disabled:opacity-50"
+      >
+        <Save size={14} />
+        {saving ? "Saving..." : saved ? "Saved!" : "Save Notifications"}
+      </button>
+    </div>
+  );
+}
+
 // ── Main Page ──────────────────────────────────────────────────────────────
 
 export default function CompanySettings() {
@@ -483,11 +559,15 @@ export default function CompanySettings() {
             <TabsTrigger value="tools" className="flex items-center gap-1.5">
               <Wrench size={14} /> Tools
             </TabsTrigger>
+            <TabsTrigger value="notifications" className="flex items-center gap-1.5">
+              <Bell size={14} /> Notifications
+            </TabsTrigger>
           </TabsList>
           <TabsContent value="brief"><BriefTab /></TabsContent>
           <TabsContent value="goals"><GoalsTab /></TabsContent>
           <TabsContent value="agents"><AgentsTab /></TabsContent>
           <TabsContent value="tools"><ToolsTab /></TabsContent>
+          <TabsContent value="notifications"><NotificationsTab /></TabsContent>
         </Tabs>
       </div>
     </div>

@@ -1,4 +1,4 @@
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient, useMutation } from "@tanstack/react-query";
 import { useCallback } from "react";
 import { supabase } from "@/integrations/supabase/client";
 import { useCompany } from "@/contexts/CompanyContext";
@@ -265,4 +265,243 @@ export function useAgentTools() {
     },
     enabled: !!companyId,
   });
+}
+
+// ── Skills ──────────────────────────────────────────────────────────────────
+
+export interface SkillRow {
+  id: string;
+  company_id: string;
+  name: string;
+  description: string | null;
+  content: string;
+  source_url: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface SkillLinkRow {
+  id: string;
+  agent_definition_id: string;
+  skill_id: string;
+  is_active: boolean;
+  created_at: string;
+  skill?: SkillRow;
+}
+
+export function useSkills() {
+  const { company } = useCompany();
+  const companyId = company?.id;
+
+  return useQuery({
+    queryKey: ["skills", companyId],
+    queryFn: async () => {
+      if (!companyId) return [];
+      const { data, error } = await supabase
+        .from("skills")
+        .select("*")
+        .eq("company_id", companyId)
+        .order("name");
+      if (error) throw error;
+      return (data || []) as SkillRow[];
+    },
+    enabled: !!companyId,
+  });
+}
+
+export function useAgentSkillLinks() {
+  const { company } = useCompany();
+  const companyId = company?.id;
+
+  return useQuery({
+    queryKey: ["agent_skill_links", companyId],
+    queryFn: async () => {
+      if (!companyId) return [];
+      const { data: agents } = await supabase
+        .from("agent_definitions")
+        .select("id")
+        .eq("company_id", companyId);
+      if (!agents?.length) return [];
+      const agentIds = agents.map((a: { id: string }) => a.id);
+
+      const { data, error } = await supabase
+        .from("agent_skill_links")
+        .select("*, skills(*)")
+        .in("agent_definition_id", agentIds);
+      if (error) throw error;
+
+      return (data || []).map((row: Record<string, unknown>) => ({
+        id: row.id as string,
+        agent_definition_id: row.agent_definition_id as string,
+        skill_id: row.skill_id as string,
+        is_active: row.is_active as boolean,
+        created_at: row.created_at as string,
+        skill: row.skills as SkillRow | undefined,
+      })) as SkillLinkRow[];
+    },
+    enabled: !!companyId,
+  });
+}
+
+export function useSkillMutations() {
+  const queryClient = useQueryClient();
+  const { company } = useCompany();
+
+  const invalidate = () => {
+    queryClient.invalidateQueries({ queryKey: ["skills", company?.id] });
+    queryClient.invalidateQueries({ queryKey: ["agent_skill_links", company?.id] });
+  };
+
+  const createSkill = useMutation({
+    mutationFn: async (input: {
+      name: string;
+      description: string;
+      content: string;
+      source_url?: string;
+      agentIds: string[];
+    }) => {
+      const { data: skill, error } = await supabase
+        .from("skills")
+        .insert({
+          company_id: company!.id,
+          name: input.name,
+          description: input.description || null,
+          content: input.content,
+          source_url: input.source_url || null,
+        })
+        .select()
+        .single();
+      if (error) throw error;
+
+      if (input.agentIds.length > 0) {
+        const links = input.agentIds.map((agentId) => ({
+          agent_definition_id: agentId,
+          skill_id: skill.id,
+        }));
+        const { error: linkErr } = await supabase
+          .from("agent_skill_links")
+          .insert(links);
+        if (linkErr) throw linkErr;
+      }
+      return skill;
+    },
+    onSuccess: invalidate,
+  });
+
+  const toggleSkillLink = useMutation({
+    mutationFn: async (input: { linkId: string; isActive: boolean }) => {
+      const { error } = await supabase
+        .from("agent_skill_links")
+        .update({ is_active: input.isActive })
+        .eq("id", input.linkId);
+      if (error) throw error;
+    },
+    onSuccess: invalidate,
+  });
+
+  const removeSkillLink = useMutation({
+    mutationFn: async (linkId: string) => {
+      const { error } = await supabase
+        .from("agent_skill_links")
+        .delete()
+        .eq("id", linkId);
+      if (error) throw error;
+    },
+    onSuccess: invalidate,
+  });
+
+  const deleteSkill = useMutation({
+    mutationFn: async (skillId: string) => {
+      const { error } = await supabase
+        .from("skills")
+        .delete()
+        .eq("id", skillId);
+      if (error) throw error;
+    },
+    onSuccess: invalidate,
+  });
+
+  const updateSkill = useMutation({
+    mutationFn: async (input: { skillId: string; content: string; name?: string; description?: string }) => {
+      const updates: Record<string, unknown> = { content: input.content, updated_at: new Date().toISOString() };
+      if (input.name !== undefined) updates.name = input.name;
+      if (input.description !== undefined) updates.description = input.description;
+      const { error } = await supabase
+        .from("skills")
+        .update(updates)
+        .eq("id", input.skillId);
+      if (error) throw error;
+    },
+    onSuccess: invalidate,
+  });
+
+  return { createSkill, toggleSkillLink, removeSkillLink, deleteSkill, updateSkill };
+}
+
+// ── Skill Recommendations ───────────────────────────────────────────────────
+
+export interface SkillRecommendationRow {
+  id: string;
+  agent_definition_id: string;
+  company_id: string;
+  title: string;
+  reason: string;
+  suggested_content: string | null;
+  priority: number;
+  status: string;
+  created_at: string;
+}
+
+export function useSkillRecommendations() {
+  const { company } = useCompany();
+  const companyId = company?.id;
+
+  return useQuery({
+    queryKey: ["skill_recommendations", companyId],
+    queryFn: async () => {
+      if (!companyId) return [];
+      const { data, error } = await supabase
+        .from("skill_recommendations")
+        .select("*")
+        .eq("company_id", companyId)
+        .eq("status", "pending")
+        .order("priority", { ascending: false });
+      if (error) throw error;
+      return (data || []) as SkillRecommendationRow[];
+    },
+    enabled: !!companyId,
+  });
+}
+
+export function useSkillRecommendationMutations() {
+  const queryClient = useQueryClient();
+  const { company } = useCompany();
+
+  const invalidate = () => {
+    queryClient.invalidateQueries({ queryKey: ["skill_recommendations", company?.id] });
+  };
+
+  const dismissRecommendation = useMutation({
+    mutationFn: async (recId: string) => {
+      const { error } = await supabase
+        .from("skill_recommendations")
+        .update({ status: "dismissed" })
+        .eq("id", recId);
+      if (error) throw error;
+    },
+    onSuccess: invalidate,
+  });
+
+  const markInstalled = useMutation({
+    mutationFn: async (recId: string) => {
+      const { error } = await supabase
+        .from("skill_recommendations")
+        .update({ status: "installed" })
+        .eq("id", recId);
+      if (error) throw error;
+    },
+    onSuccess: invalidate,
+  });
+
+  return { dismissRecommendation, markInstalled };
 }

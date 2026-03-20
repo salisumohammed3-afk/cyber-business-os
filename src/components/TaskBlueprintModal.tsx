@@ -166,14 +166,36 @@ const TaskBlueprintModal = ({ task, onClose }: Props) => {
                 </div>
               </div>
 
-              {/* Execution result */}
+              {/* Section 2: Result / Outcome */}
+              {task.result?.response && (
+                <div>
+                  <span className="font-mono text-[10px] text-muted-foreground tracking-wider uppercase block mb-1.5">
+                    Result
+                  </span>
+                  <div className="text-xs text-foreground leading-relaxed bg-secondary p-3 rounded-md border border-border prose prose-sm prose-gray max-w-none [&_p]:my-1 [&_ul]:my-1 [&_li]:my-0.5 max-h-64 overflow-y-auto">
+                    <ReactMarkdown>{task.result.response}</ReactMarkdown>
+                  </div>
+                </div>
+              )}
+
+              {!task.result?.response && (task.tool_output || task.reasoning) && (
+                <div>
+                  <span className="font-mono text-[10px] text-muted-foreground tracking-wider uppercase block mb-1.5">
+                    Result
+                  </span>
+                  <pre className="text-[10px] font-mono text-muted-foreground bg-secondary p-3 rounded-md border border-border overflow-x-auto whitespace-pre-wrap leading-relaxed max-h-48 overflow-y-auto">
+                    {task.tool_output || task.reasoning}
+                  </pre>
+                </div>
+              )}
+
+              {/* Section 3: Steps / What Happened */}
               {task.result && (
-                <div className="space-y-3">
+                <div className="space-y-2">
                   <span className="font-mono text-[10px] text-muted-foreground tracking-wider uppercase block">
-                    Execution Result
+                    Steps
                   </span>
 
-                  {/* Execution stats bar */}
                   <div className="flex flex-wrap items-center gap-3 text-[10px]">
                     {task.result.turns != null && (
                       <div className="flex items-center gap-1 text-muted-foreground">
@@ -196,9 +218,14 @@ const TaskBlueprintModal = ({ task, onClose }: Props) => {
                     {task.result.max_turns_reached && (
                       <Badge variant="secondary" className="text-[9px] text-amber-500">max turns</Badge>
                     )}
+                    {(task.result as Record<string, unknown>).attempt && (
+                      <div className="flex items-center gap-1 text-muted-foreground">
+                        <RotateCcw size={10} className="text-violet-500" />
+                        <span>attempt {(task.result as Record<string, unknown>).attempt as number}</span>
+                      </div>
+                    )}
                   </div>
 
-                  {/* Tools used chips */}
                   {task.result.tools_used && task.result.tools_used.length > 0 && (
                     <div className="flex flex-wrap gap-1.5">
                       {task.result.tools_used.map((tool) => (
@@ -210,24 +237,17 @@ const TaskBlueprintModal = ({ task, onClose }: Props) => {
                     </div>
                   )}
 
-                  {/* Agent response */}
-                  {task.result.response && (
-                    <div className="text-xs text-foreground leading-relaxed bg-secondary p-3 rounded-md border border-border prose prose-sm prose-gray max-w-none [&_p]:my-1 [&_ul]:my-1 [&_li]:my-0.5 max-h-56 overflow-y-auto">
-                      <ReactMarkdown>{task.result.response}</ReactMarkdown>
+                  {task.result.tool_calls && Array.isArray(task.result.tool_calls) && task.result.tool_calls.length > 0 && (
+                    <div className="space-y-1 mt-1">
+                      {task.result.tool_calls.map((tc: { tool: string; source: string }, i: number) => (
+                        <div key={i} className="flex items-center gap-2 text-[10px] text-muted-foreground pl-1">
+                          <span className="text-[9px] font-mono text-muted-foreground/50 w-4 text-right">{i + 1}.</span>
+                          <Badge variant="outline" className="text-[8px] font-mono px-1 py-0">{tc.source}</Badge>
+                          <span className="font-mono">{tc.tool}</span>
+                        </div>
+                      ))}
                     </div>
                   )}
-                </div>
-              )}
-
-              {/* Legacy tool output fallback */}
-              {!task.result && (task.tool_output || task.reasoning) && (
-                <div>
-                  <span className="font-mono text-[10px] text-muted-foreground tracking-wider uppercase block mb-1.5">
-                    Output
-                  </span>
-                  <pre className="text-[10px] font-mono text-muted-foreground bg-secondary p-3 rounded-md border border-border overflow-x-auto whitespace-pre-wrap leading-relaxed max-h-48 overflow-y-auto">
-                    {task.tool_output || task.reasoning}
-                  </pre>
                 </div>
               )}
 

@@ -14,14 +14,11 @@ Each task you propose should be:
 
 Available agents and their strengths:
 - orchestrator: Overall coordination, strategy, user communication
-- sales: Revenue generation, pipeline management, lead research (has Apollo, LinkedIn)
-- outreach: Cold email, campaigns, relationship building (has AgentMail, LinkedIn)
+- growth: Full revenue lifecycle — user acquisition, sales pipeline, outreach, pricing, campaigns, retention (has Apollo, LinkedIn, AgentMail, Meta Ads, ElevenLabs)
 - research: Market research, competitive intelligence, trend analysis (has Exa, Firecrawl)
-- growth: User acquisition, ad campaigns, growth experiments (has Meta Ads, ElevenLabs)
 - engineering: Technical development, architecture, code review
 - designer: UI/UX design, mockups, design system
-- browser: Web automation, scraping, form filling (has Firecrawl)
-- taskmaster: Project management, board management
+- executive-assistant: Email management, meeting notes to actions, Monday.com boards, client reporting, scheduling (has Monday.com, AgentMail, Gmail, Google Calendar)
 
 Respond ONLY with a JSON array of task objects. Each object must have:
 - "title": short task title

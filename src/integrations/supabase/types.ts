@@ -40,6 +40,8 @@ export interface Database {
           slug: string
           brief: CompanyBrief
           is_active: boolean
+          digest_email: string | null
+          digest_enabled: boolean
           created_at: string
         }
         Insert: {
@@ -49,6 +51,8 @@ export interface Database {
           slug: string
           brief?: Json
           is_active?: boolean
+          digest_email?: string | null
+          digest_enabled?: boolean
           created_at?: string
         }
         Update: {
@@ -58,6 +62,8 @@ export interface Database {
           slug?: string
           brief?: Json
           is_active?: boolean
+          digest_email?: string | null
+          digest_enabled?: boolean
           created_at?: string
         }
       }
@@ -415,6 +421,53 @@ export interface Database {
           created_at?: string
         }
       }
+      projects: {
+        Row: {
+          id: string
+          company_id: string
+          name: string
+          description: string | null
+          repo_url: string | null
+          deploy_url: string | null
+          branch: string
+          tables_created: string[]
+          env_vars: Json
+          status: 'draft' | 'building' | 'live' | 'archived'
+          created_by_task_id: string | null
+          created_at: string
+          updated_at: string
+        }
+        Insert: {
+          id?: string
+          company_id: string
+          name: string
+          description?: string | null
+          repo_url?: string | null
+          deploy_url?: string | null
+          branch?: string
+          tables_created?: string[]
+          env_vars?: Json
+          status?: 'draft' | 'building' | 'live' | 'archived'
+          created_by_task_id?: string | null
+          created_at?: string
+          updated_at?: string
+        }
+        Update: {
+          id?: string
+          company_id?: string
+          name?: string
+          description?: string | null
+          repo_url?: string | null
+          deploy_url?: string | null
+          branch?: string
+          tables_created?: string[]
+          env_vars?: Json
+          status?: 'draft' | 'building' | 'live' | 'archived'
+          created_by_task_id?: string | null
+          created_at?: string
+          updated_at?: string
+        }
+      }
       memories: {
         Row: {
           id: string
@@ -516,6 +569,87 @@ export interface Database {
           agent_definition_id?: string | null
           created_at?: string
         }
+      }
+    }
+    skills: {
+      Row: {
+        id: string
+        company_id: string
+        name: string
+        description: string | null
+        content: string
+        source_url: string | null
+        created_at: string
+        updated_at: string
+      }
+      Insert: {
+        id?: string
+        company_id: string
+        name: string
+        description?: string | null
+        content: string
+        source_url?: string | null
+        created_at?: string
+        updated_at?: string
+      }
+      Update: {
+        id?: string
+        company_id?: string
+        name?: string
+        description?: string | null
+        content?: string
+        source_url?: string | null
+        updated_at?: string
+      }
+    }
+    agent_skill_links: {
+      Row: {
+        id: string
+        agent_definition_id: string
+        skill_id: string
+        is_active: boolean
+        created_at: string
+      }
+      Insert: {
+        id?: string
+        agent_definition_id: string
+        skill_id: string
+        is_active?: boolean
+        created_at?: string
+      }
+      Update: {
+        id?: string
+        agent_definition_id?: string
+        skill_id?: string
+        is_active?: boolean
+      }
+    }
+    skill_recommendations: {
+      Row: {
+        id: string
+        agent_definition_id: string
+        company_id: string
+        title: string
+        reason: string
+        suggested_content: string | null
+        priority: number
+        status: string
+        created_at: string
+      }
+      Insert: {
+        id?: string
+        agent_definition_id: string
+        company_id: string
+        title: string
+        reason: string
+        suggested_content?: string | null
+        priority?: number
+        status?: string
+        created_at?: string
+      }
+      Update: {
+        id?: string
+        status?: string
       }
     }
     Enums: {

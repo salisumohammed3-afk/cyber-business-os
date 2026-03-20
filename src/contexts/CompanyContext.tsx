@@ -10,6 +10,8 @@ export interface Company {
   slug: string
   brief: CompanyBrief
   is_active: boolean
+  digest_email: string | null
+  digest_enabled: boolean
   created_at: string
 }
 

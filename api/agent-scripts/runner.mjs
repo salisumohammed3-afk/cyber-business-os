@@ -1003,12 +1003,13 @@ async function saveCheckpoint(messages, turn, allToolCalls) {
       saved_at: new Date().toISOString(),
     };
     const jsonSize = JSON.stringify(checkpoint).length;
-    if (jsonSize > 500_000) {
-      const trimmed = { ...checkpoint, messages: serializable.slice(-10) };
-      await sbPatch("tasks", { metadata: { checkpoint: trimmed } }, { id: "eq." + TASK_ID });
-    } else {
-      await sbPatch("tasks", { metadata: { checkpoint } }, { id: "eq." + TASK_ID });
-    }
+    const cpData = jsonSize > 500_000
+      ? { ...checkpoint, messages: serializable.slice(-10) }
+      : checkpoint;
+
+    const existing = await sbGet("tasks", { id: "eq." + TASK_ID }, { select: "metadata", single: true });
+    const merged = { ...(existing?.metadata || {}), checkpoint: cpData };
+    await sbPatch("tasks", { metadata: merged }, { id: "eq." + TASK_ID });
   } catch (e) {
     await log("Checkpoint save failed: " + (e.message || e), "warn");
   }
@@ -1328,15 +1329,17 @@ async function main() {
     systemPrompt = "You are the Engineering Agent. You BUILD things. You have a full sandbox environment with filesystem, shell, and GitHub access.\n\n" +
       "CRITICAL: You MUST use your tools to write actual code, test it, and push it. NEVER just describe what you would build. ALWAYS build it.\n\n" +
       systemPrompt +
-      "\n\n## Engineering Workflow (FOLLOW THIS EXACTLY)\n" +
-      "Step 1: Write all code files using sandbox_write_file (use relative paths like 'project/index.html')\n" +
-      "Step 2: Run and test with sandbox_bash (e.g. 'cat project/index.html' to verify)\n" +
+      "\n\n## Engineering Workflow (FOLLOW THIS EXACTLY — DO NOT SKIP STEPS)\n" +
+      "Step 1: Write ALL code files using sandbox_write_file (use relative paths like 'project/index.html')\n" +
+      "Step 2: Verify files with sandbox_bash (e.g. 'cat project/index.html | head -20')\n" +
       "Step 3: Fix any errors found\n" +
       "Step 4: Create a GitHub repo with github_create_repo\n" +
-      "Step 5: Push each file with github_push_file\n" +
-      "Step 6: Deploy with deploy_static_site (PREFERRED) — this gives an instant live URL. Do NOT use GitHub Pages workflows.\n" +
-      "Step 7: Register the project with register_project (use the deploy URL from step 6)\n\n" +
-      "You MUST complete ALL steps. A text description of what you WOULD build is NOT acceptable output.";
+      "Step 5: Push EVERY file with github_push_file\n" +
+      "Step 6: Deploy with deploy_static_site (PREFERRED — instant live URL). Do NOT use GitHub Pages workflows.\n" +
+      "Step 7: Register the project with register_project (use deploy URL from step 6)\n\n" +
+      "CRITICAL: You MUST complete ALL 7 steps in order. DO NOT stop after writing files. " +
+      "DO NOT return text without completing the full workflow. If you stop before register_project, your work will be REJECTED. " +
+      "The minimum acceptable tool sequence is: sandbox_write_file → github_create_repo → github_push_file → deploy_static_site → register_project.";
 
     // Project edit mode: inject existing project context
     let rawInputCheck = task.input_data;

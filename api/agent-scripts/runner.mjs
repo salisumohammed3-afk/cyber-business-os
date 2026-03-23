@@ -19,6 +19,7 @@ const COMPOSIO_KEY     = process.env.COMPOSIO_API_KEY || "";
 const PROJECTS_DB_URL  = process.env.PROJECTS_SUPABASE_URL || "";
 const PROJECTS_DB_KEY  = process.env.PROJECTS_SUPABASE_KEY || "";
 const SELF_URL         = process.env.SELF_URL || "";
+const VERCEL_TOKEN     = process.env.VERCEL_TOKEN || "";
 
 if (!TASK_ID || !SUPABASE_URL || !SUPABASE_KEY || !ANTHROPIC_KEY) {
   console.error("Missing required env vars");
@@ -379,6 +380,18 @@ const ENGINEERING_TOOLS = [
       required: [],
     },
   },
+  {
+    name: "deploy_static_site",
+    description: "Deploy a static site directory to Vercel. Returns a live URL instantly. Use INSTEAD of GitHub Pages for deployment.",
+    input_schema: {
+      type: "object",
+      properties: {
+        project_name: { type: "string", description: "Project name (lowercase, hyphens ok), e.g. 'smart-todo-app'" },
+        directory: { type: "string", description: "Path to the directory containing static files to deploy, e.g. 'todo-app'" },
+      },
+      required: ["project_name", "directory"],
+    },
+  },
 ];
 
 const DESIGNER_TOOLS = [
@@ -451,6 +464,7 @@ async function executeTool(name, input) {
       case "sandbox_read_file":  return await toolSandboxReadFile(input);
       case "sandbox_write_file": return await toolSandboxWriteFile(input);
       case "sandbox_list_files": return await toolSandboxListFiles(input);
+      case "deploy_static_site": return await toolDeployStaticSite(input);
       case "fail_task":          return JSON.stringify({ acknowledged: true, reason: input.reason });
       default:                   return JSON.stringify({ error: "Unknown tool: " + name });
     }
@@ -824,13 +838,29 @@ async function toolComposioExecute(input) {
 
 // ── Sandbox filesystem tools (engineering agent only) ───────────────────────
 
+const BLOCKING_PATTERNS = [
+  /\bhttp\.server\b/, /\bserve\s/, /\bnpx\s+serve\b/, /\blive-server\b/,
+  /\bnginx\b/, /\bapache2?\b/, /\buvicorn\b/, /\bgunicorn\b/,
+  /\btail\s+-f\b/, /\bwatch\b/, /\bnodemon\b/, /\bnpm\s+start\b/,
+];
+
 function toolSandboxBash(input) {
+  const cmd = input.command || "";
+  const isBlocking = BLOCKING_PATTERNS.some(p => p.test(cmd));
+  if (isBlocking && !cmd.includes("&") && !cmd.includes("timeout")) {
+    return JSON.stringify({
+      error: "This command looks like it would run forever (blocking server/watcher). " +
+        "Either append ' &' to run in background, prefix with 'timeout 10s', or use a different approach.",
+      suggestion: cmd + " &",
+    });
+  }
+
   try {
     const cwd = input.cwd || process.cwd();
-    const stdout = execSync(input.command, {
+    const stdout = execSync(cmd, {
       cwd,
       encoding: "utf-8",
-      timeout: 60000,
+      timeout: 120_000,
       maxBuffer: 2 * 1024 * 1024,
       shell: true,
     });
@@ -882,12 +912,112 @@ function toolSandboxListFiles(input) {
   }
 }
 
+async function toolDeployStaticSite(input) {
+  if (!VERCEL_TOKEN) return JSON.stringify({ error: "VERCEL_TOKEN not configured. Use GitHub Pages as fallback." });
+  const { project_name, directory } = input;
+  if (!project_name || !directory) return JSON.stringify({ error: "project_name and directory are required" });
+
+  try {
+    const dir = join(process.cwd(), directory);
+    if (!existsSync(dir)) return JSON.stringify({ error: "Directory not found: " + directory });
+
+    function collectFiles(base, prefix = "") {
+      const results = [];
+      for (const name of readdirSync(base)) {
+        const full = join(base, name);
+        const rel = prefix ? prefix + "/" + name : name;
+        if (name.startsWith(".") || name === "node_modules") continue;
+        const st = statSync(full);
+        if (st.isDirectory()) {
+          results.push(...collectFiles(full, rel));
+        } else if (st.size < 5_000_000) {
+          results.push({ file: rel, data: readFileSync(full).toString("base64"), encoding: "base64" });
+        }
+      }
+      return results;
+    }
+
+    const files = collectFiles(dir);
+    if (files.length === 0) return JSON.stringify({ error: "No files found in " + directory });
+
+    await log("Deploying " + files.length + " files to Vercel as " + project_name, "deploy_start");
+
+    const body = {
+      name: project_name,
+      files: files,
+      projectSettings: { framework: null },
+      target: "production",
+    };
+
+    const resp = await fetch("https://api.vercel.com/v13/deployments", {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer " + VERCEL_TOKEN,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+
+    if (!resp.ok) {
+      const errText = await resp.text().catch(() => "");
+      return JSON.stringify({ error: "Deploy failed: " + resp.status + " " + errText.slice(0, 300) });
+    }
+
+    const data = await resp.json();
+    const url = data.url ? "https://" + data.url : data.alias?.[0] ? "https://" + data.alias[0] : null;
+
+    await log("Deployed to " + (url || data.url || "unknown"), "deploy_complete");
+    return JSON.stringify({
+      success: true,
+      url: url,
+      deployment_url: data.url,
+      project: project_name,
+      files_deployed: files.length,
+      ready_state: data.readyState || data.status,
+    });
+  } catch (e) {
+    return JSON.stringify({ error: "Deploy error: " + (e.message || e) });
+  }
+}
+
 // ── Agentic loop ────────────────────────────────────────────────────────────
 
-async function runLoop(model, systemPrompt, messages, tools, maxTurns, temperature, mcpServers = []) {
-  const allToolCalls = [];
+async function saveCheckpoint(messages, turn, allToolCalls) {
+  try {
+    const serializable = messages.map(m => {
+      if (typeof m.content === "string") return m;
+      if (Array.isArray(m.content)) {
+        return { role: m.role, content: m.content.map(b => {
+          if (b.type === "tool_result") return { type: "tool_result", tool_use_id: b.tool_use_id, content: (b.content || "").slice(0, 2000) };
+          if (b.type === "tool_use") return { type: "tool_use", id: b.id, name: b.name, input: b.input };
+          if (b.type === "text") return { type: "text", text: (b.text || "").slice(0, 3000) };
+          return b;
+        })};
+      }
+      return m;
+    });
+    const checkpoint = {
+      messages: serializable,
+      turn,
+      tools_used: [...new Set(allToolCalls.map(t => t.tool))],
+      saved_at: new Date().toISOString(),
+    };
+    const jsonSize = JSON.stringify(checkpoint).length;
+    if (jsonSize > 500_000) {
+      const trimmed = { ...checkpoint, messages: serializable.slice(-10) };
+      await sbPatch("tasks", { metadata: { checkpoint: trimmed } }, { id: "eq." + TASK_ID });
+    } else {
+      await sbPatch("tasks", { metadata: { checkpoint } }, { id: "eq." + TASK_ID });
+    }
+  } catch (e) {
+    await log("Checkpoint save failed: " + (e.message || e), "warn");
+  }
+}
 
-  for (let turn = 0; turn < maxTurns; turn++) {
+async function runLoop(model, systemPrompt, messages, tools, maxTurns, temperature, mcpServers = [], startTurn = 0, existingToolCalls = []) {
+  const allToolCalls = [...existingToolCalls];
+
+  for (let turn = startTurn; turn < maxTurns; turn++) {
     await log("Turn " + (turn + 1) + "/" + maxTurns + " — calling " + model);
 
     const response = await callClaude(model, systemPrompt, messages, tools, 4096, temperature, mcpServers);
@@ -928,6 +1058,8 @@ async function runLoop(model, systemPrompt, messages, tools, maxTurns, temperatu
       }
 
       messages.push({ role: "user", content: results });
+
+      await saveCheckpoint(messages, turn + 1, allToolCalls);
       continue;
     }
 
@@ -1202,7 +1334,8 @@ async function main() {
       "Step 3: Fix any errors found\n" +
       "Step 4: Create a GitHub repo with github_create_repo\n" +
       "Step 5: Push each file with github_push_file\n" +
-      "Step 6: Register the project with register_project\n\n" +
+      "Step 6: Deploy with deploy_static_site (PREFERRED) — this gives an instant live URL. Do NOT use GitHub Pages workflows.\n" +
+      "Step 7: Register the project with register_project (use the deploy URL from step 6)\n\n" +
       "You MUST complete ALL steps. A text description of what you WOULD build is NOT acceptable output.";
 
     // Project edit mode: inject existing project context
@@ -1276,10 +1409,25 @@ async function main() {
     }
   }
 
-  await log("Starting agentic loop — " + tools.length + " tools, " + mcpServers.length + " MCP servers, max " + maxTurns + " turns", "loop_start");
+  // 9. Check for checkpoint (resume from previous run)
+  let startTurn = 0;
+  let existingToolCalls = [];
+  const taskMeta = task.metadata || {};
+  const checkpoint = taskMeta.checkpoint;
 
-  // 9. Run the loop
-  const result = await runLoop(model, systemPrompt, messages, tools, maxTurns, temperature, mcpServers);
+  if (checkpoint && checkpoint.messages && checkpoint.messages.length > 0) {
+    const resumeTurn = checkpoint.turn || 0;
+    await log("Resuming from checkpoint at turn " + resumeTurn + " (" + (checkpoint.tools_used || []).join(", ") + ")", "checkpoint_resume");
+    messages.length = 0;
+    for (const m of checkpoint.messages) messages.push(m);
+    startTurn = resumeTurn;
+    existingToolCalls = (checkpoint.tools_used || []).map(t => ({ tool: t, input: {}, output: "(from checkpoint)", source: "checkpoint" }));
+  }
+
+  await log("Starting agentic loop — " + tools.length + " tools, " + mcpServers.length + " MCP servers, max " + maxTurns + " turns" + (startTurn > 0 ? " (resuming from turn " + startTurn + ")" : ""), "loop_start");
+
+  // 10. Run the loop
+  const result = await runLoop(model, systemPrompt, messages, tools, maxTurns, temperature, mcpServers, startTurn, existingToolCalls);
 
   await log("Loop finished: " + result.status + " in " + result.turns + " turn(s), " + result.toolCalls.length + " tool call(s)");
 

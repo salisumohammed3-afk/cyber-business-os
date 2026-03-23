@@ -75,7 +75,7 @@ async function startSandbox(
 
     const sandbox = await Sandbox.create({
       runtime: "node22",
-      timeout: 600_000,
+      timeout: 3_600_000,
     });
 
     await termLog(supabase, `Sandbox ${sandbox.sandboxId} created. Writing runner script...`, { taskId, logType: "sandbox_ready" });
@@ -95,6 +95,7 @@ async function startSandbox(
       PROJECTS_SUPABASE_URL: process.env.PROJECTS_SUPABASE_URL || "",
       PROJECTS_SUPABASE_KEY: process.env.PROJECTS_SUPABASE_SERVICE_KEY || "",
       SELF_URL: selfUrl,
+      VERCEL_TOKEN: process.env.VERCEL_TOKEN || "",
     };
 
     await sandbox.runCommand({
@@ -148,13 +149,37 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   const supabase = createClient(supabaseUrl, supabaseKey);
 
-  // Recover stuck tasks older than 12 minutes
-  const stuckCutoff = new Date(Date.now() - 12 * 60 * 1000).toISOString();
-  await supabase
+  // Recover stuck tasks older than 65 minutes
+  const stuckCutoff = new Date(Date.now() - 65 * 60 * 1000).toISOString();
+  const { data: stuckTasks } = await supabase
     .from("tasks")
-    .update({ status: "failed", error_message: "Timed out", completed_at: new Date().toISOString() })
+    .select("id, metadata")
     .eq("status", "running")
     .lt("started_at", stuckCutoff);
+
+  if (stuckTasks && stuckTasks.length > 0) {
+    for (const stuck of stuckTasks) {
+      const meta = (stuck.metadata as Record<string, unknown>) || {};
+      const retries = (meta.retry_count as number) || 0;
+      const hasCheckpoint = !!meta.checkpoint;
+
+      if (hasCheckpoint && retries < 2) {
+        await supabase.from("tasks").update({
+          status: "pending",
+          started_at: null,
+          error_message: null,
+          metadata: { ...meta, retry_count: retries + 1 },
+        }).eq("id", stuck.id);
+        await termLog(supabase, `Auto-retrying stuck task ${stuck.id.slice(0, 8)} (retry ${retries + 1}/2, has checkpoint)`, { taskId: stuck.id, logType: "auto_retry" });
+      } else {
+        await supabase.from("tasks").update({
+          status: "failed",
+          error_message: "Timed out" + (retries > 0 ? ` after ${retries} retries` : ""),
+          completed_at: new Date().toISOString(),
+        }).eq("id", stuck.id);
+      }
+    }
+  }
 
   const { data: task, error: taskErr } = await supabase
     .from("tasks")
@@ -180,7 +205,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     .from("tasks")
     .update({ status: "running", started_at: new Date().toISOString() })
     .eq("id", task_id)
-    .in("status", ["pending"])
+    .in("status", ["pending", "failed"])
     .select("id");
 
   if (!updated?.length) {

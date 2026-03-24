@@ -1373,11 +1373,19 @@ async function main() {
   }
 
   // 6. Select tools for this agent
-  const tools = [...BASE_TOOLS];
-  if (agentSlug === "engineering") tools.push(...ENGINEERING_TOOLS);
-  if (agentSlug === "designer") tools.push(...DESIGNER_TOOLS);
-  if (composioApps.length > 0) tools.push(...COMPOSIO_TOOLS);
-  if (mcpToolsets.length > 0) tools.push(...mcpToolsets);
+  let tools;
+  if (agentSlug === "orchestrator") {
+    // Orchestrator gets ONLY coordination tools — no web_search, no composio.
+    // This forces it to delegate instead of doing research/work itself.
+    const ORCHESTRATOR_ONLY = ["delegate_task", "create_task", "store_memory", "recall_memories", "database_query", "fail_task"];
+    tools = BASE_TOOLS.filter(t => ORCHESTRATOR_ONLY.includes(t.name));
+  } else {
+    tools = [...BASE_TOOLS];
+    if (agentSlug === "engineering") tools.push(...ENGINEERING_TOOLS);
+    if (agentSlug === "designer") tools.push(...DESIGNER_TOOLS);
+    if (composioApps.length > 0) tools.push(...COMPOSIO_TOOLS);
+    if (mcpToolsets.length > 0) tools.push(...mcpToolsets);
+  }
 
   // 7. Build conversation
   let rawInput = task.input_data;

@@ -156,6 +156,24 @@ export function useLiveChat(companyId: string | null) {
         throw new Error(agentError?.message ?? 'Orchestrator agent not found for this company')
       }
 
+      // Check if there's already a running/pending task for this conversation
+      // to avoid spawning competing orchestrator sandboxes
+      const { data: existingTask } = await supabase
+        .from('tasks')
+        .select('id, status')
+        .eq('conversation_id', convId)
+        .in('status', ['pending', 'running'])
+        .eq('title', 'Respond to user message')
+        .limit(1)
+        .maybeSingle()
+
+      if (existingTask) {
+        // A task is already processing this conversation — the new message
+        // is already in chat_messages so the running agent will see it
+        // in its conversation history. No new task needed.
+        return
+      }
+
       const { data: newTask, error: taskError } = await supabase.from('tasks').insert({
         conversation_id: convId,
         agent_definition_id: orchestrator.id,

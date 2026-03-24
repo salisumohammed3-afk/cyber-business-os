@@ -17,7 +17,7 @@ export type TaskStatus =
 
 export type GoalStatus = 'active' | 'achieved' | 'paused' | 'abandoned'
 
-export type BusinessStage = 'idea' | 'building' | 'pre-revenue' | 'early-revenue' | 'scaling' | 'established'
+export type BusinessStage = 'idea' | 'building' | 'pre-revenue' | 'scaling' | 'established'
 
 export interface CompanyBrief {
   what_we_do?: string

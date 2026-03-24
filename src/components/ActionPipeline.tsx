@@ -1,5 +1,5 @@
 import { useState, useMemo } from "react";
-import { useTasks, type Task } from "@/hooks/useSupabaseData";
+import { useTasks, useTaskActions, type Task } from "@/hooks/useSupabaseData";
 import {
   CheckCircle2,
   Loader2,
@@ -11,6 +11,7 @@ import {
   Lightbulb,
   Wrench,
   Zap,
+  Trash2,
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import TaskBlueprintModal from "./TaskBlueprintModal";
@@ -77,6 +78,7 @@ function relativeTime(dateStr?: string | null): string {
 
 const ActionPipeline = () => {
   const { data: tasks = [], isLoading } = useTasks();
+  const { deleteTask } = useTaskActions();
   const [activeTab, setActiveTab] = useState<TabKey>("proposed");
   const [selectedTask, setSelectedTask] = useState<Task | null>(null);
 
@@ -147,7 +149,7 @@ const ActionPipeline = () => {
                 <div
                   key={task.id}
                   onClick={() => setSelectedTask(task)}
-                  className={`rounded-md p-3 transition-colors cursor-pointer group ${
+                  className={`relative rounded-md p-3 transition-colors cursor-pointer group ${
                     task.status === "proposed"
                       ? "border border-dashed border-violet-500/40 hover:border-violet-500/70 bg-violet-500/[0.03]"
                       : "border border-border hover:border-foreground/20"
@@ -218,6 +220,15 @@ const ActionPipeline = () => {
                       />
                     </div>
                   </div>
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      deleteTask(task.id);
+                    }}
+                    className="absolute bottom-2 right-2 p-1 rounded-md text-muted-foreground/50 hover:text-red-500 hover:bg-red-500/10 opacity-0 group-hover:opacity-100 transition-all"
+                  >
+                    <Trash2 size={12} />
+                  </button>
                 </div>
               );
             })

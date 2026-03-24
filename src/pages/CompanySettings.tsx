@@ -9,7 +9,7 @@ import { supabase } from "@/integrations/supabase/client";
 import { useCompany } from "@/contexts/CompanyContext";
 import type { CompanyBrief, GoalStatus } from "@/integrations/supabase/types";
 
-const STAGES = ["idea", "building", "pre-revenue", "early-revenue", "scaling", "established"] as const;
+const STAGES = ["idea", "building", "pre-revenue", "scaling", "established"] as const;
 
 // ── Brief Tab ──────────────────────────────────────────────────────────────
 

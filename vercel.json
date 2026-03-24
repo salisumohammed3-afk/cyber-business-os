@@ -3,10 +3,6 @@
   "outputDirectory": "dist",
   "framework": "vite",
   "functions": {
-    "api/run-agent.ts": {
-      "maxDuration": 120,
-      "includeFiles": "api/agent-scripts/**"
-    },
     "api/daily-digest.ts": {
       "maxDuration": 120
     }

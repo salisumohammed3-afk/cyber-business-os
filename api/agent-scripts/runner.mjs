@@ -1,4 +1,4 @@
-// runner.mjs — Executes agent tasks inside a Vercel Sandbox
+// runner.mjs — Executes agent tasks (Railway worker or Vercel Sandbox)
 // Zero external dependencies: uses only Node.js builtins + fetch
 import { execSync } from "node:child_process";
 import {
@@ -20,6 +20,7 @@ const PROJECTS_DB_URL  = process.env.PROJECTS_SUPABASE_URL || "";
 const PROJECTS_DB_KEY  = process.env.PROJECTS_SUPABASE_KEY || "";
 const SELF_URL         = process.env.SELF_URL || "";
 const VERCEL_TOKEN     = process.env.VERCEL_TOKEN || "";
+const TASK_WORKDIR     = process.env.TASK_WORKDIR || "";
 
 if (!TASK_ID || !SUPABASE_URL || !SUPABASE_KEY || !ANTHROPIC_KEY) {
   console.error("Missing required env vars");
@@ -856,7 +857,7 @@ function toolSandboxBash(input) {
   }
 
   try {
-    const cwd = input.cwd || process.cwd();
+    const cwd = input.cwd || TASK_WORKDIR || process.cwd();
     const stdout = execSync(cmd, {
       cwd,
       encoding: "utf-8",
@@ -898,7 +899,7 @@ function toolSandboxWriteFile(input) {
 
 function toolSandboxListFiles(input) {
   try {
-    const dir = input.path || process.cwd();
+    const dir = input.path || TASK_WORKDIR || process.cwd();
     if (!existsSync(dir)) return JSON.stringify({ error: "Directory not found: " + dir });
     const entries = readdirSync(dir).map(name => {
       try {
@@ -918,7 +919,7 @@ async function toolDeployStaticSite(input) {
   if (!project_name || !directory) return JSON.stringify({ error: "project_name and directory are required" });
 
   try {
-    const dir = join(process.cwd(), directory);
+    const dir = join(TASK_WORKDIR || process.cwd(), directory);
     if (!existsSync(dir)) return JSON.stringify({ error: "Directory not found: " + directory });
 
     function collectFiles(base, prefix = "") {
@@ -1275,7 +1276,7 @@ function formatNotification(agentSlug, taskTitle, resultText, deliverables) {
 // ── Main ────────────────────────────────────────────────────────────────────
 
 async function main() {
-  await log("Sandbox runner started for task " + TASK_ID.slice(0, 8));
+  await log("Runner started for task " + TASK_ID.slice(0, 8) + (TASK_WORKDIR ? " (workdir: " + TASK_WORKDIR + ")" : ""));
 
   // 1. Load task
   const task = await sbGet("tasks", { id: "eq." + TASK_ID }, { single: true });
@@ -1622,26 +1623,11 @@ async function main() {
 
   await log("Results written. Task " + finalStatus + ".", "task_" + (finalStatus === "completed" ? "complete" : "failed"));
 
-  // 12. Trigger child tasks
-  if (childTasks.length > 0 && SELF_URL) {
-    await log("Triggering " + childTasks.length + " child task(s)");
-    for (let i = 0; i < childTasks.length; i++) {
-      if (i > 0) await sleep(5000);
-      try {
-        const url = SELF_URL + "/api/run-agent";
-        const body = { task_id: childTasks[i].taskId, conversation_id: childTasks[i].conversationId };
-        await log("Triggering child " + childTasks[i].taskId.slice(0, 8) + " via " + url);
-        const resp = await fetch(url, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
-        });
-        const respText = await resp.text().catch(() => "");
-        await log("Child trigger response: " + resp.status + " " + respText.slice(0, 200));
-      } catch (e) {
-        await log("Child trigger failed: " + (e.message || e), "error");
-      }
-    }
+  // 12. Child tasks are already inserted as 'pending' by delegate_task.
+  // The Railway worker (or Vercel handler) picks them up automatically.
+  if (childTasks.length > 0) {
+    await log(childTasks.length + " child task(s) queued for pickup: " +
+      childTasks.map(c => c.taskId.slice(0, 8)).join(", "));
   }
 
   await log("Runner complete. Exiting.");

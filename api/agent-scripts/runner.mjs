@@ -1186,6 +1186,83 @@ async function reviewResult(agentName, instruction, resultText, resultStatus, to
   }
 }
 
+// ── Deliverable Extraction ───────────────────────────────────────────────────
+
+function extractDeliverables(toolCalls) {
+  const deliverables = [];
+  const seen = new Set();
+
+  for (const tc of toolCalls) {
+    let out;
+    try { out = typeof tc.output === "string" ? JSON.parse(tc.output) : tc.output; } catch { continue; }
+    if (!out || out.error || !out.success) continue;
+
+    if (tc.tool === "deploy_static_site" && out.url) {
+      const key = "project:" + out.url;
+      if (!seen.has(key)) { seen.add(key); deliverables.push({ type: "project", label: out.project || "Live App", url: out.url }); }
+    }
+
+    if (tc.tool === "register_project" && out.project_id) {
+      deliverables.push({ type: "registered", label: "Project registered", id: out.project_id });
+    }
+
+    if (tc.tool === "github_create_repo" && out.html_url) {
+      const key = "repo:" + out.html_url;
+      if (!seen.has(key)) { seen.add(key); deliverables.push({ type: "repo", label: out.name || "GitHub Repo", url: out.html_url }); }
+    }
+
+    if (tc.tool === "composio_execute") {
+      const action = (tc.input?.action_id || "").toUpperCase();
+      const data = out.data || out;
+
+      if (action.includes("GOOGLEDOCS") && data.document_id) {
+        const url = "https://docs.google.com/document/d/" + (data.response_data?.documentId || data.document_id);
+        const key = "doc:" + url;
+        if (!seen.has(key)) { seen.add(key); deliverables.push({ type: "doc", label: data.response_data?.title || "Google Doc", url }); }
+      }
+      if (action.includes("GOOGLESHEETS") && (data.spreadsheet_id || data.spreadsheetId)) {
+        const sid = data.spreadsheet_id || data.spreadsheetId;
+        const url = "https://docs.google.com/spreadsheets/d/" + sid;
+        const key = "sheet:" + url;
+        if (!seen.has(key)) { seen.add(key); deliverables.push({ type: "sheet", label: data.title || "Google Sheet", url }); }
+      }
+      if ((action.includes("AGENTMAIL") || action.includes("GMAIL")) && action.includes("SEND")) {
+        deliverables.push({ type: "email", label: "Email sent" + (data.to ? " to " + data.to : "") });
+      }
+    }
+  }
+
+  return deliverables;
+}
+
+function formatNotification(agentSlug, taskTitle, resultText, deliverables) {
+  const agentNames = {
+    engineering: "Engineering Agent", research: "Research Agent",
+    growth: "Growth Agent", designer: "Design Agent",
+    "executive-assistant": "Executive Assistant",
+  };
+  const agentLabel = agentNames[agentSlug] || agentSlug;
+
+  const cleanTitle = (taskTitle || "").replace(/^Delegated:\s*/i, "").slice(0, 80);
+
+  let md = "**Task Complete" + (cleanTitle ? ": " + cleanTitle : "") + "**\n\n";
+  md += "The " + agentLabel + " finished this task. Here's what was produced:\n\n";
+  md += resultText.slice(0, 4000);
+
+  if (deliverables.length > 0) {
+    md += "\n\n---\n**Deliverables:**\n";
+    for (const d of deliverables) {
+      if (d.url) {
+        md += "- [" + d.label + "](" + d.url + ")\n";
+      } else {
+        md += "- " + d.label + "\n";
+      }
+    }
+  }
+
+  return md;
+}
+
 // ── Main ────────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -1457,11 +1534,12 @@ async function main() {
   const isDelegated = task.source === "agent" && task.parent_task_id;
   let finalText = result.text;
   let finalStatus = result.status === "completed" ? "completed" : "failed";
+  let reviewSummary = null;
 
   if (isDelegated && result.status === "completed") {
     const review = await reviewResult(agentSlug, instruction, result.text, result.status, result.toolCalls);
     if (review.accepted) {
-      finalText = review.summary;
+      reviewSummary = review.summary;
       await log("Review: ACCEPTED", "review_accepted");
     } else {
       finalStatus = "failed";
@@ -1470,7 +1548,12 @@ async function main() {
     }
   }
 
-  // 11. Write results
+  // 11. Extract deliverables and write results
+  const deliverables = extractDeliverables(result.toolCalls || []);
+  if (deliverables.length > 0) {
+    await log("Deliverables: " + deliverables.map(d => d.type + (d.url ? " " + d.url : "")).join(", "), "deliverables");
+  }
+
   if (!isDelegated) {
     await sbInsert("chat_messages", {
       conversation_id: CONVERSATION_ID,
@@ -1485,12 +1568,23 @@ async function main() {
       },
     });
   } else {
+    const notificationContent = finalStatus === "completed"
+      ? formatNotification(agentSlug, task.title, result.text, deliverables)
+      : finalText;
+
     await sbInsert("chat_messages", {
       conversation_id: CONVERSATION_ID,
       role: "orchestrator",
-      content: finalText,
+      content: notificationContent,
       timestamp: new Date().toISOString(),
-      metadata: { review: true, reviewed_task_id: TASK_ID, agent_slug: agentSlug },
+      metadata: {
+        notification: finalStatus === "completed",
+        review: true,
+        review_summary: reviewSummary,
+        reviewed_task_id: TASK_ID,
+        agent_slug: agentSlug,
+        deliverables: deliverables.length > 0 ? deliverables : undefined,
+      },
     });
   }
 

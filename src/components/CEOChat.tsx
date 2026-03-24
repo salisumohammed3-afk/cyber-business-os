@@ -1,12 +1,36 @@
 import { useRef, useEffect, useState, useMemo, useCallback } from 'react'
 import ReactMarkdown from 'react-markdown'
-import { Bot, Pencil } from 'lucide-react'
+import { Bot, Pencil, Globe, GitBranch, FileText, Mail, CheckCircle2, Sheet } from 'lucide-react'
 import { useLiveChat } from '@/hooks/useLiveChat'
 import { useCompany } from '@/contexts/CompanyContext'
 import { supabase } from '@/integrations/supabase/client'
 import { Link } from 'react-router-dom'
 
 interface ProjectRef { id: string; deploy_url: string }
+
+interface Deliverable {
+  type: string
+  label: string
+  url?: string
+  id?: string
+}
+
+const AGENT_LABELS: Record<string, string> = {
+  engineering: 'Engineering Agent',
+  research: 'Research Agent',
+  growth: 'Growth Agent',
+  designer: 'Design Agent',
+  'executive-assistant': 'Executive Assistant',
+}
+
+const DELIVERABLE_ICONS: Record<string, typeof Globe> = {
+  project: Globe,
+  repo: GitBranch,
+  doc: FileText,
+  sheet: Sheet,
+  email: Mail,
+  registered: CheckCircle2,
+}
 
 export function CEOChat() {
   const { company } = useCompany()
@@ -91,25 +115,92 @@ export function CEOChat() {
           </div>
         )}
         {!loading &&
-          messages.map((msg) => (
-            <div
-              key={msg.id}
-              className={
-                msg.role === 'user'
-                  ? 'flex justify-end'
-                  : 'flex justify-start'
-              }
-            >
-              <div
-                className={
-                  msg.role === 'user'
-                    ? 'rounded-lg px-4 py-2 max-w-[80%] bg-blue-600 text-white'
-                    : 'rounded-lg px-4 py-2 max-w-[80%] bg-gray-200 text-gray-900'
-                }
-              >
-                {msg.role === 'user' ? (
-                  <p className="text-sm whitespace-pre-wrap">{msg.content ?? ''}</p>
-                ) : (
+          messages.map((msg) => {
+            const meta = (msg.metadata && typeof msg.metadata === 'object' && !Array.isArray(msg.metadata))
+              ? msg.metadata as Record<string, unknown>
+              : null
+            const isNotification = meta?.notification === true
+            const deliverables = (isNotification && Array.isArray(meta?.deliverables))
+              ? meta.deliverables as Deliverable[]
+              : []
+            const notifAgent = (meta?.agent_slug as string) || ''
+
+            if (msg.role === 'user') {
+              return (
+                <div key={msg.id} className="flex justify-end">
+                  <div className="rounded-lg px-4 py-2 max-w-[80%] bg-blue-600 text-white">
+                    <p className="text-sm whitespace-pre-wrap">{msg.content ?? ''}</p>
+                  </div>
+                </div>
+              )
+            }
+
+            if (isNotification) {
+              return (
+                <div key={msg.id} className="flex justify-start">
+                  <div className="max-w-[85%] rounded-lg border border-green-200 bg-green-50 overflow-hidden">
+                    <div className="flex items-center gap-2 px-4 py-2 bg-green-100/60 border-b border-green-200">
+                      <CheckCircle2 size={14} className="text-green-600 shrink-0" />
+                      <span className="text-xs font-semibold text-green-800">
+                        {AGENT_LABELS[notifAgent] || 'Agent'} — Task Complete
+                      </span>
+                    </div>
+
+                    <div className="px-4 py-3">
+                      <div className="prose prose-sm prose-gray max-w-none [&_p]:my-1 [&_ul]:my-1 [&_ol]:my-1 [&_li]:my-0.5 [&_h1]:text-base [&_h2]:text-sm [&_h3]:text-sm [&_code]:text-xs [&_pre]:text-xs [&_hr]:my-2">
+                        <ReactMarkdown components={{
+                          a: ({ href, children, ...props }) => {
+                            const pid = href ? findProjectForUrl(href) : null
+                            return (
+                              <>
+                                <a href={href} target="_blank" rel="noreferrer" className="text-green-700 hover:text-green-900" {...props}>{children}</a>
+                                {pid && (
+                                  <Link to={`/projects/${pid}/edit`} className="inline-flex items-center gap-0.5 ml-1 text-violet-600 hover:text-violet-500 no-underline text-[10px] font-medium align-middle">
+                                    <Pencil size={9} /> edit
+                                  </Link>
+                                )}
+                              </>
+                            )
+                          }
+                        }}>{msg.content ?? ''}</ReactMarkdown>
+                      </div>
+
+                      {deliverables.length > 0 && (
+                        <div className="mt-3 pt-2 border-t border-green-200 space-y-1.5">
+                          {deliverables.map((d, i) => {
+                            const Icon = DELIVERABLE_ICONS[d.type] || FileText
+                            return (
+                              <div key={i} className="flex items-center gap-2 text-sm">
+                                <Icon size={13} className="text-green-600 shrink-0" />
+                                {d.url ? (
+                                  <div className="flex items-center gap-1.5">
+                                    <a href={d.url} target="_blank" rel="noreferrer" className="text-green-800 hover:text-green-950 underline underline-offset-2 font-medium">{d.label}</a>
+                                    {d.type === 'project' && d.url && (() => {
+                                      const pid = findProjectForUrl(d.url)
+                                      return pid ? (
+                                        <Link to={`/projects/${pid}/edit`} className="inline-flex items-center gap-0.5 text-violet-600 hover:text-violet-500 text-[10px] font-medium">
+                                          <Pencil size={9} /> edit
+                                        </Link>
+                                      ) : null
+                                    })()}
+                                  </div>
+                                ) : (
+                                  <span className="text-green-700">{d.label}</span>
+                                )}
+                              </div>
+                            )
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              )
+            }
+
+            return (
+              <div key={msg.id} className="flex justify-start">
+                <div className="rounded-lg px-4 py-2 max-w-[80%] bg-gray-200 text-gray-900">
                   <div className="prose prose-sm prose-gray max-w-none [&_p]:my-1 [&_ul]:my-1 [&_ol]:my-1 [&_li]:my-0.5 [&_h1]:text-base [&_h2]:text-sm [&_h3]:text-sm [&_code]:text-xs [&_pre]:text-xs">
                     <ReactMarkdown components={{
                       a: ({ href, children, ...props }) => {
@@ -127,10 +218,10 @@ export function CEOChat() {
                       }
                     }}>{msg.content ?? ''}</ReactMarkdown>
                   </div>
-                )}
+                </div>
               </div>
-            </div>
-          ))}
+            )
+          })}
         {isWaitingForResponse && (
           <div className="flex justify-start items-center gap-2">
             <Bot size={14} className="text-gray-400 animate-pulse" />

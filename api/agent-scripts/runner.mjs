@@ -1196,15 +1196,22 @@ async function main() {
   if (!task) throw new Error("Task not found: " + TASK_ID);
   companyId = task.company_id;
 
-  // 2. Load agent definition
-  let systemPrompt = "You are the Orchestrator of a Cyber Business OS — the CEO's AI right hand. Be direct and concise. Lead with action.";
+  // 2. Load agent definition (default to orchestrator if none assigned)
+  let systemPrompt = "";
   let model = "claude-sonnet-4-20250514";
   let temperature = 0.7;
   let maxTurns = 15;
   let agentDefId = null;
 
-  if (task.agent_definition_id) {
-    const def = await sbGet("agent_definitions", { id: "eq." + task.agent_definition_id }, { single: true });
+  let defId = task.agent_definition_id;
+  if (!defId) {
+    const orch = await sbGet("agent_definitions", { slug: "eq.orchestrator" }, { select: "id", single: true });
+    if (orch) defId = orch.id;
+    await log("No agent assigned — defaulting to orchestrator", "agent_fallback");
+  }
+
+  if (defId) {
+    const def = await sbGet("agent_definitions", { id: "eq." + defId }, { single: true });
     if (def) {
       systemPrompt = def.system_prompt || systemPrompt;
       model = def.model || model;
@@ -1214,6 +1221,10 @@ async function main() {
       agentSlug = def.slug || "unknown";
       await log("Agent: " + def.name + " (" + agentSlug + ") — model: " + model, "agent_loaded");
     }
+  }
+
+  if (!systemPrompt) {
+    systemPrompt = "You are the Orchestrator of a Cyber Business OS — the CEO's AI right hand. Be direct and concise. Delegate to sub-agents for any substantial work.";
   }
 
   // 3. Resolve company and inject context

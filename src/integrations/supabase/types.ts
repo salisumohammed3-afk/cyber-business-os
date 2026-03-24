@@ -352,6 +352,7 @@ export interface Database {
           is_recurring: boolean
           recurrence_schedule: string | null
           source: string | null
+          metadata: Json | null
         }
         Insert: {
           id?: string
@@ -374,6 +375,7 @@ export interface Database {
           is_recurring?: boolean
           recurrence_schedule?: string | null
           source?: string | null
+          metadata?: Json | null
         }
         Update: {
           id?: string
@@ -396,6 +398,7 @@ export interface Database {
           is_recurring?: boolean
           recurrence_schedule?: string | null
           source?: string | null
+          metadata?: Json | null
         }
       }
       task_results: {

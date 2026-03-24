@@ -11,6 +11,7 @@ Each task you propose should be:
 - Assigned to the most appropriate specialist agent
 - Prioritized by business impact
 - Aligned with the company's active goals
+- **NOT a duplicate of any task already in the "Existing Proposed Tasks" list** — if a similar task is already proposed, skip it entirely. Only propose genuinely new ideas.
 
 Available agents and their strengths:
 - orchestrator: Overall coordination, strategy, user communication
@@ -97,6 +98,21 @@ async function getBusinessContext(supabase: SupabaseClient, companyId: string, c
     sections.push(
       "## Available Agents\n" +
         agents.map((a: Record<string, string | null>) => `- **${a.name}** (${a.slug}): ${a.description || "No description"}`).join("\n")
+    );
+  }
+
+  const { data: proposedTasks } = await supabase
+    .from("tasks")
+    .select("title")
+    .eq("company_id", companyId)
+    .eq("status", "proposed")
+    .order("created_at", { ascending: false })
+    .limit(50);
+
+  if (proposedTasks?.length) {
+    sections.push(
+      "## Existing Proposed Tasks (DO NOT duplicate these)\n" +
+        proposedTasks.map((t: { title: string }) => `- ${t.title}`).join("\n")
     );
   }
 
@@ -197,10 +213,52 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const slugToId: Record<string, string> = {};
       for (const a of (agentDefs || []) as Array<{ id: string; slug: string }>) slugToId[a.slug] = a.id;
 
+      // Load existing proposed/pending titles for dedup
+      const { data: existingTasks } = await supabase
+        .from("tasks")
+        .select("title")
+        .eq("company_id", comp.id)
+        .in("status", ["proposed", "pending", "running"])
+        .limit(100);
+
+      const normalize = (s: string) =>
+        s.toLowerCase().replace(/[^a-z0-9]/g, " ").replace(/\s+/g, " ").trim();
+
+      const existingNorms = new Set(
+        (existingTasks || []).map((t: { title: string }) => normalize(t.title))
+      );
+
+      // Build trigrams for fuzzy matching
+      const trigrams = (s: string) => {
+        const t = new Set<string>();
+        for (let i = 0; i <= s.length - 3; i++) t.add(s.slice(i, i + 3));
+        return t;
+      };
+      const similarity = (a: string, b: string) => {
+        const ta = trigrams(a), tb = trigrams(b);
+        let shared = 0;
+        for (const g of ta) if (tb.has(g)) shared++;
+        return shared / Math.max(ta.size, tb.size, 1);
+      };
+      const isDuplicate = (title: string) => {
+        const norm = normalize(title);
+        if (existingNorms.has(norm)) return true;
+        for (const existing of existingNorms) {
+          if (similarity(norm, existing) > 0.6) return true;
+        }
+        return false;
+      };
+
       let proposed = 0;
+      let skipped = 0;
       for (const t of tasks) {
         const agentId = slugToId[t.agent_slug];
         if (!agentId) continue;
+
+        if (isDuplicate(t.title)) {
+          skipped++;
+          continue;
+        }
 
         const { error } = await supabase.from("tasks").insert({
           title: t.title,
@@ -213,7 +271,19 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           tags: JSON.stringify(t.tags || []),
         });
 
-        if (!error) proposed++;
+        if (!error) {
+          proposed++;
+          existingNorms.add(normalize(t.title));
+        }
+      }
+
+      if (skipped > 0) {
+        await supabase.from("terminal_logs").insert({
+          message: `Proactive planner skipped ${skipped} duplicate task(s) for ${comp.name}`,
+          source: "proactive-planner",
+          log_type: "planner_dedup",
+          company_id: comp.id,
+        });
       }
 
       await supabase.from("terminal_logs").insert({

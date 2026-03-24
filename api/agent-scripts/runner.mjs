@@ -1102,8 +1102,17 @@ async function verifyEngineering(toolCalls) {
     checks.push({ pass: true, msg: "Project registered: " + p.name });
     if (p.deploy_url) {
       try {
-        const r = await fetch(p.deploy_url, { method: "HEAD", redirect: "follow", signal: AbortSignal.timeout(10000) });
-        checks.push({ pass: r.ok, msg: "Deploy URL " + p.deploy_url + " → " + r.status });
+        let url = p.deploy_url;
+        let r = await fetch(url, { method: "HEAD", redirect: "follow", signal: AbortSignal.timeout(10000) });
+        // Vercel team auth returns 401 on preview URLs; try the production URL
+        if (r.status === 401 && url.includes("-team-")) {
+          const prodUrl = url.replace(/-[a-z0-9]+-team-[^.]+\.vercel\.app/, ".vercel.app");
+          if (prodUrl !== url) {
+            const r2 = await fetch(prodUrl, { method: "HEAD", redirect: "follow", signal: AbortSignal.timeout(10000) });
+            if (r2.ok) { r = r2; url = prodUrl; }
+          }
+        }
+        checks.push({ pass: r.ok, msg: "Deploy URL " + url + " → " + r.status });
       } catch (e) {
         checks.push({ pass: false, msg: "Deploy URL unreachable: " + (e.message || "").slice(0, 80) });
       }

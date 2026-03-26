@@ -146,18 +146,47 @@ export function useLiveChat(companyId: string | null) {
       })
       if (msgError) throw new Error(msgError.message)
 
-      const { data: orchestrator, error: agentError } = await supabase
+      // Fast path: call quick-reply (Haiku) for instant answers.
+      // If delegation is needed, the endpoint creates the task for us.
+      try {
+        const qr = await fetch('/api/quick-reply', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            conversation_id: convId,
+            company_id: companyId,
+            message: text,
+          }),
+        })
+
+        if (qr.ok) {
+          const result = await qr.json()
+          if (result.mode === 'direct') {
+            // Reply already written to chat_messages — realtime will deliver it
+            return
+          }
+          // mode === 'delegated': ack message + task already created by the endpoint
+          // Keep waitingForReply true so the UI shows the spinner until the
+          // delegated task's completion notification arrives
+          return
+        }
+      } catch (qrError) {
+        console.error('Quick-reply failed, falling back to full pipeline:', qrError)
+      }
+
+      // Fallback: full task pipeline (only reached if quick-reply fails)
+      const { data: orchestrator } = await supabase
         .from('agent_definitions')
         .select('id')
         .eq('slug', 'orchestrator')
         .eq('company_id', companyId)
         .single()
-      if (agentError || !orchestrator?.id) {
-        throw new Error(agentError?.message ?? 'Orchestrator agent not found for this company')
+
+      if (!orchestrator?.id) {
+        console.error('Orchestrator agent not found — cannot send message')
+        return
       }
 
-      // Check if there's already a running/pending task for this conversation
-      // to avoid spawning competing orchestrator sandboxes
       const { data: existingTask } = await supabase
         .from('tasks')
         .select('id, status')
@@ -167,12 +196,7 @@ export function useLiveChat(companyId: string | null) {
         .limit(1)
         .maybeSingle()
 
-      if (existingTask) {
-        // A task is already processing this conversation — the new message
-        // is already in chat_messages so the running agent will see it
-        // in its conversation history. No new task needed.
-        return
-      }
+      if (existingTask) return
 
       const { data: newTask, error: taskError } = await supabase.from('tasks').insert({
         conversation_id: convId,

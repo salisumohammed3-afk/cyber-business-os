@@ -153,7 +153,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         "content-type": "application/json",
       },
       body: JSON.stringify({
-        model: "claude-haiku-4-5-20251001",
+        model: "claude-opus-4-6",
         max_tokens: 1024,
         temperature: 0.5,
         system: systemPrompt,

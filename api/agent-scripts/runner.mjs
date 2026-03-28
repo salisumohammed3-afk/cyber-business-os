@@ -519,11 +519,43 @@ async function toolCreateTask(input) {
 }
 
 async function toolStoreMemory(input) {
+  // Dedup: check if a very similar memory already exists
+  const snippet = input.content.slice(0, 60).replace(/%/g, "").replace(/'/g, "");
+  if (snippet.length > 10) {
+    const dupeParams = new URLSearchParams({
+      select: "id,content", limit: "5",
+      content: "ilike.*" + snippet + "*",
+    });
+    if (companyId) dupeParams.set("company_id", "eq." + companyId);
+    const dupeR = await fetch(SUPABASE_URL + "/rest/v1/memories?" + dupeParams, { headers: SB_HEADERS }).catch(() => null);
+    if (dupeR?.ok) {
+      const dupes = await dupeR.json();
+      const normNew = input.content.toLowerCase().replace(/[^a-z0-9]/g, " ").replace(/\s+/g, " ").trim();
+      for (const d of dupes) {
+        const normOld = (d.content || "").toLowerCase().replace(/[^a-z0-9]/g, " ").replace(/\s+/g, " ").trim();
+        const shorter = Math.min(normNew.length, normOld.length);
+        const longer = Math.max(normNew.length, normOld.length);
+        if (shorter > 0 && longer > 0) {
+          let match = 0;
+          const words1 = new Set(normNew.split(" "));
+          const words2 = new Set(normOld.split(" "));
+          for (const w of words1) if (words2.has(w)) match++;
+          const overlap = match / Math.max(words1.size, words2.size);
+          if (overlap > 0.8) {
+            return JSON.stringify({ skipped: true, reason: "duplicate", existing_id: d.id });
+          }
+        }
+      }
+    }
+  }
+
   const result = await sbInsert("memories", {
     content: input.content, category: input.category,
     importance: input.importance || 5,
     user_id: "00000000-0000-0000-0000-000000000000",
-    company_id: companyId, metadata: { source: "agent" },
+    company_id: companyId,
+    agent_definition_id: agentDefId,
+    metadata: { source: "agent", agent_slug: agentSlug },
   });
   if (!result) return JSON.stringify({ error: "Failed to store memory" });
   return JSON.stringify({ success: true, stored: input.content });
@@ -531,17 +563,30 @@ async function toolStoreMemory(input) {
 
 async function toolRecallMemories(input) {
   const params = new URLSearchParams({
-    select: "content,category,importance,created_at",
+    select: "content,category,importance,created_at,metadata",
     order: "importance.desc", limit: String(input.limit || 10),
   });
   if (companyId) params.set("company_id", "eq." + companyId);
   if (input.category) params.set("category", "eq." + input.category);
-  params.set("content", "ilike.*" + input.query + "*");
+  // Full-text search with stemming; falls back to ilike if query is very short
+  const q = (input.query || "").trim();
+  if (q.length > 2) {
+    params.set("fts", "websearch." + q);
+  } else {
+    params.set("content", "ilike.*" + q + "*");
+  }
+  // Exclude expired memories
+  params.set("or", "(expires_at.is.null,expires_at.gt." + new Date().toISOString() + ")");
 
   const r = await fetch(SUPABASE_URL + "/rest/v1/memories?" + params, { headers: SB_HEADERS });
   if (!r.ok) return JSON.stringify({ error: await r.text() });
   const data = await r.json();
-  return JSON.stringify({ memories: data, count: data.length });
+  const results = data.map(m => ({
+    content: m.content, category: m.category,
+    importance: m.importance, created_at: m.created_at,
+    source_agent: m.metadata?.agent_slug || "unknown",
+  }));
+  return JSON.stringify({ memories: results, count: results.length });
 }
 
 async function toolDelegateTask(input) {
@@ -1501,19 +1546,24 @@ async function main() {
     messages.push({ role: "user", content: "Execute: " + (task.title || "No details provided.") });
   }
 
-  // 8. Inject relevant memories
-  const keywords = instruction.split(/\s+/).filter(w => w.length > 3).slice(0, 5);
+  // 8. Inject relevant memories (full-text search, all keywords, expiry-aware)
+  const keywords = instruction.split(/\s+/).filter(w => w.length > 3).slice(0, 8);
   if (keywords.length > 0) {
+    const ftsQuery = keywords.join(" or ");
     const memParams = new URLSearchParams({
-      select: "content,category", order: "importance.desc", limit: "8",
+      select: "content,category,metadata", order: "importance.desc", limit: "8",
+      fts: "websearch." + ftsQuery,
+      or: "(expires_at.is.null,expires_at.gt." + new Date().toISOString() + ")",
     });
     if (companyId) memParams.set("company_id", "eq." + companyId);
-    memParams.set("content", "ilike.*" + keywords[0] + "*");
     const memR = await fetch(SUPABASE_URL + "/rest/v1/memories?" + memParams, { headers: SB_HEADERS }).catch(() => null);
     if (memR?.ok) {
       const mems = await memR.json();
       if (mems.length > 0) {
-        systemPrompt += "\n\n## Relevant Memories\n" + mems.map(m => "- [" + m.category + "] " + m.content).join("\n");
+        systemPrompt += "\n\n## Relevant Memories\n" + mems.map(m => {
+          const src = m.metadata?.agent_slug ? " (via " + m.metadata.agent_slug + ")" : "";
+          return "- [" + m.category + "] " + m.content + src;
+        }).join("\n");
       }
     }
   }

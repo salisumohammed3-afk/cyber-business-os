@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useMemo } from "react";
 import { X, Minimize2, Maximize2 } from "lucide-react";
 import { supabase } from "@/integrations/supabase/client";
 import { useCompany } from "@/contexts/CompanyContext";
@@ -8,8 +8,10 @@ interface LogEntry {
   message: string;
   source: string | null;
   agent_slug: string | null;
+  task_id: string | null;
   log_type: string | null;
   created_at: string;
+  metadata?: unknown;
 }
 
 const logTypeColor: Record<string, string> = {
@@ -21,6 +23,9 @@ const logTypeColor: Record<string, string> = {
   task_complete: "text-green-400",
   memory_recall: "text-yellow-400",
   error: "text-red-400",
+  provider_error: "text-orange-400",
+  worker_exit_reconcile: "text-amber-400",
+  digest_skipped_idempotent: "text-slate-400",
 };
 
 const LiveTerminal = () => {
@@ -29,8 +34,20 @@ const LiveTerminal = () => {
   const [lines, setLines] = useState<LogEntry[]>([]);
   const [isExpanded, setIsExpanded] = useState(true);
   const [activeAgent, setActiveAgent] = useState<string | null>(null);
+  const [taskFilter, setTaskFilter] = useState("");
+  const [typeFilter, setTypeFilter] = useState("");
   const scrollRef = useRef<HTMLDivElement>(null);
   const lastSeenTimestampRef = useRef<string>("2000-01-01T00:00:00Z");
+
+  const filteredLines = useMemo(() => {
+    const tf = taskFilter.trim().toLowerCase();
+    const yf = typeFilter.trim().toLowerCase();
+    return lines.filter((line) => {
+      if (tf && !(line.task_id || "").toLowerCase().includes(tf)) return false;
+      if (yf && !(line.log_type || "").toLowerCase().includes(yf)) return false;
+      return true;
+    });
+  }, [lines, taskFilter, typeFilter]);
 
   useEffect(() => {
     if (!companyId) return;
@@ -48,10 +65,10 @@ const LiveTerminal = () => {
           .limit(30);
         if (!data || data.length === 0) return;
 
-        const sorted = [...data].reverse();
-        setLines(sorted as LogEntry[]);
-        lastSeenTimestampRef.current = sorted[sorted.length - 1].created_at;
-        if (data[0]?.agent_slug) setActiveAgent(data[0].agent_slug);
+        const sorted = [...data].reverse() as LogEntry[];
+        setLines(sorted);
+        lastSeenTimestampRef.current = sorted[sorted.length - 1]!.created_at;
+        if (sorted[0]?.agent_slug) setActiveAgent(sorted[0].agent_slug);
       } else {
         const { data } = await supabase
           .from("terminal_logs")
@@ -86,7 +103,8 @@ const LiveTerminal = () => {
         "postgres_changes",
         { event: "INSERT", schema: "public", table: "terminal_logs" },
         (payload) => {
-          const row = payload.new as LogEntry;
+          const row = payload.new as LogEntry & { company_id?: string | null };
+          if (companyId && row.company_id && row.company_id !== companyId) return;
           lastSeenTimestampRef.current = row.created_at;
           if (row.agent_slug) setActiveAgent(row.agent_slug);
           setLines((prev) => {
@@ -109,7 +127,7 @@ const LiveTerminal = () => {
     if (scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
-  }, [lines]);
+  }, [lines, filteredLines]);
 
   const hasLogs = lines.length > 0;
   const latestLog = lines[lines.length - 1];
@@ -146,7 +164,9 @@ const LiveTerminal = () => {
             sal-os — {activeAgent ? `agent:${activeAgent}` : "system"} — live execution
           </span>
           {hasLogs && (
-            <span className="font-mono text-[9px] text-emerald-500 ml-2">{lines.length} events</span>
+            <span className="font-mono text-[9px] text-emerald-500 ml-2">
+              {filteredLines.length}/{lines.length} events
+            </span>
           )}
         </div>
         <div className="flex items-center gap-2">
@@ -159,6 +179,23 @@ const LiveTerminal = () => {
         </div>
       </div>
 
+      <div className="flex flex-wrap items-center gap-2 px-4 py-1 border-b border-[hsl(0,0%,12%)]">
+        <input
+          type="text"
+          value={taskFilter}
+          onChange={(e) => setTaskFilter(e.target.value)}
+          placeholder="Filter task id…"
+          className="font-mono text-[10px] h-7 px-2 rounded border border-[hsl(0,0%,20%)] bg-[hsl(0,0%,8%)] text-[hsl(var(--terminal-fg))] w-40 placeholder:text-[hsl(0,0%,35%)]"
+        />
+        <input
+          type="text"
+          value={typeFilter}
+          onChange={(e) => setTypeFilter(e.target.value)}
+          placeholder="Filter log_type…"
+          className="font-mono text-[10px] h-7 px-2 rounded border border-[hsl(0,0%,20%)] bg-[hsl(0,0%,8%)] text-[hsl(var(--terminal-fg))] w-36 placeholder:text-[hsl(0,0%,35%)]"
+        />
+      </div>
+
       {/* Log output */}
       <div ref={scrollRef} className="h-40 overflow-y-auto px-4 py-2">
         {!hasLogs && (
@@ -166,15 +203,23 @@ const LiveTerminal = () => {
             &gt; Waiting for agent activity...
           </div>
         )}
-        {lines.map((line) => {
+        {filteredLines.map((line) => {
           const color = logTypeColor[line.log_type || ""] || "text-[hsl(var(--terminal-fg))]";
+          const metaJson =
+            line.metadata && typeof line.metadata === "object" ? JSON.stringify(line.metadata) : "";
+          const metaHint =
+            metaJson.length > 0
+              ? " " + metaJson.slice(0, 120) + (metaJson.length > 120 ? "…" : "")
+              : "";
           return (
             <div key={line.id} className="font-mono text-[11px] leading-5 flex gap-2">
               <span className="text-[hsl(0,0%,35%)] shrink-0 select-none">
                 {new Date(line.created_at).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", second: "2-digit" })}
               </span>
+              <span className="text-[hsl(0,0%,45%)] shrink-0 hidden sm:inline">{line.task_id ? line.task_id.slice(0, 8) : "—"}</span>
               <span className={color}>
                 &gt; {line.message}
+                {metaHint && <span className="text-[hsl(0,0%,45%)] font-normal">{metaHint}</span>}
               </span>
             </div>
           );

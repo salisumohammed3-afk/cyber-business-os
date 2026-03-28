@@ -1,6 +1,7 @@
 // runner.mjs — Executes agent tasks (Railway worker or Vercel Sandbox)
 // Zero external dependencies: uses only Node.js builtins + fetch
 import { execSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import {
   readFileSync, writeFileSync, mkdirSync, existsSync,
   readdirSync, statSync,
@@ -26,6 +27,9 @@ if (!TASK_ID || !SUPABASE_URL || !SUPABASE_KEY || !ANTHROPIC_KEY) {
   console.error("Missing required env vars");
   process.exit(1);
 }
+
+const RUN_ID = randomUUID();
+const USE_JSON_LOG = process.env.LOG_FORMAT === "json" || process.env.NODE_ENV === "production";
 
 // ── Supabase REST helpers ───────────────────────────────────────────────────
 
@@ -113,7 +117,10 @@ async function callClaude(model, system, messages, tools, maxTokens = 4096, temp
     const is5xx = resp.status >= 500;
     if ((is429 || is5xx) && attempt < MAX_RETRIES) {
       const wait = is429 ? attempt * 15000 : attempt * 5000;
-      await log("API " + resp.status + " — retry " + (attempt + 1) + "/" + MAX_RETRIES + " in " + (wait / 1000) + "s", "error");
+      await log("API " + resp.status + " — retry " + (attempt + 1) + "/" + MAX_RETRIES + " in " + (wait / 1000) + "s", "provider_error", {
+        http_status: resp.status,
+        provider: "anthropic",
+      });
       await sleep(wait);
       continue;
     }
@@ -127,13 +134,35 @@ async function callClaude(model, system, messages, tools, maxTokens = 4096, temp
 let agentSlug = "unknown";
 let companyId = null;
 
-async function log(message, logType = "info") {
-  console.log("[" + logType + "] " + message);
+async function log(message, logType = "info", meta = {}) {
+  const base = {
+    level: logType === "error" || logType === "provider_error" ? "error" : "info",
+    msg: message,
+    log_type: logType,
+    task_id: TASK_ID,
+    conversation_id: CONVERSATION_ID,
+    company_id: companyId,
+    agent_slug: agentSlug,
+    run_id: RUN_ID,
+    ts: new Date().toISOString(),
+    ...meta,
+  };
+  if (USE_JSON_LOG) {
+    console.log(JSON.stringify(base));
+  } else {
+    console.log("[" + logType + "] " + message);
+  }
   try {
-    await sbInsert("terminal_logs", {
-      message, source: "sandbox-runner", agent_slug: agentSlug,
-      task_id: TASK_ID, log_type: logType, company_id: companyId,
-    });
+    const row = {
+      message,
+      source: "sandbox-runner",
+      agent_slug: agentSlug,
+      task_id: TASK_ID,
+      log_type: logType,
+      company_id: companyId,
+      metadata: { run_id: RUN_ID, conversation_id: CONVERSATION_ID, ...meta },
+    };
+    await sbInsert("terminal_logs", row);
   } catch {}
 }
 

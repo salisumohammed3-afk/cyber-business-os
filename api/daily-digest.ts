@@ -2,6 +2,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import { Resend } from "resend";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
 import type { VercelRequest, VercelResponse } from "@vercel/node";
+import { finishJobRun, startJobRun } from "./job-run-ledger";
 
 export const maxDuration = 120;
 
@@ -244,21 +245,48 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   const anthropic = new Anthropic({ apiKey: anthropicKey });
   const resend = new Resend(resendKey);
 
+  const todayUtc = new Date().toISOString().slice(0, 10);
+  const jobRunId = await startJobRun(supabase, "daily_digest", { date_utc: todayUtc });
+
   const { data: companies, error: compErr } = await supabase
     .from("companies")
-    .select("id, name, digest_email, digest_enabled")
+    .select("id, name, digest_email, digest_enabled, digest_last_sent_date")
     .eq("is_active", true)
     .eq("digest_enabled", true);
 
   if (compErr || !companies?.length) {
+    await finishJobRun(supabase, jobRunId, {
+      status: "success",
+      companies_processed: 0,
+      metadata: { note: "No companies with digest enabled" },
+    });
     return res.status(200).json({ sent: 0, note: "No companies with digest enabled" });
   }
 
   const results: Array<{ company: string; status: string; email?: string }> = [];
+  let failureCount = 0;
 
-  for (const comp of companies as Array<{ id: string; name: string; digest_email: string | null; digest_enabled: boolean }>) {
+  for (const comp of companies as Array<{
+    id: string;
+    name: string;
+    digest_email: string | null;
+    digest_enabled: boolean;
+    digest_last_sent_date: string | null;
+  }>) {
     if (!comp.digest_email) {
       results.push({ company: comp.name, status: "skipped_no_email" });
+      continue;
+    }
+
+    if (comp.digest_last_sent_date === todayUtc) {
+      await supabase.from("terminal_logs").insert({
+        message: `Daily digest skipped (already sent ${todayUtc}) for ${comp.name}`,
+        source: "daily-digest",
+        log_type: "digest_skipped_idempotent",
+        company_id: comp.id,
+        metadata: { date_utc: todayUtc },
+      });
+      results.push({ company: comp.name, status: "skipped_already_sent" });
       continue;
     }
 
@@ -293,15 +321,19 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       });
 
       if (sendErr) {
+        failureCount++;
         await supabase.from("terminal_logs").insert({
           message: `Daily digest FAILED for ${comp.name}: ${sendErr.message}`,
           source: "daily-digest",
           log_type: "digest_error",
           company_id: comp.id,
+          metadata: { error: sendErr.message },
         });
         results.push({ company: comp.name, status: "send_failed", email: comp.digest_email });
         continue;
       }
+
+      await supabase.from("companies").update({ digest_last_sent_date: todayUtc }).eq("id", comp.id);
 
       await supabase.from("terminal_logs").insert({
         message: `Daily digest sent to ${comp.digest_email} for ${comp.name}`,
@@ -312,17 +344,27 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
       results.push({ company: comp.name, status: "sent", email: comp.digest_email });
     } catch (e) {
+      failureCount++;
       const msg = e instanceof Error ? e.message : "Unknown error";
       await supabase.from("terminal_logs").insert({
         message: `Daily digest error for ${comp.name}: ${msg}`,
         source: "daily-digest",
         log_type: "digest_error",
         company_id: comp.id,
+        metadata: { error: msg },
       });
       results.push({ company: comp.name, status: "error" });
     }
   }
 
   const sent = results.filter(r => r.status === "sent").length;
+  const jobStatus = failureCount > 0 && sent === 0 ? "failed" : failureCount > 0 ? "partial" : "success";
+  await finishJobRun(supabase, jobRunId, {
+    status: jobStatus,
+    companies_processed: companies.length,
+    error_summary: failureCount > 0 ? `${failureCount} company error(s)` : null,
+    metadata: { sent, total: companies.length, date_utc: todayUtc, results },
+  });
+
   return res.status(200).json({ sent, total: companies.length, results });
 }

@@ -1,6 +1,7 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
 import type { VercelRequest, VercelResponse } from "@vercel/node";
+import { finishJobRun, startJobRun } from "./job-run-ledger";
 
 export const maxDuration = 120;
 
@@ -143,6 +144,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   const supabase = createClient(supabaseUrl, supabaseKey);
   const anthropic = new Anthropic({ apiKey: anthropicKey });
+  const jobRunId = await startJobRun(supabase, "proactive_planner", {});
 
   // Load all active companies
   const { data: companies, error: compErr } = await supabase
@@ -151,10 +153,16 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     .eq("is_active", true);
 
   if (compErr || !companies?.length) {
+    await finishJobRun(supabase, jobRunId, {
+      status: "success",
+      companies_processed: 0,
+      metadata: { note: "No active companies" },
+    });
     return res.status(200).json({ proposed: 0, note: "No active companies" });
   }
 
   const results: Array<{ company: string; proposed: number; tasks: string[] }> = [];
+  let companyFailures = 0;
 
   for (const comp of companies) {
     try {
@@ -295,17 +303,28 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
       results.push({ company: comp.name, proposed, tasks: tasks.map((t) => t.title) });
     } catch (e) {
+      companyFailures++;
       const msg = e instanceof Error ? e.message : "Unknown error";
       await supabase.from("terminal_logs").insert({
         message: `Proactive planner error for ${comp.name}: ${msg}`,
         source: "proactive-planner",
         log_type: "planner_error",
         company_id: comp.id,
+        metadata: { error: msg },
       });
       results.push({ company: comp.name, proposed: 0, tasks: [] });
     }
   }
 
   const totalProposed = results.reduce((sum, r) => sum + r.proposed, 0);
+  const jobStatus =
+    companyFailures > 0 && totalProposed === 0 ? "failed" : companyFailures > 0 ? "partial" : "success";
+  await finishJobRun(supabase, jobRunId, {
+    status: jobStatus,
+    companies_processed: companies.length,
+    error_summary: companyFailures > 0 ? `${companyFailures} company error(s)` : null,
+    metadata: { total_proposed: totalProposed, results },
+  });
+
   return res.status(200).json({ total_proposed: totalProposed, results });
 }

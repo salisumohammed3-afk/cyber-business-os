@@ -12,6 +12,7 @@ export interface Company {
   is_active: boolean
   digest_email: string | null
   digest_enabled: boolean
+  digest_last_sent_date: string | null
   created_at: string
 }
 

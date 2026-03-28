@@ -1,6 +1,7 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
 import type { VercelRequest, VercelResponse } from "@vercel/node";
+import { finishJobRun, startJobRun } from "./job-run-ledger";
 
 export const maxDuration = 120;
 
@@ -121,6 +122,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   const supabase = createClient(supabaseUrl, supabaseKey);
   const anthropic = new Anthropic({ apiKey: anthropicKey });
+  const jobRunId = await startJobRun(supabase, "skill_recommender", {});
 
   const { data: companies } = await supabase
     .from("companies")
@@ -128,10 +130,17 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     .eq("is_active", true);
 
   if (!companies?.length) {
+    await finishJobRun(supabase, jobRunId, {
+      status: "success",
+      companies_processed: 0,
+      metadata: { note: "No active companies" },
+    });
     return res.status(200).json({ recommendations: 0, note: "No active companies" });
   }
 
   let totalRecs = 0;
+  let agentErrors = 0;
+  let companyErrors = 0;
 
   for (const comp of companies) {
     try {
@@ -173,7 +182,16 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           try {
             const jsonMatch = rawText.match(/\[[\s\S]*\]/);
             recs = jsonMatch ? JSON.parse(jsonMatch[0]) : [];
-          } catch {
+          } catch (parseErr) {
+            agentErrors++;
+            const pmsg = parseErr instanceof Error ? parseErr.message : "parse error";
+            await supabase.from("terminal_logs").insert({
+              message: `Skill recommender: unparseable JSON for ${agent.name} (${comp.name}): ${pmsg}`,
+              source: "skill-recommender",
+              log_type: "recommender_error",
+              company_id: comp.id,
+              metadata: { agent_slug: agent.slug, error: pmsg },
+            });
             continue;
           }
 
@@ -205,14 +223,40 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             log_type: "recommender",
             company_id: comp.id,
           });
-        } catch {
-          // Individual agent failure doesn't stop the loop
+        } catch (agentErr) {
+          agentErrors++;
+          const msg = agentErr instanceof Error ? agentErr.message : "Unknown error";
+          await supabase.from("terminal_logs").insert({
+            message: `Skill recommender error for ${agent.name} (${comp.name}): ${msg}`,
+            source: "skill-recommender",
+            log_type: "recommender_error",
+            company_id: comp.id,
+            metadata: { agent_slug: agent.slug, error: msg },
+          });
         }
       }
-    } catch {
-      // Company-level failure doesn't stop the loop
+    } catch (compErr) {
+      companyErrors++;
+      const msg = compErr instanceof Error ? compErr.message : "Unknown error";
+      await supabase.from("terminal_logs").insert({
+        message: `Skill recommender company-level error for ${comp.name}: ${msg}`,
+        source: "skill-recommender",
+        log_type: "recommender_error",
+        company_id: comp.id,
+        metadata: { error: msg },
+      });
     }
   }
+
+  const failures = agentErrors + companyErrors;
+  const jobStatus =
+    failures > 0 && totalRecs === 0 ? "failed" : failures > 0 ? "partial" : "success";
+  await finishJobRun(supabase, jobRunId, {
+    status: jobStatus,
+    companies_processed: companies.length,
+    error_summary: failures > 0 ? `${agentErrors} agent + ${companyErrors} company error(s)` : null,
+    metadata: { total_recommendations: totalRecs, agentErrors, companyErrors },
+  });
 
   return res.status(200).json({ total_recommendations: totalRecs });
 }

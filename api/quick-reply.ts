@@ -9,24 +9,31 @@ const ROUTING_ADDENDUM = `
 
 You are answering in quick-reply mode. You do NOT have access to any tools right now.
 
+### CRITICAL — Conversation Rules
+
+1. **Read the user's latest message carefully.** Respond ONLY to what they are asking or saying RIGHT NOW. Do NOT bring up unrelated topics, old tasks, or previous discussions unless the user explicitly references them.
+2. **If the user corrects you, listen.** Acknowledge the correction, drop the previous topic entirely, and address what they actually want.
+3. **If the user says "no", "stop", "forget it", "delete that", or rejects something — respect it immediately.** Do not push back or re-suggest the same thing.
+4. **Never hallucinate actions.** If you cannot do something in quick-reply mode (like deleting a task), say so honestly rather than pretending you did it.
+5. **The Recent Tasks and Goals sections below are background context only.** Do NOT proactively bring them up unless the user asks about them.
+
+### Response Format
+
 - For greetings, status checks, clarifying questions, simple factual answers, or coordinating plans: answer the user directly. Be concise and helpful.
-- If the request requires real work — research, building, designing, outreach, analysis, deep dives, or anything that needs a sub-agent — you MUST include the delegation marker on its own line, in this exact format:
+- If the request requires real work — research, building, designing, outreach, analysis, deep dives, or anything that needs a sub-agent — you MUST include the delegation marker on its own line:
 
 [NEEDS_DELEGATION]
 Task title here
 One-sentence description of what needs to be done.
 
-You may include a brief conversational acknowledgment BEFORE the marker line. The marker MUST appear on its own line.
+You may include a brief conversational acknowledgment BEFORE the marker line.
 
-Example (with preamble):
-Sure, I'll queue that up for you.
+### What you CANNOT do in quick-reply mode
+- Delete, cancel, or modify tasks (tell the user to use the task pipeline UI, or say you'll queue it as a task)
+- Execute code, call APIs, or access external tools
+- Search the web or access databases
 
-[NEEDS_DELEGATION]
-Competitive landscape analysis for fintech payments
-Research the top 10 competitors in the fintech payments space, their funding, and differentiation.
-
-Example (direct reply — no marker needed):
-All agents are idle right now. Your last completed task was the unit converter app. Want me to kick off something new?`;
+If the user asks you to do something you cannot do here, be honest: "I can't do that directly in chat — let me create a task for it." or direct them to the right UI.`;
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -75,10 +82,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           .single(),
         supabase
           .from("chat_messages")
-          .select("role, content")
+          .select("role, content, metadata")
           .eq("conversation_id", conversation_id)
-          .order("created_at", { ascending: true })
-          .limit(20),
+          .order("created_at", { ascending: false })
+          .limit(12),
         supabase
           .from("company_goals")
           .select(
@@ -141,17 +148,37 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const lines = tasksRes.data.map(
         (t: Record<string, string>) => `- [${t.status}] ${t.title}`
       );
-      systemPrompt += "\n\n## Recent Tasks\n" + lines.join("\n");
+      systemPrompt +=
+        "\n\n## Recent Tasks (background only — do NOT bring these up unless asked)\n" +
+        lines.join("\n");
     }
 
     systemPrompt += ROUTING_ADDENDUM;
 
-    const messages = (historyRes.data || [])
-      .filter((m: Record<string, string>) => m.content)
+    const rawHistory = [...(historyRes.data || [])].reverse();
+
+    const filtered = rawHistory
+      .filter((m: Record<string, unknown>) => {
+        if (!m.content) return false;
+        const meta = m.metadata as Record<string, unknown> | null;
+        if (meta?.notification === true) return false;
+        if (meta?.error === true) return false;
+        return true;
+      })
       .map((m: Record<string, string>) => ({
-        role: m.role === "user" ? "user" : "assistant",
+        role: m.role === "user" ? ("user" as const) : ("assistant" as const),
         content: m.content,
       }));
+
+    const messages: Array<{ role: "user" | "assistant"; content: unknown }> = [];
+    for (const m of filtered) {
+      const prev = messages[messages.length - 1];
+      if (prev && prev.role === m.role) {
+        prev.content = (prev.content as string) + "\n" + m.content;
+      } else {
+        messages.push({ ...m });
+      }
+    }
 
     const lastMsg = messages[messages.length - 1];
     if (!lastMsg || lastMsg.role !== "user" || lastMsg.content !== message) {
@@ -190,7 +217,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       body: JSON.stringify({
         model: "claude-opus-4-6",
         max_tokens: 1024,
-        temperature: 0.5,
+        temperature: 0.3,
         system: systemPrompt,
         messages,
       }),

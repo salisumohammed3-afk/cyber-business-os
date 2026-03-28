@@ -1,7 +1,15 @@
 import { createClient } from "@supabase/supabase-js";
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 
-const DELEGATION_MARKER = "[NEEDS_DELEGATION]";
+const DELEGATION_RE = /\[NEEDS_DELEGATION(?::([a-z][\w-]*))?\]/;
+
+const VALID_SLUGS = new Set([
+  "research",
+  "engineering",
+  "designer",
+  "growth",
+  "executive-assistant",
+]);
 
 const ROUTING_ADDENDUM = `
 
@@ -10,15 +18,30 @@ const ROUTING_ADDENDUM = `
 You are answering in quick-reply mode. You do NOT have access to any tools right now.
 
 - For greetings, status checks, clarifying questions, simple factual answers, or coordinating plans: answer the user directly. Be concise and helpful.
-- If the request requires real work — research, building, designing, outreach, analysis, deep dives, or anything that needs a sub-agent — respond with EXACTLY the marker \`${DELEGATION_MARKER}\` on the FIRST line, followed by a short task title on the second line, and a one-sentence description on the third line.
+- If the request requires real work — research, building, designing, outreach, analysis, deep dives, or anything that needs a sub-agent — you MUST include the delegation marker on its own line, in this exact format:
 
-Example delegation response:
-${DELEGATION_MARKER}
+[NEEDS_DELEGATION:agent_slug]
+Task title here
+One-sentence description of what needs to be done.
+
+Available agent slugs: research, engineering, designer, growth, executive-assistant
+- research: market analysis, competitive intelligence, deep dives, trends
+- engineering: building apps, code, technical work, web scraping
+- designer: UI/UX mockups, design systems, visual prototypes
+- growth: outreach, sales pipeline, email campaigns, lead research
+- executive-assistant: email management, calendar, meeting notes, task boards
+
+You may include a brief conversational acknowledgment BEFORE the marker line. The marker MUST appear on its own line.
+
+Example (with preamble):
+Sure, I'll get that research started for you.
+
+[NEEDS_DELEGATION:research]
 Competitive landscape analysis for fintech payments
 Research the top 10 competitors in the fintech payments space, their funding, and differentiation.
 
-Example direct response:
-All agents are idle right now. Your last completed task was the unit converter app — it's live at unit-converter.vercel.app. Want me to kick off something new?`;
+Example (direct reply — no marker needed):
+All agents are idle right now. Your last completed task was the unit converter app. Want me to kick off something new?`;
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -50,14 +73,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   const supabase = createClient(supabaseUrl, supabaseKey);
 
   try {
-    const [orchestratorRes, companyRes, historyRes, goalsRes, tasksRes] =
+    const [agentsRes, companyRes, historyRes, goalsRes, tasksRes] =
       await Promise.all([
         supabase
           .from("agent_definitions")
-          .select("id, system_prompt")
-          .eq("slug", "orchestrator")
-          .eq("company_id", company_id)
-          .single(),
+          .select("id, slug, system_prompt")
+          .eq("company_id", company_id),
         supabase
           .from("companies")
           .select("name, brief")
@@ -71,7 +92,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           .limit(20),
         supabase
           .from("company_goals")
-          .select("title, target_metric, current_value, target_value, timeframe")
+          .select(
+            "title, target_metric, current_value, target_value, timeframe"
+          )
           .eq("company_id", company_id)
           .eq("status", "active")
           .order("priority", { ascending: true }),
@@ -84,10 +107,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           .limit(10),
       ]);
 
+    const agents = agentsRes.data || [];
+    const agentBySlug = new Map(agents.map((a) => [a.slug, a]));
+    const orchestrator = agentBySlug.get("orchestrator");
+
     let systemPrompt =
-      orchestratorRes.data?.system_prompt ||
+      orchestrator?.system_prompt ||
       "You are the Orchestrator of a Cyber Business OS. Be direct and concise.";
-    const orchestratorId = orchestratorRes.data?.id;
 
     const company = companyRes.data;
     if (company?.brief) {
@@ -163,37 +189,45 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     if (!anthropicRes.ok) {
       const errBody = await anthropicRes.text().catch(() => "");
-      return res
-        .status(502)
-        .json({ error: `Anthropic ${anthropicRes.status}: ${errBody.slice(0, 300)}` });
+      return res.status(502).json({
+        error: `Anthropic ${anthropicRes.status}: ${errBody.slice(0, 300)}`,
+      });
     }
 
     const anthropicData = await anthropicRes.json();
     const reply =
-      anthropicData.content?.[0]?.text || "Sorry, I couldn't generate a reply.";
+      anthropicData.content?.[0]?.text ||
+      "Sorry, I couldn't generate a reply.";
 
-    if (reply.trim().startsWith(DELEGATION_MARKER)) {
-      const lines = reply.trim().split("\n").filter(Boolean);
-      const taskTitle = lines[1] || "Respond to user message";
-      const taskDescription = lines.slice(2).join("\n") || message;
+    // Check for delegation marker ANYWHERE in the response
+    const delegationMatch = reply.match(DELEGATION_RE);
 
-      const ackContent =
-        "Got it — I'm delegating this now. I'll notify you when it's done.";
+    if (delegationMatch) {
+      const markerIdx = reply.indexOf(delegationMatch[0]);
+      const afterMarker = reply.slice(markerIdx + delegationMatch[0].length);
+      const afterLines = afterMarker.split("\n").filter(Boolean);
+      const taskTitle = afterLines[0]?.trim() || "Respond to user message";
+      const taskDescription =
+        afterLines.slice(1).join("\n").trim() || message;
 
-      const inserts: Promise<unknown>[] = [
-        supabase.from("chat_messages").insert({
-          conversation_id,
-          role: "assistant",
-          content: ackContent,
-          timestamp: new Date().toISOString(),
-        }),
-      ];
+      // Extract any conversational preamble before the marker
+      const preamble = reply.slice(0, markerIdx).trim();
+      const ackContent = preamble
+        ? preamble
+        : "Got it — I'm delegating this now. I'll notify you when it's done.";
+
+      // Resolve the target sub-agent (skip the orchestrator middleman)
+      const requestedSlug = delegationMatch[1] || "";
+      const targetSlug = VALID_SLUGS.has(requestedSlug)
+        ? requestedSlug
+        : "research";
+      const targetAgent = agentBySlug.get(targetSlug);
 
       const taskInsert = await supabase
         .from("tasks")
         .insert({
           conversation_id,
-          agent_definition_id: orchestratorId || null,
+          agent_definition_id: targetAgent?.id || orchestrator?.id || null,
           company_id,
           status: "pending",
           title: taskTitle,
@@ -203,19 +237,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         .select("id")
         .single();
 
-      await Promise.all(inserts);
+      await supabase.from("chat_messages").insert({
+        conversation_id,
+        role: "assistant",
+        content: ackContent,
+        timestamp: new Date().toISOString(),
+      });
 
       const taskId = taskInsert.data?.id;
-      if (taskId) {
-        fetch(
-          `${req.headers.origin || "https://" + req.headers.host}/api/run-agent`,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ task_id: taskId, conversation_id }),
-          }
-        ).catch(() => {});
-      }
 
       return res.status(200).json({ mode: "delegated", task_id: taskId });
     }

@@ -1,4 +1,4 @@
-import { useRef, useEffect, useState, useMemo, useCallback } from 'react'
+import { useRef, useEffect, useState, useMemo, useCallback, type KeyboardEvent } from 'react'
 import ReactMarkdown from 'react-markdown'
 import { Bot, Pencil, Globe, GitBranch, FileText, Mail, CheckCircle2, Sheet } from 'lucide-react'
 import { useLiveChat } from '@/hooks/useLiveChat'
@@ -36,8 +36,16 @@ export function CEOChat() {
   const { company } = useCompany()
   const { messages, loading, error, sendMessage } = useLiveChat(company?.id ?? null)
   const scrollContainerRef = useRef<HTMLDivElement>(null)
+  const textareaRef = useRef<HTMLTextAreaElement>(null)
   const [inputValue, setInputValue] = useState('')
   const [sending, setSending] = useState(false)
+
+  const autoResize = useCallback(() => {
+    const ta = textareaRef.current
+    if (!ta) return
+    ta.style.height = 'auto'
+    ta.style.height = Math.min(ta.scrollHeight, 160) + 'px'
+  }, [])
   const [projectRefs, setProjectRefs] = useState<ProjectRef[]>([])
 
   useEffect(() => {
@@ -78,6 +86,7 @@ export function CEOChat() {
     if (!text || sending) return
     setSending(true)
     setInputValue('')
+    if (textareaRef.current) textareaRef.current.style.height = 'auto'
     try {
       await sendMessage(text)
     } catch (err) {
@@ -233,20 +242,31 @@ export function CEOChat() {
       </div>
       <form
         onSubmit={handleSubmit}
-        className="border-t p-4 flex gap-2 items-center"
+        className="border-t p-4 flex gap-2 items-end"
       >
-        <input
-          type="text"
+        <textarea
+          ref={textareaRef}
           value={inputValue}
-          onChange={(e) => setInputValue(e.target.value)}
+          onChange={(e) => {
+            setInputValue(e.target.value)
+            autoResize()
+          }}
+          onKeyDown={(e: KeyboardEvent<HTMLTextAreaElement>) => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+              e.preventDefault()
+              handleSubmit(e)
+            }
+          }}
           placeholder={company ? `Message ${company.name}...` : 'Select a company first'}
           disabled={sending || !company}
-          className="flex-1 rounded-lg border border-gray-300 px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50 disabled:cursor-not-allowed"
+          rows={1}
+          className="flex-1 rounded-lg border border-gray-300 px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50 disabled:cursor-not-allowed resize-none overflow-y-auto"
+          style={{ maxHeight: '160px' }}
         />
         <button
           type="submit"
           disabled={sending || !inputValue.trim() || !company}
-          className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
+          className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed flex-shrink-0"
         >
           Send
         </button>

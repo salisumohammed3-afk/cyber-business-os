@@ -125,13 +125,16 @@ export function useLiveChat(companyId: string | null) {
         try { localStorage.setItem(convStorageKey(companyId), convId) } catch { /* noop */ }
       }
 
+      const msgId = crypto.randomUUID()
+      const ts = new Date().toISOString()
+
       const optimisticMsg: ChatMessageRow = {
-        id: crypto.randomUUID(),
+        id: msgId,
         conversation_id: convId,
         role: 'user',
         content: text,
-        timestamp: new Date().toISOString(),
-        created_at: new Date().toISOString(),
+        timestamp: ts,
+        created_at: ts,
         tool_calls: null,
         metadata: null,
       }
@@ -139,10 +142,11 @@ export function useLiveChat(companyId: string | null) {
       setWaitingForReply(true)
 
       const { error: msgError } = await supabase.from('chat_messages').insert({
+        id: msgId,
         conversation_id: convId,
         role: 'user',
         content: text,
-        timestamp: new Date().toISOString(),
+        timestamp: ts,
       })
       if (msgError) throw new Error(msgError.message)
 

@@ -5,6 +5,41 @@ import type { Database } from '@/integrations/supabase/types'
 
 type ChatMessageRow = Database['public']['Tables']['chat_messages']['Row']
 
+export interface Attachment {
+  name: string
+  url: string
+  type: string
+  size: number
+}
+
+const ATTACHMENT_BUCKET = 'chat-attachments'
+
+async function uploadFiles(companyId: string, convId: string, files: File[]): Promise<Attachment[]> {
+  const results: Attachment[] = []
+  for (const file of files) {
+    const ext = file.name.split('.').pop() || 'bin'
+    const path = `${companyId}/${convId}/${crypto.randomUUID()}.${ext}`
+
+    const { error } = await supabase.storage
+      .from(ATTACHMENT_BUCKET)
+      .upload(path, file, { contentType: file.type, upsert: false })
+
+    if (error) {
+      console.error('Upload failed for', file.name, error.message)
+      continue
+    }
+
+    const { data: urlData } = supabase.storage.from(ATTACHMENT_BUCKET).getPublicUrl(path)
+    results.push({
+      name: file.name,
+      url: urlData.publicUrl,
+      type: file.type,
+      size: file.size,
+    })
+  }
+  return results
+}
+
 function convStorageKey(companyId: string) {
   return `sal-os-conv-${companyId}`
 }
@@ -104,7 +139,7 @@ export function useLiveChat(companyId: string | null) {
   }, [conversationIdState])
 
   const sendMessage = useCallback(
-    async (text: string): Promise<void> => {
+    async (text: string, files?: File[]): Promise<void> => {
       if (!companyId) throw new Error('No company selected')
 
       let convId = convIdRef.current
@@ -125,8 +160,14 @@ export function useLiveChat(companyId: string | null) {
         try { localStorage.setItem(convStorageKey(companyId), convId) } catch { /* noop */ }
       }
 
+      let attachments: Attachment[] = []
+      if (files && files.length > 0) {
+        attachments = await uploadFiles(companyId, convId, files)
+      }
+
       const msgId = crypto.randomUUID()
       const ts = new Date().toISOString()
+      const msgMeta = attachments.length > 0 ? { attachments } : null
 
       const optimisticMsg: ChatMessageRow = {
         id: msgId,
@@ -136,7 +177,7 @@ export function useLiveChat(companyId: string | null) {
         timestamp: ts,
         created_at: ts,
         tool_calls: null,
-        metadata: null,
+        metadata: msgMeta,
       }
       setMessages((prev) => [...prev, optimisticMsg])
       setWaitingForReply(true)
@@ -147,11 +188,14 @@ export function useLiveChat(companyId: string | null) {
         role: 'user',
         content: text,
         timestamp: ts,
+        metadata: msgMeta,
       })
       if (msgError) throw new Error(msgError.message)
 
-      // Fast path: call quick-reply (Opus) for instant answers.
-      // If work is needed, the endpoint creates a proposed task for approval.
+      const attachmentContext = attachments.length > 0
+        ? '\n\n[Attachments: ' + attachments.map((a) => `${a.name} (${a.type}) — ${a.url}`).join(', ') + ']'
+        : ''
+
       try {
         const qr = await fetch('/api/quick-reply', {
           method: 'POST',
@@ -159,21 +203,18 @@ export function useLiveChat(companyId: string | null) {
           body: JSON.stringify({
             conversation_id: convId,
             company_id: companyId,
-            message: text,
+            message: text + attachmentContext,
+            attachments: attachments.length > 0 ? attachments : undefined,
           }),
         })
 
         if (qr.ok) {
-          const result = await qr.json()
-          // Both "direct" and "proposed" modes write a chat message via the
-          // endpoint — realtime delivers it to the UI. No further action needed.
           return
         }
       } catch (qrError) {
         console.error('Quick-reply failed, falling back to full pipeline:', qrError)
       }
 
-      // Fallback: full task pipeline (only reached if quick-reply fails)
       const { data: orchestrator } = await supabase
         .from('agent_definitions')
         .select('id')
@@ -203,7 +244,7 @@ export function useLiveChat(companyId: string | null) {
         company_id: companyId,
         status: 'pending',
         title: 'Respond to user message',
-        description: text,
+        description: text + attachmentContext,
         source: 'internal',
       }).select('id').single()
       if (taskError) throw new Error(taskError.message)

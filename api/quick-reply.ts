@@ -49,11 +49,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (!anthropicKey)
     return res.status(500).json({ error: "ANTHROPIC_API_KEY not configured" });
 
-  const { conversation_id, company_id, message } = req.body || {};
+  const { conversation_id, company_id, message, attachments } = req.body || {};
   if (!conversation_id || !company_id || !message)
     return res
       .status(400)
       .json({ error: "conversation_id, company_id, and message are required" });
+
+  const attachmentList: Array<{ name: string; url: string; type: string; size: number }> =
+    Array.isArray(attachments) ? attachments : [];
 
   const supabase = createClient(supabaseUrl, supabaseKey);
 
@@ -152,7 +155,29 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     const lastMsg = messages[messages.length - 1];
     if (!lastMsg || lastMsg.role !== "user" || lastMsg.content !== message) {
-      messages.push({ role: "user", content: message });
+      if (attachmentList.length > 0) {
+        const imageTypes = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
+        const contentBlocks: Array<Record<string, unknown>> = [];
+
+        for (const att of attachmentList) {
+          if (imageTypes.has(att.type)) {
+            contentBlocks.push({
+              type: "image",
+              source: { type: "url", url: att.url },
+            });
+          } else {
+            contentBlocks.push({
+              type: "text",
+              text: `[Attached file: ${att.name} (${att.type}, ${Math.round(att.size / 1024)}KB) — ${att.url}]`,
+            });
+          }
+        }
+
+        contentBlocks.push({ type: "text", text: message });
+        messages.push({ role: "user", content: contentBlocks });
+      } else {
+        messages.push({ role: "user", content: message });
+      }
     }
 
     const anthropicRes = await fetch("https://api.anthropic.com/v1/messages", {
@@ -202,6 +227,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       // Create a proposed task assigned to the orchestrator.
       // The user reviews it in the pipeline and clicks "Approve & Run".
       // The orchestrator then handles delegation to sub-agents.
+      const taskInput: Record<string, unknown> = {
+        instruction: taskDescription,
+        context: message,
+      };
+      if (attachmentList.length > 0) {
+        taskInput.attachments = attachmentList;
+      }
+
       const taskInsert = await supabase
         .from("tasks")
         .insert({
@@ -211,6 +244,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           status: "proposed",
           title: taskTitle,
           description: taskDescription,
+          input_data: taskInput,
           source: "chat",
         })
         .select("id")

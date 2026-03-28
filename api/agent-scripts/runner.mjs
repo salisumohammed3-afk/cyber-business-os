@@ -220,13 +220,15 @@ const BASE_TOOLS = [
   },
   {
     name: "delegate_task",
-    description: "Delegate work to a specialist sub-agent. Task runs after current agent finishes.",
+    description: "Delegate work to a specialist sub-agent. Optionally chain to another agent on completion via next_agent.",
     input_schema: {
       type: "object",
       properties: {
         agent_slug: { type: "string", description: "Target: engineering, growth, research, designer, executive-assistant" },
         instruction: { type: "string", description: "Detailed instruction for the sub-agent" },
         context: { type: "string", description: "Additional context" },
+        next_agent: { type: "string", description: "Optional: agent slug to auto-handoff to on completion (e.g. 'engineering')" },
+        next_instruction: { type: "string", description: "Optional: instruction for the next agent. Use {RESULT} as placeholder for this agent's output." },
       },
       required: ["agent_slug", "instruction"],
     },
@@ -596,6 +598,14 @@ async function toolDelegateTask(input) {
   if (!agentDef) return JSON.stringify({ error: "Agent '" + input.agent_slug + "' not found" });
   if (agentDef.slug === agentSlug) return JSON.stringify({ error: "Cannot delegate to yourself" });
 
+  const taskMeta = {};
+  if (input.next_agent) {
+    taskMeta.handoff = {
+      next_agent: input.next_agent,
+      next_instruction: input.next_instruction || "",
+    };
+  }
+
   const result = await sbInsert("tasks", {
     title: "Delegated: " + input.instruction.slice(0, 80),
     description: input.instruction,
@@ -603,6 +613,7 @@ async function toolDelegateTask(input) {
     parent_task_id: TASK_ID, company_id: companyId,
     status: "pending",
     input_data: { instruction: input.instruction, context: input.context || "" },
+    metadata: Object.keys(taskMeta).length > 0 ? taskMeta : {},
     source: "agent",
   });
   if (!result) return JSON.stringify({ error: "Failed to create delegated task" });
@@ -1678,6 +1689,41 @@ async function main() {
   if (childTasks.length > 0) {
     await log(childTasks.length + " child task(s) queued for pickup: " +
       childTasks.map(c => c.taskId.slice(0, 8)).join(", "));
+  }
+
+  // 13. Handoff chain: if this task has a next_agent, auto-create the follow-up task
+  const handoff = (task.metadata || {}).handoff;
+  if (handoff?.next_agent && finalStatus === "completed") {
+    const nextAgentDef = await sbGet("agent_definitions", {
+      slug: "eq." + handoff.next_agent, company_id: "eq." + companyId,
+    }, { select: "id,name", single: true });
+
+    if (nextAgentDef) {
+      const nextInstruction = (handoff.next_instruction || "Continue from previous agent output.")
+        .replace(/\{RESULT\}/g, finalText);
+
+      const handoffTask = await sbInsert("tasks", {
+        title: "Handoff: " + handoff.next_agent + " — " + nextInstruction.slice(0, 60),
+        description: nextInstruction,
+        agent_definition_id: nextAgentDef.id,
+        conversation_id: CONVERSATION_ID,
+        parent_task_id: task.parent_task_id || TASK_ID,
+        company_id: companyId,
+        status: "pending",
+        input_data: {
+          instruction: nextInstruction,
+          context: "Previous agent (" + agentSlug + ") output:\n\n" + finalText,
+          deliverables: deliverables,
+        },
+        source: "agent",
+      });
+
+      if (handoffTask?.[0]?.id) {
+        await log("Handoff: created task " + handoffTask[0].id.slice(0, 8) + " for " + handoff.next_agent, "handoff_created");
+      }
+    } else {
+      await log("Handoff skipped: agent '" + handoff.next_agent + "' not found", "handoff_error");
+    }
   }
 
   await log("Runner complete. Exiting.");

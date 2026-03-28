@@ -27,6 +27,7 @@ const localTools: Record<string, ToolInfo> = {
   store_memory: { name: "Store Memory", icon: BookOpen, description: "Save important facts and decisions for future reference" },
   recall_memories: { name: "Recall Memories", icon: FileSearch, description: "Search stored memories for relevant context" },
   delegate_task: { name: "Delegate Task", icon: MessageSquare, description: "Propose work for specialist sub-agents (requires user approval)" },
+  fail_task: { name: "Fail Task", icon: XCircle, description: "Mark a task as failed with an error message when it cannot be completed" },
 };
 
 const composioToolMeta: Record<string, { label: string; description: string }> = {
@@ -45,7 +46,7 @@ const composioToolMeta: Record<string, { label: string; description: string }> =
   figma: { label: "Figma", description: "Design file access, component inspection, and asset export" },
 };
 
-const orchestratorLocalTools = ["web_search", "database_query", "create_task", "store_memory", "recall_memories", "delegate_task"];
+const orchestratorLocalTools = ["delegate_task", "create_task", "database_query", "store_memory", "recall_memories", "fail_task"];
 const specialistLocalTools = ["web_search", "database_query", "store_memory", "recall_memories"];
 
 const agentConfigs: Record<string, AgentConfig> = {
@@ -123,6 +124,7 @@ const agentConfigs: Record<string, AgentConfig> = {
 };
 
 const specialistSlugs = ["engineering", "growth", "research", "designer", "executive-assistant"];
+const allAgentSlugs = ["orchestrator", ...specialistSlugs];
 
 function buildToolList(
   slug: string,
@@ -572,7 +574,7 @@ const Agents = () => {
       is_orchestrator: boolean;
     }>) || [];
 
-  const tabAgents = typedAgents.filter((a) => specialistSlugs.includes(a.slug));
+  const tabAgents = typedAgents.filter((a) => allAgentSlugs.includes(a.slug));
 
   const agentToolsMap = useMemo(() => {
     const map: Record<string, ToolInfo[]> = {};

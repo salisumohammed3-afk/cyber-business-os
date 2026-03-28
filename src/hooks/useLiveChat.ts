@@ -150,8 +150,8 @@ export function useLiveChat(companyId: string | null) {
       })
       if (msgError) throw new Error(msgError.message)
 
-      // Fast path: call quick-reply (Haiku) for instant answers.
-      // If delegation is needed, the endpoint creates the task for us.
+      // Fast path: call quick-reply (Opus) for instant answers.
+      // If work is needed, the endpoint creates a proposed task for approval.
       try {
         const qr = await fetch('/api/quick-reply', {
           method: 'POST',
@@ -165,13 +165,8 @@ export function useLiveChat(companyId: string | null) {
 
         if (qr.ok) {
           const result = await qr.json()
-          if (result.mode === 'direct') {
-            // Reply already written to chat_messages — realtime will deliver it
-            return
-          }
-          // mode === 'delegated': ack message + task already created by the endpoint
-          // Keep waitingForReply true so the UI shows the spinner until the
-          // delegated task's completion notification arrives
+          // Both "direct" and "proposed" modes write a chat message via the
+          // endpoint — realtime delivers it to the UI. No further action needed.
           return
         }
       } catch (qrError) {

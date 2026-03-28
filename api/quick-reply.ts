@@ -1,15 +1,7 @@
 import { createClient } from "@supabase/supabase-js";
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 
-const DELEGATION_RE = /\[NEEDS_DELEGATION(?::([a-z][\w-]*))?\]/;
-
-const VALID_SLUGS = new Set([
-  "research",
-  "engineering",
-  "designer",
-  "growth",
-  "executive-assistant",
-]);
+const DELEGATION_RE = /\[NEEDS_DELEGATION\]/;
 
 const ROUTING_ADDENDUM = `
 
@@ -20,23 +12,16 @@ You are answering in quick-reply mode. You do NOT have access to any tools right
 - For greetings, status checks, clarifying questions, simple factual answers, or coordinating plans: answer the user directly. Be concise and helpful.
 - If the request requires real work — research, building, designing, outreach, analysis, deep dives, or anything that needs a sub-agent — you MUST include the delegation marker on its own line, in this exact format:
 
-[NEEDS_DELEGATION:agent_slug]
+[NEEDS_DELEGATION]
 Task title here
 One-sentence description of what needs to be done.
-
-Available agent slugs: research, engineering, designer, growth, executive-assistant
-- research: market analysis, competitive intelligence, deep dives, trends
-- engineering: building apps, code, technical work, web scraping
-- designer: UI/UX mockups, design systems, visual prototypes
-- growth: outreach, sales pipeline, email campaigns, lead research
-- executive-assistant: email management, calendar, meeting notes, task boards
 
 You may include a brief conversational acknowledgment BEFORE the marker line. The marker MUST appear on its own line.
 
 Example (with preamble):
-Sure, I'll get that research started for you.
+Sure, I'll queue that up for you.
 
-[NEEDS_DELEGATION:research]
+[NEEDS_DELEGATION]
 Competitive landscape analysis for fintech payments
 Research the top 10 competitors in the fintech payments space, their funding, and differentiation.
 
@@ -78,6 +63,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         supabase
           .from("agent_definitions")
           .select("id, slug, system_prompt")
+          .eq("slug", "orchestrator")
           .eq("company_id", company_id),
         supabase
           .from("companies")
@@ -107,9 +93,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           .limit(10),
       ]);
 
-    const agents = agentsRes.data || [];
-    const agentBySlug = new Map(agents.map((a) => [a.slug, a]));
-    const orchestrator = agentBySlug.get("orchestrator");
+    const orchestrator = agentsRes.data?.[0] || null;
 
     let systemPrompt =
       orchestrator?.system_prompt ||
@@ -210,29 +194,24 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const taskDescription =
         afterLines.slice(1).join("\n").trim() || message;
 
-      // Extract any conversational preamble before the marker
       const preamble = reply.slice(0, markerIdx).trim();
       const ackContent = preamble
         ? preamble
-        : "Got it — I'm delegating this now. I'll notify you when it's done.";
+        : "I've queued that as a proposed task. You can review and approve it in the task pipeline.";
 
-      // Resolve the target sub-agent (skip the orchestrator middleman)
-      const requestedSlug = delegationMatch[1] || "";
-      const targetSlug = VALID_SLUGS.has(requestedSlug)
-        ? requestedSlug
-        : "research";
-      const targetAgent = agentBySlug.get(targetSlug);
-
+      // Create a proposed task assigned to the orchestrator.
+      // The user reviews it in the pipeline and clicks "Approve & Run".
+      // The orchestrator then handles delegation to sub-agents.
       const taskInsert = await supabase
         .from("tasks")
         .insert({
           conversation_id,
-          agent_definition_id: targetAgent?.id || orchestrator?.id || null,
+          agent_definition_id: orchestrator?.id || null,
           company_id,
-          status: "pending",
+          status: "proposed",
           title: taskTitle,
           description: taskDescription,
-          source: "internal",
+          source: "chat",
         })
         .select("id")
         .single();
@@ -246,7 +225,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
       const taskId = taskInsert.data?.id;
 
-      return res.status(200).json({ mode: "delegated", task_id: taskId });
+      return res.status(200).json({ mode: "proposed", task_id: taskId });
     }
 
     await supabase.from("chat_messages").insert({

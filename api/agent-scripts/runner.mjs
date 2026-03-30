@@ -287,15 +287,15 @@ const BASE_TOOLS = [
   },
   {
     name: "fail_task",
-    description: "Mark the task as FAILED. Call when you genuinely cannot complete the work after trying tools.",
+    description: "Mark the task as FAILED. LAST RESORT ONLY — call this ONLY after you have tried multiple different tools and approaches. Before calling, ask yourself: did I try web_search? Did I try a different strategy? Can I deliver partial results instead? If you can deliver ANYTHING useful, do NOT call this.",
     input_schema: {
       type: "object",
       properties: {
-        reason: { type: "string" },
-        partial_result: { type: "string" },
-        tools_tried: { type: "array", items: { type: "string" } },
+        reason: { type: "string", description: "Why you're failing — must explain what you tried and why ALL alternatives are exhausted" },
+        partial_result: { type: "string", description: "Any partial work you completed — deliver this instead of nothing" },
+        tools_tried: { type: "array", items: { type: "string" }, description: "List of tools you already attempted" },
       },
-      required: ["reason"],
+      required: ["reason", "tools_tried"],
     },
   },
 ];
@@ -1103,6 +1103,8 @@ async function saveCheckpoint(messages, turn, allToolCalls) {
 
 async function runLoop(model, systemPrompt, messages, tools, maxTurns, temperature, mcpServers = [], startTurn = 0, existingToolCalls = []) {
   const allToolCalls = [...existingToolCalls];
+  let failAttempts = 0;
+  const MAX_FAIL_RETRIES = 2;
 
   for (let turn = startTurn; turn < maxTurns; turn++) {
     await log("Turn " + (turn + 1) + "/" + maxTurns + " — calling " + model);
@@ -1120,6 +1122,25 @@ async function runLoop(model, systemPrompt, messages, tools, maxTurns, temperatu
     if (response.stop_reason === "tool_use" && toolBlocks.length > 0) {
       const failBlock = toolBlocks.find(b => b.name === "fail_task");
       if (failBlock) {
+        failAttempts++;
+        if (failAttempts <= MAX_FAIL_RETRIES && turn + 2 < maxTurns) {
+          await log("Agent wants to give up (attempt " + failAttempts + "/" + MAX_FAIL_RETRIES + ") — pushing back", "fail_pushback");
+          messages.push({ role: "assistant", content: response.content });
+          messages.push({ role: "user", content: [{
+            type: "tool_result", tool_use_id: failBlock.id,
+            content: "HOLD ON — Do not give up yet. You have " + (maxTurns - turn - 1) + " turns remaining. " +
+              "Reason you wanted to fail: " + (failBlock.input.reason || "unknown") + "\n\n" +
+              "Before failing, try these recovery strategies:\n" +
+              "1. If a tool errored, try an alternative tool or different parameters\n" +
+              "2. If web_search returned nothing, try different search terms\n" +
+              "3. If an external service is down, work with what you have\n" +
+              "4. If you're stuck on one approach, try a completely different approach\n" +
+              "5. Deliver PARTIAL results — something useful is better than nothing\n\n" +
+              "Only call fail_task again if you've truly exhausted ALL alternatives.",
+          }]);
+          allToolCalls.push({ tool: "fail_task", input: failBlock.input, output: "(pushed back)", source: "local" });
+          continue;
+        }
         return {
           status: "failed",
           text: failBlock.input.reason || "Agent could not complete",
@@ -1168,43 +1189,56 @@ async function runLoop(model, systemPrompt, messages, tools, maxTurns, temperatu
 
 // ── Quality review (for delegated tasks) ────────────────────────────────────
 
-async function verifyEngineering(toolCalls) {
+async function verifyEngineering(toolCalls, instruction) {
   const checks = [];
+  const lcInstruction = (instruction || "").toLowerCase();
+
+  const isBuildTask = /\b(build|create|deploy|app|site|website|tool|calculator|timer|game|dashboard|todo|to-do)\b/i.test(lcInstruction);
+  const isAnalysisTask = /\b(analy[sz]e|review|audit|assess|research|investigate|document|report|reskin|presentation|brief)\b/i.test(lcInstruction);
 
   const sandboxTools = toolCalls.filter(t =>
-    t.tool.startsWith("sandbox_") || t.tool === "github_push_file" || t.tool === "github_create_repo"
+    t.tool.startsWith("sandbox_") || t.tool === "github_push_file" || t.tool === "github_create_repo" || t.tool === "deploy_static_site"
   );
-  if (sandboxTools.length === 0) {
-    checks.push({ pass: false, msg: "No sandbox or GitHub tools used — agent described but didn't build" });
-  } else {
-    checks.push({ pass: true, msg: sandboxTools.length + " build/push tool calls made" });
-  }
 
-  const projects = await sbGet("projects", { created_by_task_id: "eq." + TASK_ID });
-  if (!projects?.length) {
-    checks.push({ pass: false, msg: "No project registered via register_project" });
-  } else {
-    const p = projects[0];
-    checks.push({ pass: true, msg: "Project registered: " + p.name });
-    if (p.deploy_url) {
-      try {
-        let url = p.deploy_url;
-        let r = await fetch(url, { method: "HEAD", redirect: "follow", signal: AbortSignal.timeout(10000) });
-        // Vercel team auth returns 401 on preview URLs; try the production URL
-        if (r.status === 401 && url.includes("-team-")) {
-          const prodUrl = url.replace(/-[a-z0-9]+-team-[^.]+\.vercel\.app/, ".vercel.app");
-          if (prodUrl !== url) {
-            const r2 = await fetch(prodUrl, { method: "HEAD", redirect: "follow", signal: AbortSignal.timeout(10000) });
-            if (r2.ok) { r = r2; url = prodUrl; }
+  if (isBuildTask) {
+    if (sandboxTools.length === 0) {
+      checks.push({ pass: false, msg: "No sandbox/GitHub/deploy tool calls — agent didn't build anything" });
+    } else {
+      checks.push({ pass: true, msg: sandboxTools.length + " build/push tool calls made" });
+    }
+
+    const projects = await sbGet("projects", { created_by_task_id: "eq." + TASK_ID });
+    if (projects?.length) {
+      const p = projects[0];
+      checks.push({ pass: true, msg: "Project registered: " + p.name });
+      if (p.deploy_url) {
+        try {
+          let url = p.deploy_url;
+          let r = await fetch(url, { method: "HEAD", redirect: "follow", signal: AbortSignal.timeout(10000) });
+          if (r.status === 401 && url.includes("-team-")) {
+            const prodUrl = url.replace(/-[a-z0-9]+-team-[^.]+\.vercel\.app/, ".vercel.app");
+            if (prodUrl !== url) {
+              const r2 = await fetch(prodUrl, { method: "HEAD", redirect: "follow", signal: AbortSignal.timeout(10000) });
+              if (r2.ok) { r = r2; url = prodUrl; }
+            }
           }
+          checks.push({ pass: r.ok, msg: "Deploy URL " + url + " → " + r.status });
+        } catch (e) {
+          checks.push({ pass: false, msg: "Deploy URL unreachable: " + (e.message || "").slice(0, 80) });
         }
-        checks.push({ pass: r.ok, msg: "Deploy URL " + url + " → " + r.status });
-      } catch (e) {
-        checks.push({ pass: false, msg: "Deploy URL unreachable: " + (e.message || "").slice(0, 80) });
       }
     }
-    if (p.repo_url) {
-      checks.push({ pass: true, msg: "Repo: " + p.repo_url });
+  } else if (isAnalysisTask) {
+    if (toolCalls.length === 0) {
+      checks.push({ pass: false, msg: "No tools used — agent didn't do any real work" });
+    } else {
+      checks.push({ pass: true, msg: toolCalls.length + " tool calls made for analysis/research work" });
+    }
+  } else {
+    if (toolCalls.length >= 1) {
+      checks.push({ pass: true, msg: toolCalls.length + " tool calls made" });
+    } else {
+      checks.push({ pass: false, msg: "No tools used — agent described work instead of doing it" });
     }
   }
 
@@ -1223,10 +1257,12 @@ async function verifyResearch(resultText, toolCalls) {
 
   const urlPattern = /https?:\/\/[^\s)]+/g;
   const urls = resultText.match(urlPattern) || [];
-  if (urls.length === 0) {
-    checks.push({ pass: false, msg: "No URLs or sources cited in the response" });
-  } else {
+  if (urls.length === 0 && searchCalls.length === 0) {
+    checks.push({ pass: false, msg: "No URLs cited AND no search tools used" });
+  } else if (urls.length > 0) {
     checks.push({ pass: true, msg: urls.length + " source URL(s) cited" });
+  } else {
+    checks.push({ pass: true, msg: "Agent used " + searchCalls.length + " search calls (URLs not in final text but research was done)" });
   }
 
   if (resultText.length < 200) {
@@ -1241,7 +1277,7 @@ async function reviewResult(agentName, instruction, resultText, resultStatus, to
     let verificationChecks = [];
 
     if (agentSlug === "engineering") {
-      verificationChecks = await verifyEngineering(toolCalls || []);
+      verificationChecks = await verifyEngineering(toolCalls || [], instruction);
     } else if (agentSlug === "research" || agentSlug === "growth") {
       verificationChecks = await verifyResearch(resultText, toolCalls || []);
     }
@@ -1261,14 +1297,26 @@ async function reviewResult(agentName, instruction, resultText, resultStatus, to
       ? "\n\nAutomated checks (all passed):\n" + verificationChecks.map(c => "✓ " + c.msg).join("\n")
       : "";
 
+    const toolsSummary = (toolCalls || []).length > 0
+      ? "\n\nTools the agent actually used: " + [...new Set((toolCalls || []).map(t => t.tool))].join(", ") + " (" + toolCalls.length + " total calls)"
+      : "\n\nTools used: NONE";
+
     const prompt = "Agent: " + agentName + "\nTask: " + instruction +
       "\nResult (" + resultStatus + "):\n" + resultText.slice(0, 3000) +
-      verificationContext +
-      "\n\nEvaluate whether the agent delivered real, actionable results (not just descriptions of what it WOULD do)." +
-      "\nIf the agent delivered substantive results with real data/output, respond with ACCEPT: followed by a 2-sentence summary." +
-      "\nIf the output is vague, generic, or describes actions without actually performing them, respond with REJECT: followed by explanation.";
+      verificationContext + toolsSummary +
+      "\n\nEvaluate whether the agent delivered real, actionable results." +
+      "\n\nACCEPT if ANY of these are true:" +
+      "\n- Agent used tools to do real work (wrote code, searched web, created documents, etc.)" +
+      "\n- Agent produced substantive output with real data, analysis, or deliverables" +
+      "\n- Agent created something tangible (files, repos, deployed apps, documents)" +
+      "\n\nREJECT ONLY if:" +
+      "\n- Agent produced ZERO tool calls AND the output is just describing what it WOULD do" +
+      "\n- Agent's output is entirely generic/templated with no task-specific content" +
+      "\n- Agent explicitly says it cannot do the task without actually trying" +
+      "\n\nBias toward ACCEPT when the agent made genuine effort with tools. Partial results from real work > no results." +
+      "\nRespond with ACCEPT: followed by summary, or REJECT: followed by what specifically was missing.";
 
-    const resp = await callClaude("claude-sonnet-4-20250514", "You evaluate AI agent work quality. Be strict — 'completed' must mean real deliverables, not promises.", [
+    const resp = await callClaude("claude-sonnet-4-20250514", "You evaluate AI agent work. Accept genuine tool-based work and real output. Only reject if the agent clearly didn't try or produced nothing actionable.", [
       { role: "user", content: prompt },
     ], [], 512, 0.3);
 
@@ -1372,7 +1420,7 @@ async function main() {
   let systemPrompt = "";
   let model = "claude-sonnet-4-20250514";
   let temperature = 0.7;
-  let maxTurns = 15;
+  let maxTurns = 20;
   let agentDefId = null;
 
   let defId = task.agent_definition_id;
@@ -1503,26 +1551,37 @@ async function main() {
   // 5. Operational rules
   systemPrompt += "\n\n## Operational Rules (MUST FOLLOW)\n" +
     "1. EXECUTE, don't describe. Use tools to do real work.\n" +
-    "2. Exhaust alternatives. If one tool fails, try another. web_search always works.\n" +
-    "3. NEVER output auth links, setup URLs, or 'please connect' messages.\n" +
-    "4. If genuinely stuck after trying tools, call fail_task. Don't just admit failure in text.\n" +
-    "5. 'Completed' means you delivered real results, not setup instructions.";
+    "2. NEVER GIVE UP ON FIRST ERROR. If a tool fails, try different parameters, a different tool, or a different approach. You have many turns — use them.\n" +
+    "3. Exhaust alternatives. web_search always works as a fallback.\n" +
+    "4. NEVER output auth links, setup URLs, or 'please connect' messages.\n" +
+    "5. Only call fail_task as an absolute last resort after trying multiple approaches. If you have partial results, deliver those instead of failing.\n" +
+    "6. 'Completed' means you delivered real results, not setup instructions.\n" +
+    "7. If an external service is down or errors, work around it. Build locally, use sandbox tools, produce results another way.";
 
   if (agentSlug === "engineering") {
     systemPrompt = "You are the Engineering Agent. You BUILD things. You have a full sandbox environment with filesystem, shell, and GitHub access.\n\n" +
       "CRITICAL: You MUST use your tools to write actual code, test it, and push it. NEVER just describe what you would build. ALWAYS build it.\n\n" +
       systemPrompt +
-      "\n\n## Engineering Workflow (FOLLOW THIS EXACTLY — DO NOT SKIP STEPS)\n" +
-      "Step 1: Write ALL code files using sandbox_write_file (use relative paths like 'project/index.html')\n" +
-      "Step 2: Verify files with sandbox_bash (e.g. 'cat project/index.html | head -20')\n" +
-      "Step 3: Fix any errors found\n" +
-      "Step 4: Create a GitHub repo with github_create_repo\n" +
-      "Step 5: Push EVERY file with github_push_file\n" +
-      "Step 6: Deploy with deploy_static_site (PREFERRED — instant live URL). Do NOT use GitHub Pages workflows.\n" +
-      "Step 7: Register the project with register_project (use deploy URL from step 6)\n\n" +
-      "CRITICAL: You MUST complete ALL 7 steps in order. DO NOT stop after writing files. " +
-      "DO NOT return text without completing the full workflow. If you stop before register_project, your work will be REJECTED. " +
-      "The minimum acceptable tool sequence is: sandbox_write_file → github_create_repo → github_push_file → deploy_static_site → register_project.";
+      "\n\n## Engineering Workflow\n" +
+      "For BUILD/CREATE tasks (apps, sites, tools):\n" +
+      "1. Write code files using sandbox_write_file\n" +
+      "2. Test with sandbox_bash\n" +
+      "3. Fix any errors\n" +
+      "4. Create GitHub repo with github_create_repo\n" +
+      "5. Push files with github_push_file\n" +
+      "6. Deploy with deploy_static_site (instant live URL — preferred over GitHub Pages)\n" +
+      "7. Register with register_project\n\n" +
+      "For ANALYSIS/RESEARCH tasks (code review, reskinning analysis, technical assessment):\n" +
+      "1. Use web_search, database_query, or sandbox tools to gather data\n" +
+      "2. Analyze findings\n" +
+      "3. Produce a detailed written report\n" +
+      "4. No deployment or repo needed\n\n" +
+      "IMPORTANT RULES:\n" +
+      "- ALWAYS use tools. Never just describe what you'd do.\n" +
+      "- If a tool fails, try a different approach. Don't give up on first error.\n" +
+      "- If building an app, complete the full build-deploy cycle.\n" +
+      "- Partial real results are better than no results. Deliver what you can.\n" +
+      "- If deploy fails, still push to GitHub and register the project.";
 
     // Project edit mode: inject existing project context
     let rawInputCheck = task.input_data;
@@ -1630,21 +1689,58 @@ async function main() {
 
   await log("Loop finished: " + result.status + " in " + result.turns + " turn(s), " + result.toolCalls.length + " tool call(s)");
 
-  // 10. Quality review for delegated tasks
+  // 10. Quality review for delegated tasks (with retry loop)
   const isDelegated = task.source === "agent" && task.parent_task_id;
   let finalText = result.text;
   let finalStatus = result.status === "completed" ? "completed" : "failed";
   let reviewSummary = null;
 
   if (isDelegated && result.status === "completed") {
-    const review = await reviewResult(agentSlug, instruction, result.text, result.status, result.toolCalls);
-    if (review.accepted) {
-      reviewSummary = review.summary;
-      await log("Review: ACCEPTED", "review_accepted");
-    } else {
-      finalStatus = "failed";
-      finalText = "Rejected by review: " + review.summary;
-      await log("Review: REJECTED — " + review.summary, "review_rejected");
+    const MAX_REVIEW_RETRIES = 2;
+    let reviewAttempt = 0;
+    let currentResult = result;
+
+    while (reviewAttempt <= MAX_REVIEW_RETRIES) {
+      const review = await reviewResult(agentSlug, instruction, currentResult.text, currentResult.status, currentResult.toolCalls);
+      if (review.accepted) {
+        reviewSummary = review.summary;
+        finalText = currentResult.text;
+        finalStatus = "completed";
+        await log("Review: ACCEPTED" + (reviewAttempt > 0 ? " (after " + reviewAttempt + " revision(s))" : ""), "review_accepted");
+        break;
+      }
+
+      reviewAttempt++;
+      if (reviewAttempt > MAX_REVIEW_RETRIES) {
+        finalStatus = "failed";
+        finalText = "Rejected after " + MAX_REVIEW_RETRIES + " revision attempts. Last rejection: " + review.summary;
+        await log("Review: FINAL REJECT after " + MAX_REVIEW_RETRIES + " retries — " + review.summary, "review_rejected");
+        break;
+      }
+
+      await log("Review: REJECTED (attempt " + reviewAttempt + "/" + MAX_REVIEW_RETRIES + ") — " + review.summary + ". Sending back for revision.", "review_retry");
+
+      const revisionMessages = [...messages];
+      revisionMessages.push({
+        role: "user",
+        content: "YOUR WORK WAS REVIEWED AND REJECTED. Here is the feedback:\n\n" +
+          "REJECTION REASON: " + review.summary + "\n\n" +
+          "You MUST fix these issues and try again. Use your tools to actually do the work — don't just describe what you would do. " +
+          "Your previous response was:\n" + currentResult.text.slice(0, 2000) + "\n\n" +
+          "Fix the problems and deliver real, complete results this time.",
+      });
+
+      const retryResult = await runLoop(model, systemPrompt, revisionMessages, tools, 10, temperature, mcpServers, 0, currentResult.toolCalls);
+      await log("Revision loop done: " + retryResult.status + " in " + retryResult.turns + " turns", "review_revision_done");
+
+      if (retryResult.status !== "completed") {
+        finalStatus = "failed";
+        finalText = "Failed during revision attempt " + reviewAttempt + ": " + retryResult.text;
+        await log("Revision attempt " + reviewAttempt + " failed: " + retryResult.status, "review_revision_failed");
+        break;
+      }
+
+      currentResult = retryResult;
     }
   }
 
@@ -1689,7 +1785,7 @@ async function main() {
   }
 
   const failReason = finalStatus === "failed"
-    ? (result.status === "max_turns" ? "Max turns reached" : result.text.slice(0, 500))
+    ? (result.status === "max_turns" ? "Max turns reached" : finalText.slice(0, 500))
     : null;
 
   await sbPatch("tasks", {
@@ -1714,13 +1810,49 @@ async function main() {
   await log("Results written. Task " + finalStatus + ".", "task_" + (finalStatus === "completed" ? "complete" : "failed"));
 
   // 12. Child tasks are already inserted as 'pending' by delegate_task.
-  // The Railway worker (or Vercel handler) picks them up automatically.
   if (childTasks.length > 0) {
     await log(childTasks.length + " child task(s) queued for pickup: " +
       childTasks.map(c => c.taskId.slice(0, 8)).join(", "));
   }
 
-  // 13. Handoff chain: if this task has a next_agent, auto-create the follow-up task
+  // 13. Auto-retry for failed delegated tasks
+  const taskMeta2 = task.metadata || {};
+  const retryCount = taskMeta2.auto_retry_count || 0;
+  const MAX_AUTO_RETRIES = 2;
+
+  if (isDelegated && finalStatus === "failed" && retryCount < MAX_AUTO_RETRIES) {
+    await log("Auto-retrying failed delegated task (attempt " + (retryCount + 1) + "/" + MAX_AUTO_RETRIES + ")", "auto_retry");
+
+    const retryTask = await sbInsert("tasks", {
+      title: task.title,
+      description: task.description,
+      agent_definition_id: task.agent_definition_id,
+      conversation_id: CONVERSATION_ID,
+      parent_task_id: task.parent_task_id || TASK_ID,
+      company_id: companyId,
+      status: "pending",
+      input_data: {
+        instruction: instruction + "\n\nIMPORTANT CONTEXT: A previous attempt at this task FAILED with this error:\n" +
+          failReason + "\n\nYou MUST avoid this same mistake. Adjust your approach and try a different strategy.",
+        context: (typeof task.input_data === "object" ? task.input_data?.context : "") || "",
+      },
+      metadata: { ...taskMeta2, auto_retry_count: retryCount + 1, previous_task_id: TASK_ID },
+      source: "agent",
+    });
+
+    if (retryTask?.[0]?.id) {
+      await log("Retry task created: " + retryTask[0].id.slice(0, 8), "auto_retry_created");
+      await sbInsert("chat_messages", {
+        conversation_id: CONVERSATION_ID,
+        role: "orchestrator",
+        content: "Task failed — automatically retrying with adjusted approach (attempt " + (retryCount + 1) + "/" + MAX_AUTO_RETRIES + ").",
+        timestamp: new Date().toISOString(),
+        metadata: { notification: true, retry: true, original_task_id: TASK_ID },
+      });
+    }
+  }
+
+  // 14. Handoff chain: if this task has a next_agent, auto-create the follow-up task
   const handoff = (task.metadata || {}).handoff;
   if (handoff?.next_agent && finalStatus === "completed") {
     const nextAgentDef = await sbGet("agent_definitions", {

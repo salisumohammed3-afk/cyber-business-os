@@ -1107,7 +1107,15 @@ async function runLoop(model, systemPrompt, messages, tools, maxTurns, temperatu
   const MAX_FAIL_RETRIES = 2;
 
   for (let turn = startTurn; turn < maxTurns; turn++) {
+    const turnsLeft = maxTurns - turn - 1;
     await log("Turn " + (turn + 1) + "/" + maxTurns + " — calling " + model);
+
+    if (turnsLeft <= 2 && turn > 2) {
+      const urgency = turnsLeft === 0
+        ? "THIS IS YOUR FINAL TURN. You MUST produce your final answer NOW as text. Do NOT use any more tools."
+        : "You have only " + turnsLeft + " turn(s) remaining. Start wrapping up — produce your final answer with the results you have so far. Partial results are acceptable.";
+      messages.push({ role: "user", content: "[SYSTEM] " + urgency });
+    }
 
     const response = await callClaude(model, systemPrompt, messages, tools, 4096, temperature, mcpServers);
 

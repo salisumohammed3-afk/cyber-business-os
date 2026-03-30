@@ -615,11 +615,10 @@ async function toolRecallMemories(input) {
   });
   if (companyId) params.set("company_id", "eq." + companyId);
   if (input.category) params.set("category", "eq." + input.category);
-  // Full-text search with stemming; falls back to ilike if query is very short
-  const q = (input.query || "").trim();
+  const q = (input.query || "").trim().replace(/[^a-zA-Z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
   if (q.length > 2) {
     params.set("fts", "websearch." + q);
-  } else {
+  } else if (q.length > 0) {
     params.set("content", "ilike.*" + q + "*");
   }
   // Exclude expired memories
@@ -1130,7 +1129,14 @@ async function runLoop(model, systemPrompt, messages, tools, maxTurns, temperatu
       const urgency = turnsLeft === 0
         ? "THIS IS YOUR FINAL TURN. You MUST produce your final answer NOW as text. Do NOT use any more tools."
         : "You have only " + turnsLeft + " turn(s) remaining. Start wrapping up — produce your final answer with the results you have so far. Partial results are acceptable.";
-      messages.push({ role: "user", content: "[SYSTEM] " + urgency });
+      const lastMsg = messages[messages.length - 1];
+      if (lastMsg && lastMsg.role === "user" && typeof lastMsg.content === "string") {
+        lastMsg.content += "\n\n[SYSTEM] " + urgency;
+      } else if (lastMsg && lastMsg.role === "user" && Array.isArray(lastMsg.content)) {
+        lastMsg.content.push({ type: "text", text: "\n\n[SYSTEM] " + urgency });
+      } else {
+        messages.push({ role: "user", content: "[SYSTEM] " + urgency });
+      }
     }
 
     const response = await callClaude(model, systemPrompt, messages, tools, 4096, temperature, mcpServers);
@@ -1161,7 +1167,7 @@ async function runLoop(model, systemPrompt, messages, tools, maxTurns, temperatu
               "4. If you're stuck on one approach, try a completely different approach\n" +
               "5. Deliver PARTIAL results — something useful is better than nothing\n\n" +
               "Only call fail_task again if you've truly exhausted ALL alternatives.",
-          }]);
+          }]});
           allToolCalls.push({ tool: "fail_task", input: failBlock.input, output: "(pushed back)", source: "local" });
           continue;
         }
@@ -1670,7 +1676,7 @@ async function main() {
   }
 
   // 8. Inject relevant memories (full-text search, all keywords, expiry-aware)
-  const keywords = instruction.split(/\s+/).filter(w => w.length > 3).slice(0, 8);
+  const keywords = instruction.split(/\s+/).filter(w => w.length > 3).map(w => w.replace(/[^a-zA-Z0-9]/g, "")).filter(Boolean).slice(0, 8);
   if (keywords.length > 0) {
     const ftsQuery = keywords.join(" or ");
     const memParams = new URLSearchParams({

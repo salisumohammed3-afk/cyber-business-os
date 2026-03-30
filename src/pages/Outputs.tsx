@@ -12,9 +12,20 @@ import {
   Database,
   ChevronRight,
   Pencil,
+  Download,
+  Copy,
+  Check,
+  X,
 } from "lucide-react";
+import ReactMarkdown from "react-markdown";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent } from "@/components/ui/card";
+import {
+  Sheet,
+  SheetContent,
+  SheetHeader,
+  SheetTitle,
+} from "@/components/ui/sheet";
 import { supabase } from "@/integrations/supabase/client";
 import { useCompany } from "@/contexts/CompanyContext";
 
@@ -38,6 +49,7 @@ interface Document {
   agent_name: string;
   result_type: string;
   summary: string;
+  fullText: string;
   created_at: string;
 }
 
@@ -106,9 +118,9 @@ function ProjectCard({ project }: { project: Project }) {
   );
 }
 
-function DocumentCard({ doc }: { doc: Document }) {
+function DocumentCard({ doc, onClick }: { doc: Document; onClick: () => void }) {
   return (
-    <Card className="hover:border-blue-300 transition-colors">
+    <Card className="hover:border-blue-300 transition-colors cursor-pointer" onClick={onClick}>
       <CardContent className="pt-4 pb-3 space-y-1.5">
         <div className="flex items-start justify-between">
           <div className="flex items-center gap-2">
@@ -118,13 +130,30 @@ function DocumentCard({ doc }: { doc: Document }) {
           <Badge variant="outline" className="text-[10px] shrink-0">{doc.agent_name}</Badge>
         </div>
         <p className="text-xs text-muted-foreground line-clamp-3 pl-5">{doc.summary}</p>
-        <div className="pl-5 text-[10px] text-muted-foreground flex items-center gap-1">
-          <Clock size={9} />
-          {new Date(doc.created_at).toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" })}
+        <div className="pl-5 flex items-center justify-between">
+          <span className="text-[10px] text-muted-foreground flex items-center gap-1">
+            <Clock size={9} />
+            {new Date(doc.created_at).toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" })}
+          </span>
+          <span className="text-[10px] text-blue-500 font-medium flex items-center gap-0.5">
+            Preview <ChevronRight size={10} />
+          </span>
         </div>
       </CardContent>
     </Card>
   );
+}
+
+function downloadMarkdown(filename: string, content: string) {
+  const blob = new Blob([content], { type: "text/markdown;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 80) + ".md";
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
 }
 
 export default function Outputs() {
@@ -135,6 +164,8 @@ export default function Outputs() {
   const [documents, setDocuments] = useState<Document[]>([]);
   const [loadingP, setLoadingP] = useState(true);
   const [loadingD, setLoadingD] = useState(true);
+  const [previewDoc, setPreviewDoc] = useState<Document | null>(null);
+  const [copied, setCopied] = useState(false);
 
   const fetchProjects = useCallback(async () => {
     if (!company) return;
@@ -191,6 +222,7 @@ export default function Outputs() {
         agent_name: task?.agent_definition_id ? (agentMap[task.agent_definition_id] || "Agent") : "Agent",
         result_type: r.result_type,
         summary: response.slice(0, 300),
+        fullText: response,
         created_at: r.created_at,
       };
     });
@@ -258,7 +290,9 @@ export default function Outputs() {
                 </p>
               </div>
             ) : (
-              filteredDocs.map((doc) => <DocumentCard key={doc.id} doc={doc} />)
+              filteredDocs.map((doc) => (
+                <DocumentCard key={doc.id} doc={doc} onClick={() => setPreviewDoc(doc)} />
+              ))
             )}
           </div>
         </div>
@@ -288,6 +322,58 @@ export default function Outputs() {
           </div>
         </div>
       </div>
+
+      {/* Document preview sheet */}
+      <Sheet open={!!previewDoc} onOpenChange={(open) => { if (!open) setPreviewDoc(null); }}>
+        <SheetContent side="right" className="w-[600px] sm:max-w-[600px] flex flex-col p-0">
+          <SheetHeader className="px-6 pt-5 pb-3 border-b shrink-0">
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0 flex-1">
+                <SheetTitle className="text-sm font-semibold leading-tight line-clamp-2">
+                  {previewDoc?.task_title}
+                </SheetTitle>
+                <div className="flex items-center gap-2 mt-1.5">
+                  <Badge variant="outline" className="text-[10px]">{previewDoc?.agent_name}</Badge>
+                  <span className="text-[10px] text-muted-foreground">
+                    {previewDoc && new Date(previewDoc.created_at).toLocaleDateString("en-GB", {
+                      day: "numeric", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit",
+                    })}
+                  </span>
+                </div>
+              </div>
+            </div>
+            <div className="flex items-center gap-2 mt-3">
+              <button
+                onClick={() => {
+                  if (previewDoc) {
+                    navigator.clipboard.writeText(previewDoc.fullText);
+                    setCopied(true);
+                    setTimeout(() => setCopied(false), 2000);
+                  }
+                }}
+                className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md border hover:bg-secondary transition-colors"
+              >
+                {copied ? <Check size={12} className="text-emerald-500" /> : <Copy size={12} />}
+                {copied ? "Copied" : "Copy"}
+              </button>
+              <button
+                onClick={() => {
+                  if (previewDoc) downloadMarkdown(previewDoc.task_title, previewDoc.fullText);
+                }}
+                className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md border hover:bg-secondary transition-colors"
+              >
+                <Download size={12} />
+                Download .md
+              </button>
+            </div>
+          </SheetHeader>
+          <div className="flex-1 overflow-y-auto px-6 py-4">
+            <div className="prose prose-sm prose-gray max-w-none [&_p]:my-1.5 [&_ul]:my-1.5 [&_ol]:my-1.5 [&_li]:my-0.5 [&_h1]:text-lg [&_h1]:font-bold [&_h1]:mt-4 [&_h1]:mb-2 [&_h2]:text-base [&_h2]:font-semibold [&_h2]:mt-3 [&_h2]:mb-1.5 [&_h3]:text-sm [&_h3]:font-semibold [&_h3]:mt-2 [&_code]:text-xs [&_pre]:text-xs [&_pre]:bg-slate-50 [&_pre]:p-3 [&_pre]:rounded-md [&_hr]:my-3 [&_table]:text-xs [&_th]:px-2 [&_th]:py-1 [&_td]:px-2 [&_td]:py-1 [&_blockquote]:border-l-2 [&_blockquote]:pl-3 [&_blockquote]:text-muted-foreground">
+              <ReactMarkdown>{previewDoc?.fullText ?? ""}</ReactMarkdown>
+            </div>
+          </div>
+        </SheetContent>
+      </Sheet>
     </div>
   );
 }

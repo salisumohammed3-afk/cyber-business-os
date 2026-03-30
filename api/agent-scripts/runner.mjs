@@ -115,6 +115,23 @@ async function callClaude(model, system, messages, tools, maxTokens = 4096, temp
 
     const is429 = resp.status === 429;
     const is5xx = resp.status >= 500;
+    const errBody = await resp.text().catch(() => "");
+
+    if (resp.status === 400 && mcpServers.length > 0 && errBody.includes("MCP")) {
+      await log("MCP server error — retrying WITHOUT MCP tools: " + errBody.slice(0, 200), "mcp_fallback");
+      mcpServers = [];
+      delete headers["anthropic-beta"];
+      const bodyNoMcp = { model, max_tokens: maxTokens, temperature, system, messages, ...(tools.length > 0 ? { tools } : {}) };
+      const resp2 = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: { "x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json" },
+        body: JSON.stringify(bodyNoMcp),
+      });
+      if (resp2.ok) return await resp2.json();
+      const errBody2 = await resp2.text().catch(() => "");
+      throw new Error("Anthropic " + resp2.status + " (MCP fallback): " + errBody2.slice(0, 300));
+    }
+
     if ((is429 || is5xx) && attempt < MAX_RETRIES) {
       const wait = is429 ? attempt * 15000 : attempt * 5000;
       await log("API " + resp.status + " — retry " + (attempt + 1) + "/" + MAX_RETRIES + " in " + (wait / 1000) + "s", "provider_error", {
@@ -124,7 +141,6 @@ async function callClaude(model, system, messages, tools, maxTokens = 4096, temp
       await sleep(wait);
       continue;
     }
-    const errBody = await resp.text().catch(() => "");
     throw new Error("Anthropic " + resp.status + ": " + errBody.slice(0, 300));
   }
 }

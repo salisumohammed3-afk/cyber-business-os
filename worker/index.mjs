@@ -12,7 +12,7 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
 const POLL_INTERVAL = parseInt(process.env.POLL_INTERVAL || "5000", 10);
 const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT || "2", 10);
-const STUCK_TIMEOUT_MIN = parseInt(process.env.STUCK_TIMEOUT_MIN || "65", 10);
+const STUCK_TIMEOUT_MIN = parseInt(process.env.STUCK_TIMEOUT_MIN || "10", 10);
 const TASK_WORKDIR_ROOT = process.env.TASK_WORKDIR || "/tmp/agent-tasks";
 
 if (!SUPABASE_URL || !SUPABASE_KEY) {

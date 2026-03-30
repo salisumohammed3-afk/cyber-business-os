@@ -1116,19 +1116,29 @@ async function saveCheckpoint(messages, turn, allToolCalls) {
   }
 }
 
-async function runLoop(model, systemPrompt, messages, tools, maxTurns, temperature, mcpServers = [], startTurn = 0, existingToolCalls = []) {
+async function runLoop(model, systemPrompt, messages, tools, timeBudgetMs, temperature, mcpServers = [], existingToolCalls = []) {
   const allToolCalls = [...existingToolCalls];
   let failAttempts = 0;
   const MAX_FAIL_RETRIES = 2;
+  const HARD_TURN_CAP = 200;
+  const startTime = Date.now();
+  let turn = 0;
 
-  for (let turn = startTurn; turn < maxTurns; turn++) {
-    const turnsLeft = maxTurns - turn - 1;
-    await log("Turn " + (turn + 1) + "/" + maxTurns + " — calling " + model);
+  function timeLeft() { return timeBudgetMs - (Date.now() - startTime); }
+  function elapsed() { return Math.round((Date.now() - startTime) / 1000); }
 
-    if (turnsLeft <= 2 && turn > 2) {
-      const urgency = turnsLeft === 0
-        ? "THIS IS YOUR FINAL TURN. You MUST produce your final answer NOW as text. Do NOT use any more tools."
-        : "You have only " + turnsLeft + " turn(s) remaining. Start wrapping up — produce your final answer with the results you have so far. Partial results are acceptable.";
+  while (turn < HARD_TURN_CAP) {
+    const remaining = timeLeft();
+    if (remaining <= 0) break;
+
+    turn++;
+    await log("Step " + turn + " (" + elapsed() + "s elapsed, " + Math.round(remaining / 1000) + "s left) — calling " + model);
+
+    // Warn when genuinely running low on time (< 60s left, and we've been working for a while)
+    if (remaining < 60000 && turn > 2) {
+      const urgency = remaining < 15000
+        ? "THIS IS YOUR FINAL STEP. You MUST produce your final answer NOW as text. Do NOT use any more tools."
+        : "You have less than a minute left. Wrap up — produce your final answer with the results you have so far. Partial results are acceptable.";
       const lastMsg = messages[messages.length - 1];
       if (lastMsg && lastMsg.role === "user" && typeof lastMsg.content === "string") {
         lastMsg.content += "\n\n[SYSTEM] " + urgency;
@@ -1153,12 +1163,12 @@ async function runLoop(model, systemPrompt, messages, tools, maxTurns, temperatu
       const failBlock = toolBlocks.find(b => b.name === "fail_task");
       if (failBlock) {
         failAttempts++;
-        if (failAttempts <= MAX_FAIL_RETRIES && turn + 2 < maxTurns) {
+        if (failAttempts <= MAX_FAIL_RETRIES && timeLeft() > 30000) {
           await log("Agent wants to give up (attempt " + failAttempts + "/" + MAX_FAIL_RETRIES + ") — pushing back", "fail_pushback");
           messages.push({ role: "assistant", content: response.content });
           messages.push({ role: "user", content: [{
             type: "tool_result", tool_use_id: failBlock.id,
-            content: "HOLD ON — Do not give up yet. You have " + (maxTurns - turn - 1) + " turns remaining. " +
+            content: "HOLD ON — Do not give up yet. You still have time. " +
               "Reason you wanted to fail: " + (failBlock.input.reason || "unknown") + "\n\n" +
               "Before failing, try these recovery strategies:\n" +
               "1. If a tool errored, try an alternative tool or different parameters\n" +
@@ -1176,7 +1186,7 @@ async function runLoop(model, systemPrompt, messages, tools, maxTurns, temperatu
           text: failBlock.input.reason || "Agent could not complete",
           partial: failBlock.input.partial_result,
           toolCalls: allToolCalls,
-          turns: turn + 1,
+          turns: turn,
         };
       }
 
@@ -1197,7 +1207,7 @@ async function runLoop(model, systemPrompt, messages, tools, maxTurns, temperatu
 
       messages.push({ role: "user", content: results });
 
-      await saveCheckpoint(messages, turn + 1, allToolCalls);
+      await saveCheckpoint(messages, turn, allToolCalls);
       continue;
     }
 
@@ -1206,14 +1216,18 @@ async function runLoop(model, systemPrompt, messages, tools, maxTurns, temperatu
       .map(b => b.text)
       .join("") || "Task completed but no text output was produced.";
 
-    return { status: "completed", text, toolCalls: allToolCalls, turns: turn + 1 };
+    return { status: "completed", text, toolCalls: allToolCalls, turns: turn };
   }
 
+  const reason = timeLeft() <= 0
+    ? "Time budget expired (" + Math.round(timeBudgetMs / 1000) + "s)"
+    : "Hit safety cap (" + HARD_TURN_CAP + " steps)";
+
   return {
-    status: "max_turns",
-    text: "Hit maximum turns (" + maxTurns + "). Tools used: " + allToolCalls.map(t => t.tool).join(", "),
+    status: "time_expired",
+    text: reason + " after " + turn + " steps. Tools used: " + allToolCalls.map(t => t.tool).join(", "),
     toolCalls: allToolCalls,
-    turns: maxTurns,
+    turns: turn,
   };
 }
 
@@ -1450,7 +1464,8 @@ async function main() {
   let systemPrompt = "";
   let model = "claude-sonnet-4-20250514";
   let temperature = 0.7;
-  let maxTurns = 20;
+  const DEFAULT_TIME_BUDGET_MS = 5 * 60 * 1000; // 5 minutes
+  let timeBudgetMs = DEFAULT_TIME_BUDGET_MS;
   let agentDefId = null;
 
   let defId = task.agent_definition_id;
@@ -1466,7 +1481,11 @@ async function main() {
       systemPrompt = def.system_prompt || systemPrompt;
       model = def.model || model;
       temperature = parseFloat(def.temperature) || temperature;
-      maxTurns = def.max_turns || maxTurns;
+      if (def.time_budget_seconds) {
+        timeBudgetMs = def.time_budget_seconds * 1000;
+      } else if (def.max_turns) {
+        timeBudgetMs = Math.max(def.max_turns * 30 * 1000, DEFAULT_TIME_BUDGET_MS);
+      }
       agentDefId = def.id;
       agentSlug = def.slug || "unknown";
       await log("Agent: " + def.name + " (" + agentSlug + ") — model: " + model, "agent_loaded");
@@ -1698,24 +1717,21 @@ async function main() {
   }
 
   // 9. Check for checkpoint (resume from previous run)
-  let startTurn = 0;
   let existingToolCalls = [];
   const taskMeta = task.metadata || {};
   const checkpoint = taskMeta.checkpoint;
 
   if (checkpoint && checkpoint.messages && checkpoint.messages.length > 0) {
-    const resumeTurn = checkpoint.turn || 0;
-    await log("Resuming from checkpoint at turn " + resumeTurn + " (" + (checkpoint.tools_used || []).join(", ") + ")", "checkpoint_resume");
+    await log("Resuming from checkpoint (" + (checkpoint.tools_used || []).join(", ") + ")", "checkpoint_resume");
     messages.length = 0;
     for (const m of checkpoint.messages) messages.push(m);
-    startTurn = resumeTurn;
     existingToolCalls = (checkpoint.tools_used || []).map(t => ({ tool: t, input: {}, output: "(from checkpoint)", source: "checkpoint" }));
   }
 
-  await log("Starting agentic loop — " + tools.length + " tools, " + mcpServers.length + " MCP servers, max " + maxTurns + " turns" + (startTurn > 0 ? " (resuming from turn " + startTurn + ")" : ""), "loop_start");
+  await log("Starting agentic loop — " + tools.length + " tools, " + mcpServers.length + " MCP servers, " + Math.round(timeBudgetMs / 1000) + "s time budget", "loop_start");
 
   // 10. Run the loop
-  const result = await runLoop(model, systemPrompt, messages, tools, maxTurns, temperature, mcpServers, startTurn, existingToolCalls);
+  const result = await runLoop(model, systemPrompt, messages, tools, timeBudgetMs, temperature, mcpServers, existingToolCalls);
 
   await log("Loop finished: " + result.status + " in " + result.turns + " turn(s), " + result.toolCalls.length + " tool call(s)");
 
@@ -1760,7 +1776,8 @@ async function main() {
           "Fix the problems and deliver real, complete results this time.",
       });
 
-      const retryResult = await runLoop(model, systemPrompt, revisionMessages, tools, 10, temperature, mcpServers, 0, currentResult.toolCalls);
+      const REVISION_TIME_BUDGET = 3 * 60 * 1000; // 3 minutes per revision
+      const retryResult = await runLoop(model, systemPrompt, revisionMessages, tools, REVISION_TIME_BUDGET, temperature, mcpServers, currentResult.toolCalls);
       await log("Revision loop done: " + retryResult.status + " in " + retryResult.turns + " turns", "review_revision_done");
 
       if (retryResult.status !== "completed") {
@@ -1815,7 +1832,7 @@ async function main() {
   }
 
   const failReason = finalStatus === "failed"
-    ? (result.status === "max_turns" ? "Max turns reached" : finalText.slice(0, 500))
+    ? (result.status === "time_expired" ? "Time budget expired" : finalText.slice(0, 500))
     : null;
 
   await sbPatch("tasks", {

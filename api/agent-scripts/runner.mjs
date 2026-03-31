@@ -1233,44 +1233,77 @@ async function runLoop(model, systemPrompt, messages, tools, timeBudgetMs, tempe
 
 // ── Quality review (for delegated tasks) ────────────────────────────────────
 
-async function verifyEngineering(toolCalls, instruction) {
+async function verifyUrl(url, label) {
+  try {
+    let r = await fetch(url, { method: "GET", redirect: "follow", signal: AbortSignal.timeout(15000) });
+    if (r.ok) return { pass: true, msg: label + " is live (" + url + " → " + r.status + ")" };
+    if (r.status === 401 && url.includes("-team-")) {
+      const prodUrl = url.replace(/-[a-z0-9]+-team-[^.]+\.vercel\.app/, ".vercel.app");
+      if (prodUrl !== url) {
+        const r2 = await fetch(prodUrl, { method: "GET", redirect: "follow", signal: AbortSignal.timeout(10000) });
+        if (r2.ok) return { pass: true, msg: label + " is live (" + prodUrl + " → " + r2.status + ")" };
+      }
+    }
+    return { pass: false, msg: label + " returned " + r.status + " (" + url + ")" };
+  } catch (e) {
+    return { pass: false, msg: label + " unreachable: " + (e.message || "timeout").slice(0, 80) };
+  }
+}
+
+async function verifyEngineering(toolCalls, instruction, resultText) {
   const checks = [];
   const lcInstruction = (instruction || "").toLowerCase();
 
-  const isBuildTask = /\b(build|create|deploy|app|site|website|tool|calculator|timer|game|dashboard|todo|to-do)\b/i.test(lcInstruction);
+  const isBuildTask = /\b(build|create|deploy|make|app|site|website|tool|calculator|timer|game|dashboard|todo|to-do|page|landing)\b/i.test(lcInstruction);
   const isAnalysisTask = /\b(analy[sz]e|review|audit|assess|research|investigate|document|report|reskin|presentation|brief)\b/i.test(lcInstruction);
 
-  const sandboxTools = toolCalls.filter(t =>
-    t.tool.startsWith("sandbox_") || t.tool === "github_push_file" || t.tool === "github_create_repo" || t.tool === "deploy_static_site"
-  );
-
   if (isBuildTask) {
-    if (sandboxTools.length === 0) {
-      checks.push({ pass: false, msg: "No sandbox/GitHub/deploy tool calls — agent didn't build anything" });
-    } else {
-      checks.push({ pass: true, msg: sandboxTools.length + " build/push tool calls made" });
-    }
+    // For build tasks, the ONLY thing that matters is: does a working output exist?
+    let hasLiveUrl = false;
+    let liveUrl = "";
 
+    // Check registered project
     const projects = await sbGet("projects", { created_by_task_id: "eq." + TASK_ID });
     if (projects?.length) {
       const p = projects[0];
-      checks.push({ pass: true, msg: "Project registered: " + p.name });
       if (p.deploy_url) {
-        try {
-          let url = p.deploy_url;
-          let r = await fetch(url, { method: "HEAD", redirect: "follow", signal: AbortSignal.timeout(10000) });
-          if (r.status === 401 && url.includes("-team-")) {
-            const prodUrl = url.replace(/-[a-z0-9]+-team-[^.]+\.vercel\.app/, ".vercel.app");
-            if (prodUrl !== url) {
-              const r2 = await fetch(prodUrl, { method: "HEAD", redirect: "follow", signal: AbortSignal.timeout(10000) });
-              if (r2.ok) { r = r2; url = prodUrl; }
-            }
-          }
-          checks.push({ pass: r.ok, msg: "Deploy URL " + url + " → " + r.status });
-        } catch (e) {
-          checks.push({ pass: false, msg: "Deploy URL unreachable: " + (e.message || "").slice(0, 80) });
-        }
+        const urlCheck = await verifyUrl(p.deploy_url, "Deploy URL");
+        checks.push(urlCheck);
+        if (urlCheck.pass) { hasLiveUrl = true; liveUrl = p.deploy_url; }
       }
+      if (p.repo_url) {
+        const repoCheck = await verifyUrl(p.repo_url, "GitHub repo");
+        checks.push(repoCheck);
+      }
+    }
+
+    // Also check URLs mentioned in the result text or deploy tool outputs
+    if (!hasLiveUrl) {
+      const deployCall = toolCalls.find(t => t.tool === "deploy_static_site");
+      if (deployCall) {
+        try {
+          const out = typeof deployCall.output === "string" ? JSON.parse(deployCall.output) : deployCall.output;
+          if (out?.url) {
+            const urlCheck = await verifyUrl(out.url, "Deployed site");
+            checks.push(urlCheck);
+            if (urlCheck.pass) { hasLiveUrl = true; liveUrl = out.url; }
+          }
+        } catch {}
+      }
+    }
+
+    // Check GitHub Pages URLs from result text
+    if (!hasLiveUrl) {
+      const ghPagesMatch = resultText.match(/https:\/\/[a-zA-Z0-9-]+\.github\.io\/[^\s)]+/);
+      if (ghPagesMatch) {
+        const urlCheck = await verifyUrl(ghPagesMatch[0], "GitHub Pages");
+        checks.push(urlCheck);
+        if (urlCheck.pass) { hasLiveUrl = true; liveUrl = ghPagesMatch[0]; }
+      }
+    }
+
+    if (!hasLiveUrl) {
+      checks.push({ pass: false, msg: "NO WORKING LIVE URL — build tasks must produce a usable output link that loads" });
     }
   } else if (isAnalysisTask) {
     if (toolCalls.length === 0) {
@@ -1278,11 +1311,14 @@ async function verifyEngineering(toolCalls, instruction) {
     } else {
       checks.push({ pass: true, msg: toolCalls.length + " tool calls made for analysis/research work" });
     }
+    if (resultText.length < 300) {
+      checks.push({ pass: false, msg: "Analysis output too short (" + resultText.length + " chars) — not a real deliverable" });
+    }
   } else {
-    if (toolCalls.length >= 1) {
-      checks.push({ pass: true, msg: toolCalls.length + " tool calls made" });
-    } else {
+    if (toolCalls.length < 1) {
       checks.push({ pass: false, msg: "No tools used — agent described work instead of doing it" });
+    } else {
+      checks.push({ pass: true, msg: toolCalls.length + " tool calls made" });
     }
   }
 
@@ -1294,23 +1330,44 @@ async function verifyResearch(resultText, toolCalls) {
 
   const searchCalls = toolCalls.filter(t => t.tool === "web_search" || t.tool === "composio_execute");
   if (searchCalls.length === 0) {
-    checks.push({ pass: false, msg: "No search or external tool calls — agent didn't actually research" });
+    checks.push({ pass: false, msg: "No search or external tool calls — agent didn't actually research anything" });
   } else {
     checks.push({ pass: true, msg: searchCalls.length + " search/external tool calls made" });
   }
 
-  const urlPattern = /https?:\/\/[^\s)]+/g;
-  const urls = resultText.match(urlPattern) || [];
-  if (urls.length === 0 && searchCalls.length === 0) {
-    checks.push({ pass: false, msg: "No URLs cited AND no search tools used" });
-  } else if (urls.length > 0) {
-    checks.push({ pass: true, msg: urls.length + " source URL(s) cited" });
+  // Research output must be substantial
+  if (resultText.length < 500) {
+    checks.push({ pass: false, msg: "Research output too short (" + resultText.length + " chars) — not a real deliverable" });
   } else {
-    checks.push({ pass: true, msg: "Agent used " + searchCalls.length + " search calls (URLs not in final text but research was done)" });
+    checks.push({ pass: true, msg: "Substantial output (" + resultText.length + " chars)" });
   }
 
-  if (resultText.length < 200) {
-    checks.push({ pass: false, msg: "Response too short (" + resultText.length + " chars) for a research task" });
+  // Must contain real data, not just descriptions of what the agent would research
+  const wouldDoPatterns = /\b(I would|I could|I suggest|here's what I'd|I recommend researching|I can help with)\b/i;
+  const hasRealData = /\b(\d{4}|million|billion|\$\d|%|founded|revenue|market|growth|report)\b/i;
+  if (wouldDoPatterns.test(resultText.slice(0, 500)) && !hasRealData.test(resultText)) {
+    checks.push({ pass: false, msg: "Output reads like suggestions, not actual research with data" });
+  }
+
+  return checks;
+}
+
+async function verifyDeliverables(toolCalls, resultText) {
+  const checks = [];
+
+  // Verify any URLs that appear in deliverables actually work
+  const urlPattern = /https?:\/\/[^\s)>"]+/g;
+  const allUrls = [...new Set((resultText.match(urlPattern) || []).filter(u =>
+    !u.includes("api.anthropic.com") && !u.includes("supabase.co") && !u.includes("api.github.com")
+  ))];
+
+  const importantUrls = allUrls.filter(u =>
+    u.includes("github.io") || u.includes("vercel.app") || u.includes("netlify.app") ||
+    u.includes("docs.google.com") || u.includes("sheets.google.com")
+  );
+
+  for (const url of importantUrls.slice(0, 3)) {
+    checks.push(await verifyUrl(url, "Output link"));
   }
 
   return checks;
@@ -1321,53 +1378,63 @@ async function reviewResult(agentName, instruction, resultText, resultStatus, to
     let verificationChecks = [];
 
     if (agentSlug === "engineering") {
-      verificationChecks = await verifyEngineering(toolCalls || [], instruction);
+      verificationChecks = await verifyEngineering(toolCalls || [], instruction, resultText);
     } else if (agentSlug === "research" || agentSlug === "growth") {
       verificationChecks = await verifyResearch(resultText, toolCalls || []);
     }
 
+    // Also verify any important deliverable URLs in the output
+    const deliverableChecks = await verifyDeliverables(toolCalls || [], resultText);
+    verificationChecks.push(...deliverableChecks);
+
     const hardFails = verificationChecks.filter(c => !c.pass);
+    const passes = verificationChecks.filter(c => c.pass);
+
     if (hardFails.length > 0) {
       const failSummary = hardFails.map(f => f.msg).join("; ");
       await log("Verification FAILED: " + failSummary, "review_verification");
-      return { accepted: false, summary: "Failed verification: " + failSummary };
+      return { accepted: false, summary: "Output verification failed: " + failSummary };
     }
 
-    if (verificationChecks.length > 0) {
-      await log("Verification passed: " + verificationChecks.map(c => c.msg).join(", "), "review_verification");
+    if (passes.length > 0) {
+      await log("Verification passed: " + passes.map(c => c.msg).join(", "), "review_verification");
     }
 
     const verificationContext = verificationChecks.length > 0
-      ? "\n\nAutomated checks (all passed):\n" + verificationChecks.map(c => "✓ " + c.msg).join("\n")
+      ? "\n\nAutomated output checks (all passed):\n" + verificationChecks.map(c => "✓ " + c.msg).join("\n")
       : "";
 
     const toolsSummary = (toolCalls || []).length > 0
-      ? "\n\nTools the agent actually used: " + [...new Set((toolCalls || []).map(t => t.tool))].join(", ") + " (" + toolCalls.length + " total calls)"
+      ? "\n\nTools used: " + [...new Set((toolCalls || []).map(t => t.tool))].join(", ") + " (" + toolCalls.length + " total calls)"
       : "\n\nTools used: NONE";
 
     const prompt = "Agent: " + agentName + "\nTask: " + instruction +
       "\nResult (" + resultStatus + "):\n" + resultText.slice(0, 3000) +
       verificationContext + toolsSummary +
-      "\n\nEvaluate whether the agent delivered real, actionable results." +
-      "\n\nACCEPT if ANY of these are true:" +
-      "\n- Agent used tools to do real work (wrote code, searched web, created documents, etc.)" +
-      "\n- Agent produced substantive output with real data, analysis, or deliverables" +
-      "\n- Agent created something tangible (files, repos, deployed apps, documents)" +
-      "\n\nREJECT ONLY if:" +
-      "\n- Agent produced ZERO tool calls AND the output is just describing what it WOULD do" +
-      "\n- Agent's output is entirely generic/templated with no task-specific content" +
-      "\n- Agent explicitly says it cannot do the task without actually trying" +
-      "\n\nBias toward ACCEPT when the agent made genuine effort with tools. Partial results from real work > no results." +
-      "\nRespond with ACCEPT: followed by summary, or REJECT: followed by what specifically was missing.";
+      "\n\nYou are reviewing whether the agent produced a USABLE DELIVERABLE — not whether it tried hard." +
+      "\n\nACCEPT if the task has a concrete, usable output:" +
+      "\n- A working live URL the user can visit" +
+      "\n- A real research document with specific data, numbers, and sources" +
+      "\n- A created document (Google Doc, Sheet, etc.) with a shareable link" +
+      "\n- An email that was actually sent" +
+      "\n- Code pushed to a repo the user can access" +
+      "\n\nREJECT if any of these are true:" +
+      "\n- Build task but NO working live URL (GitHub repo alone is not enough)" +
+      "\n- Research task but output is generic/shallow with no real data" +
+      "\n- Output describes what the agent WOULD do instead of what it DID" +
+      "\n- Output contains placeholder or template content rather than real results" +
+      "\n- Links in the output are broken or don't work" +
+      "\n\nThe standard is: can the user immediately USE this output? A link they can click, a document they can read, data they can act on." +
+      "\nRespond with ACCEPT: followed by what the deliverable is, or REJECT: followed by what's missing.";
 
-    const resp = await callClaude("claude-sonnet-4-20250514", "You evaluate AI agent work. Accept genuine tool-based work and real output. Only reject if the agent clearly didn't try or produced nothing actionable.", [
-      { role: "user", content: prompt },
-    ], [], 512, 0.3);
+    const resp = await callClaude("claude-sonnet-4-20250514",
+      "You are a strict quality gate. Your job is to ensure agent work produces USABLE output, not just evidence of effort. The user must be able to use the deliverable immediately.",
+      [{ role: "user", content: prompt }], [], 512, 0.3);
 
     const verdict = resp.content.find(b => b.type === "text")?.text || "";
     if (verdict.startsWith("ACCEPT:")) return { accepted: true, summary: verdict.slice(7).trim() };
     if (verdict.startsWith("REJECT:")) return { accepted: false, summary: verdict.slice(7).trim() };
-    return { accepted: true, summary: resultText.slice(0, 200) };
+    return { accepted: !resultText.includes("I would") && toolCalls?.length > 0, summary: resultText.slice(0, 200) };
   } catch {
     return { accepted: true, summary: resultText.slice(0, 200) };
   }
@@ -1599,38 +1666,38 @@ async function main() {
 
   // 5. Operational rules
   systemPrompt += "\n\n## Operational Rules (MUST FOLLOW)\n" +
-    "1. EXECUTE, don't describe. Use tools to do real work.\n" +
-    "2. NEVER GIVE UP ON FIRST ERROR. If a tool fails, try different parameters, a different tool, or a different approach. You have many turns — use them.\n" +
-    "3. Exhaust alternatives. web_search always works as a fallback.\n" +
-    "4. NEVER output auth links, setup URLs, or 'please connect' messages.\n" +
-    "5. Only call fail_task as an absolute last resort after trying multiple approaches. If you have partial results, deliver those instead of failing.\n" +
-    "6. 'Completed' means you delivered real results, not setup instructions.\n" +
-    "7. If an external service is down or errors, work around it. Build locally, use sandbox tools, produce results another way.";
+    "1. THE OUTPUT IS EVERYTHING. Your task is not done until a usable deliverable exists — a link, a document, a report with real data. Process without output is failure.\n" +
+    "2. EXECUTE, don't describe. Use tools to do real work. Never say what you WOULD do.\n" +
+    "3. NEVER GIVE UP ON FIRST ERROR. Try different parameters, a different tool, a different approach entirely.\n" +
+    "4. Your output will be VERIFIED. URLs will be visited. Documents will be checked for substance. If verification fails, you'll be sent back to fix it.\n" +
+    "5. NEVER output auth links, setup URLs, or 'please connect' messages.\n" +
+    "6. Only call fail_task as an absolute last resort. Deliver partial results instead of failing.\n" +
+    "7. If an external service is down, work around it — build locally, use sandbox, find another way.";
 
   if (agentSlug === "engineering") {
     systemPrompt = "You are the Engineering Agent. You BUILD things. You have a full sandbox environment with filesystem, shell, and GitHub access.\n\n" +
-      "CRITICAL: You MUST use your tools to write actual code, test it, and push it. NEVER just describe what you would build. ALWAYS build it.\n\n" +
       systemPrompt +
-      "\n\n## Engineering Workflow\n" +
-      "For BUILD/CREATE tasks (apps, sites, tools):\n" +
+      "\n\n## YOUR #1 RULE: THE OUTPUT IS THE ONLY THING THAT MATTERS\n" +
+      "A task is NOT complete until there is a usable deliverable the user can access RIGHT NOW.\n" +
+      "- For build tasks: a WORKING LIVE URL that loads in a browser. Not just a GitHub repo. A live URL.\n" +
+      "- For analysis tasks: a detailed written report with real data.\n" +
+      "If the output doesn't work, YOU ARE NOT DONE. Keep going until it works.\n\n" +
+      "## Build Workflow\n" +
       "1. Write code files using sandbox_write_file\n" +
-      "2. Test with sandbox_bash\n" +
-      "3. Fix any errors\n" +
-      "4. Create GitHub repo with github_create_repo\n" +
-      "5. Push files with github_push_file\n" +
-      "6. Deploy with deploy_static_site (instant live URL — preferred over GitHub Pages)\n" +
-      "7. Register with register_project\n\n" +
-      "For ANALYSIS/RESEARCH tasks (code review, reskinning analysis, technical assessment):\n" +
-      "1. Use web_search, database_query, or sandbox tools to gather data\n" +
-      "2. Analyze findings\n" +
-      "3. Produce a detailed written report\n" +
-      "4. No deployment or repo needed\n\n" +
-      "IMPORTANT RULES:\n" +
-      "- ALWAYS use tools. Never just describe what you'd do.\n" +
-      "- If a tool fails, try a different approach. Don't give up on first error.\n" +
-      "- If building an app, complete the full build-deploy cycle.\n" +
-      "- Partial real results are better than no results. Deliver what you can.\n" +
-      "- If deploy fails, still push to GitHub and register the project.";
+      "2. Test with sandbox_bash — fix ALL errors before proceeding\n" +
+      "3. Create GitHub repo with github_create_repo\n" +
+      "4. Push files with github_push_file\n" +
+      "5. Deploy with deploy_static_site — this gives you a live URL\n" +
+      "6. VERIFY the live URL actually loads by mentioning it in your response\n" +
+      "7. Register with register_project (include deploy_url)\n\n" +
+      "## If deployment fails:\n" +
+      "- Try deploy_static_site again with fixed code\n" +
+      "- Try GitHub Pages as fallback (push index.html, enable pages)\n" +
+      "- Try a different deployment approach\n" +
+      "- Do NOT give up until you have a working URL or have exhausted every option\n\n" +
+      "## Completion standard:\n" +
+      "Your work will be verified by actually visiting your URLs. If they return errors or don't load, your task will be sent back. " +
+      "A GitHub repo with no live URL is an INCOMPLETE task for any build request.";
 
     // Project edit mode: inject existing project context
     let rawInputCheck = task.input_data;
@@ -1738,10 +1805,12 @@ async function main() {
   // 10. Quality review for delegated tasks (with retry loop)
   const isDelegated = task.source === "agent" && task.parent_task_id;
   let finalText = result.text;
-  let finalStatus = result.status === "completed" ? "completed" : "failed";
+  // time_expired with tool calls = agent did work, let review decide
+  const didWork = result.toolCalls.length > 2;
+  let finalStatus = (result.status === "completed" || (result.status === "time_expired" && didWork)) ? "completed" : "failed";
   let reviewSummary = null;
 
-  if (isDelegated && result.status === "completed") {
+  if (isDelegated && finalStatus === "completed") {
     const MAX_REVIEW_RETRIES = 2;
     let reviewAttempt = 0;
     let currentResult = result;
@@ -1769,11 +1838,12 @@ async function main() {
       const revisionMessages = [...messages];
       revisionMessages.push({
         role: "user",
-        content: "YOUR WORK WAS REVIEWED AND REJECTED. Here is the feedback:\n\n" +
-          "REJECTION REASON: " + review.summary + "\n\n" +
-          "You MUST fix these issues and try again. Use your tools to actually do the work — don't just describe what you would do. " +
-          "Your previous response was:\n" + currentResult.text.slice(0, 2000) + "\n\n" +
-          "Fix the problems and deliver real, complete results this time.",
+        content: "YOUR OUTPUT WAS VERIFIED AND REJECTED. The deliverable does not meet the standard.\n\n" +
+          "WHAT FAILED: " + review.summary + "\n\n" +
+          "Remember: the ONLY thing that matters is a usable output. For build tasks, that means a LIVE URL that works. " +
+          "For research, that means a substantive document with real data. " +
+          "Do NOT explain what you would do differently — actually DO IT. Use your tools, fix the problems, and deliver a working result.\n\n" +
+          "Your previous attempt:\n" + currentResult.text.slice(0, 1500),
       });
 
       const REVISION_TIME_BUDGET = 3 * 60 * 1000; // 3 minutes per revision

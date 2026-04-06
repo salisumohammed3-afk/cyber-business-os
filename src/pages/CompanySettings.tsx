@@ -268,7 +268,6 @@ function GoalsTab() {
 function AgentsTab() {
   const { company } = useCompany();
   const [agents, setAgents] = useState<Array<{ id: string; name: string; slug: string; model: string; description: string; is_orchestrator: boolean; system_prompt: string; max_turns: number; temperature: number }>>([]);
-  const [toolCounts, setToolCounts] = useState<Record<string, number>>({});
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editPrompt, setEditPrompt] = useState("");
   const [editModel, setEditModel] = useState("");
@@ -282,17 +281,6 @@ function AgentsTab() {
       .order("name");
     if (data) {
       setAgents(data as typeof agents);
-      const agentIds = data.map((a: { id: string }) => a.id);
-      const { data: tools } = await supabase
-        .from("agent_tools")
-        .select("agent_id")
-        .in("agent_id", agentIds)
-        .eq("is_enabled", true);
-      const counts: Record<string, number> = {};
-      (tools || []).forEach((t: { agent_id: string }) => {
-        counts[t.agent_id] = (counts[t.agent_id] || 0) + 1;
-      });
-      setToolCounts(counts);
     }
   }, [company]);
 
@@ -321,7 +309,7 @@ function AgentsTab() {
               </div>
               <div className="flex items-center gap-2 text-xs text-muted-foreground">
                 <span>{a.model?.split("-").slice(0, 2).join("-")}</span>
-                <span>{toolCounts[a.id] || 0} tools</span>
+                <span>{(builtInToolsByAgent[a.slug] || builtInToolsByAgent.research).length} tools</span>
                 <button
                   onClick={() => {
                     setEditingId(editingId === a.id ? null : a.id);
@@ -366,82 +354,101 @@ function AgentsTab() {
 
 // ── Tools Tab ──────────────────────────────────────────────────────────────
 
+const builtInToolsByAgent: Record<string, string[]> = {
+  orchestrator: ["delegate_task", "create_task", "database_query", "store_memory", "recall_memories", "test_url", "manage_integrations"],
+  engineering: ["web_search", "database_query", "store_memory", "recall_memories", "test_url", "github_create_repo", "github_push_file", "sandbox_bash", "sandbox_write_file", "sandbox_read_file", "deploy_static_site", "register_project", "database_admin"],
+  designer: ["web_search", "database_query", "store_memory", "recall_memories", "test_url", "design_system_search"],
+  growth: ["web_search", "database_query", "store_memory", "recall_memories", "test_url"],
+  research: ["web_search", "database_query", "store_memory", "recall_memories", "test_url"],
+  "executive-assistant": ["web_search", "database_query", "store_memory", "recall_memories", "test_url"],
+};
+
 function ToolsTab() {
   const { company } = useCompany();
-  const [tools, setTools] = useState<Array<{ id: string; agent_id: string; tool_name: string; tool_type: string; connection_source: string; is_enabled: boolean; agent_slug?: string; agent_name?: string }>>([]);
+  const [agents, setAgentsState] = useState<Array<{ id: string; slug: string; name: string }>>([]);
+  const [composioTools, setComposioTools] = useState<Array<{ id: string; agent_id: string; tool_name: string; connection_source: string; is_enabled: boolean; agent_slug?: string }>>([]);
 
-  const fetchTools = useCallback(async () => {
+  const fetchData = useCallback(async () => {
     if (!company) return;
-    const { data: agents } = await supabase
+    const { data: agentData } = await supabase
       .from("agent_definitions")
       .select("id, slug, name")
       .eq("company_id", company.id);
-    if (!agents?.length) return;
+    if (!agentData?.length) return;
+    setAgentsState(agentData as Array<{ id: string; slug: string; name: string }>);
 
-    const agentMap: Record<string, { slug: string; name: string }> = {};
-    agents.forEach((a: { id: string; slug: string; name: string }) => {
-      agentMap[a.id] = { slug: a.slug, name: a.name };
-    });
+    const agentMap: Record<string, string> = {};
+    agentData.forEach((a: { id: string; slug: string }) => { agentMap[a.id] = a.slug; });
 
     const { data } = await supabase
       .from("agent_tools")
-      .select("id, agent_id, tool_name, tool_type, connection_source, is_enabled")
-      .in("agent_id", agents.map((a: { id: string }) => a.id))
+      .select("id, agent_id, tool_name, connection_source, is_enabled")
+      .in("agent_id", agentData.map((a: { id: string }) => a.id))
+      .eq("connection_source", "composio")
       .order("tool_name");
 
     if (data) {
-      setTools(data.map((t: { id: string; agent_id: string; tool_name: string; tool_type: string; connection_source: string; is_enabled: boolean }) => ({
+      setComposioTools(data.map((t: { id: string; agent_id: string; tool_name: string; connection_source: string; is_enabled: boolean }) => ({
         ...t,
-        agent_slug: agentMap[t.agent_id]?.slug,
-        agent_name: agentMap[t.agent_id]?.name,
+        agent_slug: agentMap[t.agent_id],
       })));
     }
   }, [company]);
 
-  useEffect(() => { fetchTools() }, [fetchTools]);
+  useEffect(() => { fetchData() }, [fetchData]);
 
-  const toggleTool = async (id: string, enabled: boolean) => {
+  const toggleComposioTool = async (id: string, enabled: boolean) => {
     await supabase.from("agent_tools").update({ is_enabled: enabled }).eq("id", id);
-    fetchTools();
+    fetchData();
   };
-
-  const grouped: Record<string, typeof tools> = {};
-  tools.forEach((t) => {
-    const key = t.agent_slug || "unknown";
-    if (!grouped[key]) grouped[key] = [];
-    grouped[key].push(t);
-  });
 
   return (
     <div className="space-y-6 max-w-2xl">
-      {Object.entries(grouped).map(([slug, agentTools]) => (
-        <div key={slug}>
-          <h3 className="text-sm font-medium mb-2 flex items-center gap-2">
-            <Wrench size={14} />
-            {agentTools[0]?.agent_name || slug}
-          </h3>
-          <div className="space-y-1">
-            {agentTools.map((t) => (
-              <div key={t.id} className="flex items-center justify-between px-3 py-2 rounded border text-sm">
-                <div className="flex items-center gap-2">
-                  <span>{t.tool_name}</span>
-                  <Badge variant="outline" className="text-xs">{t.connection_source}</Badge>
+      <p className="text-sm text-muted-foreground">
+        Built-in tools are managed by the system. Composio integrations can be toggled per agent.
+      </p>
+
+      {agents.map((agent) => {
+        const tools = builtInToolsByAgent[agent.slug] || builtInToolsByAgent.research;
+        const agentComposio = composioTools.filter((t) => t.agent_slug === agent.slug);
+        return (
+          <div key={agent.slug}>
+            <h3 className="text-sm font-medium mb-2 flex items-center gap-2">
+              <Wrench size={14} />
+              {agent.name}
+            </h3>
+            <div className="space-y-1">
+              {tools.map((name) => (
+                <div key={name} className="flex items-center justify-between px-3 py-2 rounded border text-sm">
+                  <div className="flex items-center gap-2">
+                    <span>{name}</span>
+                    <Badge variant="outline" className="text-xs">built-in</Badge>
+                  </div>
+                  <span className="text-xs text-muted-foreground">Always on</span>
                 </div>
-                <label className="flex items-center gap-2 cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={t.is_enabled}
-                    onChange={(e) => toggleTool(t.id, e.target.checked)}
-                    className="rounded"
-                  />
-                  <span className="text-xs">{t.is_enabled ? "On" : "Off"}</span>
-                </label>
-              </div>
-            ))}
+              ))}
+              {agentComposio.map((t) => (
+                <div key={t.id} className="flex items-center justify-between px-3 py-2 rounded border text-sm">
+                  <div className="flex items-center gap-2">
+                    <span>{t.tool_name}</span>
+                    <Badge variant="outline" className="text-xs">{t.connection_source}</Badge>
+                  </div>
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={t.is_enabled}
+                      onChange={(e) => toggleComposioTool(t.id, e.target.checked)}
+                      className="rounded"
+                    />
+                    <span className="text-xs">{t.is_enabled ? "On" : "Off"}</span>
+                  </label>
+                </div>
+              ))}
+            </div>
           </div>
-        </div>
-      ))}
-      {tools.length === 0 && <p className="text-sm text-muted-foreground">No tools assigned to this company's agents.</p>}
+        );
+      })}
+      {agents.length === 0 && <p className="text-sm text-muted-foreground">No agents found for this company.</p>}
     </div>
   );
 }

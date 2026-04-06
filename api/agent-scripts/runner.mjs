@@ -73,6 +73,17 @@ async function sbPatch(table, updates, filters = {}) {
   return await r.json();
 }
 
+async function sbDelete(table, filters = {}) {
+  const params = new URLSearchParams();
+  for (const [k, v] of Object.entries(filters)) params.set(k, v);
+  const r = await fetch(SUPABASE_URL + "/rest/v1/" + table + "?" + params, {
+    method: "DELETE",
+    headers: { ...SB_HEADERS, Prefer: "return=representation" },
+  });
+  if (!r.ok) return null;
+  return await r.json();
+}
+
 async function sbRpc(url, key, fn, params) {
   const r = await fetch(url + "/rest/v1/rpc/" + fn, {
     method: "POST",
@@ -88,7 +99,7 @@ async function sbRpc(url, key, fn, params) {
 
 // ── Anthropic API ───────────────────────────────────────────────────────────
 
-async function callClaude(model, system, messages, tools, maxTokens = 4096, temperature = 0.7, mcpServers = []) {
+async function callClaude(model, system, messages, tools, maxTokens = 4096, temperature = 0.7) {
   const MAX_RETRIES = 3;
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     const headers = {
@@ -96,14 +107,10 @@ async function callClaude(model, system, messages, tools, maxTokens = 4096, temp
       "anthropic-version": "2023-06-01",
       "content-type": "application/json",
     };
-    if (mcpServers.length > 0) {
-      headers["anthropic-beta"] = "mcp-client-2025-11-20";
-    }
 
     const body = {
       model, max_tokens: maxTokens, temperature, system, messages,
       ...(tools.length > 0 ? { tools } : {}),
-      ...(mcpServers.length > 0 ? { mcp_servers: mcpServers } : {}),
     };
 
     const resp = await fetch("https://api.anthropic.com/v1/messages", {
@@ -116,21 +123,6 @@ async function callClaude(model, system, messages, tools, maxTokens = 4096, temp
     const is429 = resp.status === 429;
     const is5xx = resp.status >= 500;
     const errBody = await resp.text().catch(() => "");
-
-    if (resp.status === 400 && mcpServers.length > 0 && errBody.includes("MCP")) {
-      await log("MCP server error — retrying WITHOUT MCP tools: " + errBody.slice(0, 200), "mcp_fallback");
-      mcpServers = [];
-      delete headers["anthropic-beta"];
-      const bodyNoMcp = { model, max_tokens: maxTokens, temperature, system, messages, ...(tools.length > 0 ? { tools } : {}) };
-      const resp2 = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: { "x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json" },
-        body: JSON.stringify(bodyNoMcp),
-      });
-      if (resp2.ok) return await resp2.json();
-      const errBody2 = await resp2.text().catch(() => "");
-      throw new Error("Anthropic " + resp2.status + " (MCP fallback): " + errBody2.slice(0, 300));
-    }
 
     if ((is429 || is5xx) && attempt < MAX_RETRIES) {
       const wait = is429 ? attempt * 15000 : attempt * 5000;
@@ -149,6 +141,7 @@ async function callClaude(model, system, messages, tools, maxTokens = 4096, temp
 
 let agentSlug = "unknown";
 let companyId = null;
+let _composioAllowedApps = null;
 
 async function log(message, logType = "info", meta = {}) {
   const base = {
@@ -498,6 +491,20 @@ const COMPOSIO_TOOLS = [
   },
 ];
 
+const MANAGE_INTEGRATIONS_TOOL = {
+  name: "manage_integrations",
+  description: "View, assign, or remove Composio app integrations for agents. Use 'list' to see what's connected and who has access, 'assign' to give an agent access to an app, 'remove' to revoke it.",
+  input_schema: {
+    type: "object",
+    properties: {
+      action: { type: "string", enum: ["list", "assign", "remove"], description: "What to do: list all connections, assign an app to an agent, or remove access" },
+      app_name: { type: "string", description: "Composio app name (e.g. 'apollo', 'gmail', 'granola'). Required for assign/remove." },
+      agent_slug: { type: "string", description: "Target agent slug (e.g. 'growth', 'research', 'engineering'). Required for assign/remove." },
+    },
+    required: ["action"],
+  },
+};
+
 // ── Tool implementations ────────────────────────────────────────────────────
 
 const childTasks = [];
@@ -517,8 +524,9 @@ async function executeTool(name, input) {
       case "github_create_repo": return await toolGitHubCreateRepo(input);
       case "github_push_file":   return await toolGitHubPushFile(input);
       case "design_system_search": return await toolDesignSearch(input);
-      case "composio_find_actions": return await toolComposioFindActions(input);
-      case "composio_execute":      return await toolComposioExecute(input);
+      case "composio_find_actions":  return await toolComposioFindActions(input);
+      case "composio_execute":       return await toolComposioExecute(input);
+      case "manage_integrations":    return await toolManageIntegrations(input);
       case "sandbox_bash":       return await toolSandboxBash(input);
       case "sandbox_read_file":  return await toolSandboxReadFile(input);
       case "sandbox_write_file": return await toolSandboxWriteFile(input);
@@ -922,6 +930,11 @@ async function toolDesignSearch(input) {
 async function toolComposioFindActions(input) {
   if (!COMPOSIO_KEY) return JSON.stringify({ error: "Composio not configured (COMPOSIO_API_KEY missing)" });
 
+  const requestedApp = (input.app_name || "").toLowerCase();
+  if (_composioAllowedApps && !_composioAllowedApps.includes(requestedApp)) {
+    return JSON.stringify({ error: "App '" + requestedApp + "' is not available for your role. Allowed: " + _composioAllowedApps.join(", ") });
+  }
+
   const params = new URLSearchParams({ limit: "15" });
   params.set("apps", input.app_name.toUpperCase());
   if (input.use_case) params.set("useCase", input.use_case);
@@ -948,6 +961,15 @@ async function toolComposioExecute(input) {
   if (!COMPOSIO_KEY) return JSON.stringify({ error: "Composio not configured" });
 
   const actionUpper = input.action_id.toUpperCase();
+
+  if (_composioAllowedApps) {
+    const actionLower = actionUpper.toLowerCase();
+    const appMatch = _composioAllowedApps.some(app => actionLower.startsWith(app + "_") || actionLower.startsWith(app.replace(/[_-]/g, "") + "_"));
+    if (!appMatch) {
+      return JSON.stringify({ error: "Action '" + input.action_id + "' is not allowed for your role. Allowed apps: " + _composioAllowedApps.join(", ") });
+    }
+  }
+
   const accounts = await getComposioAccounts();
 
   let account = null;
@@ -980,6 +1002,106 @@ async function toolComposioExecute(input) {
 
   const output = result.data || result;
   return JSON.stringify({ success: true, data: typeof output === "string" ? output.slice(0, 8000) : output });
+}
+
+// ── Manage Integrations tool (orchestrator only) ────────────────────────────
+
+async function toolManageIntegrations(input) {
+  const action = (input.action || "").toLowerCase();
+
+  const allAgents = await sbGet("agent_definitions", companyId ? { company_id: "eq." + companyId } : {});
+  if (!allAgents || allAgents.length === 0) return JSON.stringify({ error: "No agents found" });
+
+  const agentMap = {};
+  for (const a of allAgents) agentMap[a.slug] = a;
+
+  if (action === "list") {
+    const accounts = await getComposioAccounts();
+    const connectedApps = [...new Set(accounts.filter(a => a.status === "ACTIVE").map(a => a.appName.toLowerCase()))];
+
+    const agentIds = allAgents.map(a => a.id);
+    const assignments = await sbGet("agent_tools", {
+      "agent_id": "in.(" + agentIds.join(",") + ")",
+      connection_source: "eq.composio",
+    });
+
+    const perAgent = {};
+    for (const a of allAgents) {
+      if (a.is_orchestrator) continue;
+      const agentRows = (assignments || []).filter(r => r.agent_id === a.id);
+      perAgent[a.slug] = {
+        name: a.name,
+        apps: agentRows.map(r => ({
+          app: (r.tool_name || "").toLowerCase(),
+          enabled: r.is_enabled,
+        })),
+      };
+    }
+
+    return JSON.stringify({ connected_apps: connectedApps, agent_assignments: perAgent });
+  }
+
+  if (action === "assign") {
+    const appName = (input.app_name || "").toLowerCase();
+    const targetSlug = input.agent_slug;
+    if (!appName || !targetSlug) return JSON.stringify({ error: "Both app_name and agent_slug are required" });
+
+    const agent = agentMap[targetSlug];
+    if (!agent) return JSON.stringify({ error: "Agent '" + targetSlug + "' not found. Available: " + Object.keys(agentMap).join(", ") });
+    if (agent.is_orchestrator) return JSON.stringify({ error: "Cannot assign Composio apps to the orchestrator" });
+
+    const accounts = await getComposioAccounts();
+    const connectedApps = [...new Set(accounts.filter(a => a.status === "ACTIVE").map(a => a.appName.toLowerCase()))];
+    if (!connectedApps.includes(appName)) {
+      return JSON.stringify({ error: "App '" + appName + "' is not connected in Composio. Connected: " + connectedApps.join(", ") });
+    }
+
+    const existing = await sbGet("agent_tools", {
+      agent_id: "eq." + agent.id,
+      connection_source: "eq.composio",
+      tool_name: "eq." + appName,
+    });
+
+    if (existing && existing.length > 0) {
+      await sbPatch("agent_tools", { is_enabled: true }, { id: "eq." + existing[0].id });
+      return JSON.stringify({ success: true, action: "re-enabled", app: appName, agent: targetSlug });
+    }
+
+    await sbInsert("agent_tools", {
+      agent_id: agent.id,
+      tool_name: appName,
+      tool_type: "composio",
+      connection_source: "composio",
+      is_enabled: true,
+      composio_action_id: appName.toUpperCase(),
+    });
+
+    return JSON.stringify({ success: true, action: "assigned", app: appName, agent: targetSlug });
+  }
+
+  if (action === "remove") {
+    const appName = (input.app_name || "").toLowerCase();
+    const targetSlug = input.agent_slug;
+    if (!appName || !targetSlug) return JSON.stringify({ error: "Both app_name and agent_slug are required" });
+
+    const agent = agentMap[targetSlug];
+    if (!agent) return JSON.stringify({ error: "Agent '" + targetSlug + "' not found" });
+
+    const rows = await sbGet("agent_tools", {
+      agent_id: "eq." + agent.id,
+      connection_source: "eq.composio",
+      tool_name: "eq." + appName,
+    });
+
+    if (!rows || rows.length === 0) {
+      return JSON.stringify({ error: "App '" + appName + "' is not assigned to " + targetSlug });
+    }
+
+    await sbDelete("agent_tools", { id: "eq." + rows[0].id });
+    return JSON.stringify({ success: true, action: "removed", app: appName, agent: targetSlug });
+  }
+
+  return JSON.stringify({ error: "Unknown action '" + action + "'. Use: list, assign, remove" });
 }
 
 // ── Sandbox filesystem tools (engineering agent only) ───────────────────────
@@ -1161,7 +1283,7 @@ async function saveCheckpoint(messages, turn, allToolCalls) {
   }
 }
 
-async function runLoop(model, systemPrompt, messages, tools, timeBudgetMs, temperature, mcpServers = [], existingToolCalls = []) {
+async function runLoop(model, systemPrompt, messages, tools, timeBudgetMs, temperature, existingToolCalls = []) {
   const allToolCalls = [...existingToolCalls];
   let failAttempts = 0;
   const MAX_FAIL_RETRIES = 2;
@@ -1194,13 +1316,7 @@ async function runLoop(model, systemPrompt, messages, tools, timeBudgetMs, tempe
       }
     }
 
-    const response = await callClaude(model, systemPrompt, messages, tools, 4096, temperature, mcpServers);
-
-    const mcpCalls = response.content.filter(b => b.type === "mcp_tool_use");
-    for (const block of mcpCalls) {
-      await log("MCP Tool: " + block.name + " on " + (block.server_name || "mcp"), "mcp_tool_call");
-      allToolCalls.push({ tool: block.name, input: block.input, output: "(MCP-executed)", source: "mcp:" + (block.server_name || "unknown") });
-    }
+    const response = await callClaude(model, systemPrompt, messages, tools, 4096, temperature);
 
     const toolBlocks = response.content.filter(b => b.type === "tool_use");
 
@@ -1361,9 +1477,11 @@ async function reviewResult(agentName, instruction, resultText, resultStatus, to
     const verdict = resp.content.find(b => b.type === "text")?.text || "";
     if (verdict.startsWith("ACCEPT:")) return { accepted: true, summary: verdict.slice(7).trim() };
     if (verdict.startsWith("REJECT:")) return { accepted: false, summary: verdict.slice(7).trim() };
-    return { accepted: true, summary: resultText.slice(0, 200) };
-  } catch {
-    return { accepted: true, summary: resultText.slice(0, 200) };
+    await log("Review verdict ambiguous (no ACCEPT/REJECT prefix): " + verdict.slice(0, 100), "review_ambiguous");
+    return { accepted: false, summary: "Review inconclusive — could not determine if output meets requirements" };
+  } catch (err) {
+    await log("Review error: " + (err?.message || err), "review_error");
+    return { accepted: false, summary: "Review failed due to an error — manual check needed" };
   }
 }
 
@@ -1523,52 +1641,33 @@ async function main() {
 
   // 4. Load external integrations
 
-  // 4a. Composio — auto-discover ALL active connected apps
+  // 4a. Composio — discover active connected apps, filtered by agent_tools DB rows
   let composioApps = [];
-  if (COMPOSIO_KEY) {
+  if (COMPOSIO_KEY && agentSlug !== "orchestrator" && agentDefId) {
     const accounts = await getComposioAccounts();
-    composioApps = [...new Set(accounts.filter(a => a.status === "ACTIVE").map(a => a.appName))];
-    if (composioApps.length > 0) {
-      await log("Composio apps: " + composioApps.join(", "), "composio_loaded");
-    }
-  }
+    const allActive = [...new Set(accounts.filter(a => a.status === "ACTIVE").map(a => a.appName.toLowerCase()))];
 
-  // 4b. MCP servers — load from agent_tools where auth token is stored
-  const mcpServers = [];
-  const mcpToolsets = [];
-  if (agentDefId) {
-    const mcpTools = await sbGet("agent_tools", {
+    const agentComposioRows = await sbGet("agent_tools", {
       agent_id: "eq." + agentDefId,
       is_enabled: "eq.true",
-      "mcp_server_url": "not.is.null",
+      connection_source: "eq.composio",
     });
-    for (const t of (mcpTools || [])) {
-      if (t.mcp_server_url && t.config?.authorization_token) {
-        const serverName = (t.tool_name || "mcp").toLowerCase().replace(/\s+/g, "-");
-        mcpServers.push({
-          type: "url",
-          url: t.mcp_server_url,
-          name: serverName,
-          authorization_token: t.config.authorization_token,
-        });
-        mcpToolsets.push({ type: "mcp_toolset", mcp_server_name: serverName });
-      }
-    }
-    if (mcpServers.length > 0) {
-      await log("MCP servers: " + mcpServers.map(s => s.name).join(", "), "mcp_loaded");
+    const allowed = (agentComposioRows || []).map(r => (r.tool_name || "").toLowerCase());
+
+    composioApps = allActive.filter(app => allowed.includes(app));
+    _composioAllowedApps = composioApps;
+    if (composioApps.length > 0) {
+      await log("Composio apps for " + agentSlug + ": " + composioApps.join(", ") + " (from DB, filtered against " + allActive.length + " active accounts)", "composio_loaded");
     }
   }
 
-  // 4c. Inject external integrations into system prompt
+  // 4b. Inject external integrations into system prompt
   if (composioApps.length > 0) {
     systemPrompt += "\n\n## External Integrations (via Composio)\n" +
       "You have access to these external services. Use composio_find_actions(app_name, use_case) to discover available operations, then composio_execute(action_id, params) to run them.\n" +
-      "Connected apps: " + composioApps.join(", ") + "\n" +
-      "Workflow: 1) composio_find_actions → 2) composio_execute. Always discover actions first — do NOT guess action IDs.";
-  }
-  if (mcpServers.length > 0) {
-    systemPrompt += "\n\n## MCP Tool Servers (auto-discovered)\n" +
-      "You have direct access to tools from: " + mcpServers.map(s => s.name).join(", ") + ". These tools are automatically available — just use them.";
+      "Your allowed apps: " + composioApps.join(", ") + "\n" +
+      "Workflow: 1) composio_find_actions → 2) composio_execute. Always discover actions first — do NOT guess action IDs.\n" +
+      "Only use apps listed above — do not attempt to use apps outside your role.";
   }
 
   // 4d. Load skills assigned to this agent
@@ -1641,12 +1740,12 @@ async function main() {
   if (agentSlug === "orchestrator") {
     const ORCHESTRATOR_ONLY = ["delegate_task", "create_task", "store_memory", "recall_memories", "database_query", "test_url", "fail_task"];
     tools = BASE_TOOLS.filter(t => ORCHESTRATOR_ONLY.includes(t.name));
+    tools.push(MANAGE_INTEGRATIONS_TOOL);
   } else {
     tools = [...BASE_TOOLS];
     if (agentSlug === "engineering") tools.push(...ENGINEERING_TOOLS);
     if (agentSlug === "designer") tools.push(...DESIGNER_TOOLS);
     if (composioApps.length > 0) tools.push(...COMPOSIO_TOOLS);
-    if (mcpToolsets.length > 0) tools.push(...mcpToolsets);
   }
 
   // 7. Build conversation
@@ -1710,22 +1809,34 @@ async function main() {
     existingToolCalls = (checkpoint.tools_used || []).map(t => ({ tool: t, input: {}, output: "(from checkpoint)", source: "checkpoint" }));
   }
 
-  await log("Starting agentic loop — " + tools.length + " tools, " + mcpServers.length + " MCP servers, " + Math.round(timeBudgetMs / 1000) + "s time budget", "loop_start");
+  await log("Starting agentic loop — " + tools.length + " tools, " + Math.round(timeBudgetMs / 1000) + "s time budget", "loop_start");
 
   // 10. Run the loop
-  const result = await runLoop(model, systemPrompt, messages, tools, timeBudgetMs, temperature, mcpServers, existingToolCalls);
+  const result = await runLoop(model, systemPrompt, messages, tools, timeBudgetMs, temperature, existingToolCalls);
 
   await log("Loop finished: " + result.status + " in " + result.turns + " turn(s), " + result.toolCalls.length + " tool call(s)");
 
-  // 10. Quality review for delegated tasks (with retry loop)
+  // 10. Determine initial status
   const isDelegated = task.source === "agent" && task.parent_task_id;
   let finalText = result.text;
-  // time_expired with tool calls = agent did work, let review decide
-  const didWork = result.toolCalls.length > 2;
-  let finalStatus = (result.status === "completed" || (result.status === "time_expired" && didWork)) ? "completed" : "failed";
-  let reviewSummary = null;
+  let finalToolCalls = result.toolCalls;
 
-  if (isDelegated && finalStatus === "completed") {
+  const isTimeoutString = result.text.startsWith("Time budget expired") || result.text.startsWith("Hit safety cap");
+  const hasRealOutput = result.status === "completed" && !isTimeoutString;
+  const didWorkButTimedOut = result.status === "time_expired" && result.toolCalls.length > 2 && !isTimeoutString;
+
+  let finalStatus = (hasRealOutput || didWorkButTimedOut) ? "completed" : "failed";
+  let reviewSummary = null;
+  let failReason = null;
+
+  if (finalStatus === "failed" && result.status === "time_expired") {
+    failReason = "Time budget expired without producing output";
+  } else if (finalStatus === "failed") {
+    failReason = finalText.slice(0, 500);
+  }
+
+  // 11. Quality review for ALL completed tasks (not just delegated)
+  if (finalStatus === "completed") {
     const MAX_REVIEW_RETRIES = 2;
     let reviewAttempt = 0;
     let currentResult = result;
@@ -1735,6 +1846,7 @@ async function main() {
       if (review.accepted) {
         reviewSummary = review.summary;
         finalText = currentResult.text;
+        finalToolCalls = currentResult.toolCalls;
         finalStatus = "completed";
         await log("Review: ACCEPTED" + (reviewAttempt > 0 ? " (after " + reviewAttempt + " revision(s))" : ""), "review_accepted");
         break;
@@ -1743,7 +1855,8 @@ async function main() {
       reviewAttempt++;
       if (reviewAttempt > MAX_REVIEW_RETRIES) {
         finalStatus = "failed";
-        finalText = "Rejected after " + MAX_REVIEW_RETRIES + " revision attempts. Last rejection: " + review.summary;
+        failReason = "Rejected after " + MAX_REVIEW_RETRIES + " revision attempts: " + review.summary;
+        finalText = failReason;
         await log("Review: FINAL REJECT after " + MAX_REVIEW_RETRIES + " retries — " + review.summary, "review_rejected");
         break;
       }
@@ -1758,13 +1871,14 @@ async function main() {
           "Fix the issues and deliver a working result. Use test_url to verify your links before submitting again.",
       });
 
-      const REVISION_TIME_BUDGET = 3 * 60 * 1000; // 3 minutes per revision
-      const retryResult = await runLoop(model, systemPrompt, revisionMessages, tools, REVISION_TIME_BUDGET, temperature, mcpServers, currentResult.toolCalls);
+      const REVISION_TIME_BUDGET = 3 * 60 * 1000;
+      const retryResult = await runLoop(model, systemPrompt, revisionMessages, tools, REVISION_TIME_BUDGET, temperature, currentResult.toolCalls);
       await log("Revision loop done: " + retryResult.status + " in " + retryResult.turns + " turns", "review_revision_done");
 
       if (retryResult.status !== "completed") {
         finalStatus = "failed";
-        finalText = "Failed during revision attempt " + reviewAttempt + ": " + retryResult.text;
+        failReason = "Failed during revision attempt " + reviewAttempt + ": " + retryResult.text;
+        finalText = failReason;
         await log("Revision attempt " + reviewAttempt + " failed: " + retryResult.status, "review_revision_failed");
         break;
       }
@@ -1773,8 +1887,8 @@ async function main() {
     }
   }
 
-  // 11. Extract deliverables and write results
-  const deliverables = extractDeliverables(result.toolCalls || []);
+  // 12. Extract deliverables from the latest result (post-revision if applicable)
+  const deliverables = extractDeliverables(finalToolCalls || []);
   if (deliverables.length > 0) {
     await log("Deliverables: " + deliverables.map(d => d.type + (d.url ? " " + d.url : "")).join(", "), "deliverables");
   }
@@ -1785,16 +1899,16 @@ async function main() {
       role: "orchestrator",
       content: finalText,
       timestamp: new Date().toISOString(),
-      tool_calls: result.toolCalls.length > 0 ? result.toolCalls : null,
       metadata: {
         model, turns: result.turns,
-        tools_used: [...new Set(result.toolCalls.map(t => t.tool))],
+        tools_used: [...new Set(finalToolCalls.map(t => t.tool))],
         agent_slug: agentSlug,
+        deliverables: deliverables.length > 0 ? deliverables : undefined,
       },
     });
   } else {
     const notificationContent = finalStatus === "completed"
-      ? formatNotification(agentSlug, task.title, result.text, deliverables)
+      ? formatNotification(agentSlug, task.title, finalText, deliverables)
       : finalText;
 
     await sbInsert("chat_messages", {
@@ -1813,10 +1927,6 @@ async function main() {
     });
   }
 
-  const failReason = finalStatus === "failed"
-    ? (result.status === "time_expired" ? "Time budget expired" : finalText.slice(0, 500))
-    : null;
-
   await sbPatch("tasks", {
     status: finalStatus,
     completed_at: new Date().toISOString(),
@@ -1828,8 +1938,8 @@ async function main() {
     result_type: "text",
     data: {
       response: finalText,
-      tools_used: [...new Set(result.toolCalls.map(t => t.tool))],
-      tool_calls: result.toolCalls,
+      tools_used: [...new Set(finalToolCalls.map(t => t.tool))],
+      tool_calls: finalToolCalls,
       turns: result.turns,
       model, agent_slug: agentSlug,
       ...(finalStatus === "failed" ? { failed: true } : {}),

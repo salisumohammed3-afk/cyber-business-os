@@ -27,13 +27,25 @@ const localTools: Record<string, ToolInfo> = {
   store_memory: { name: "Store Memory", icon: BookOpen, description: "Save important facts and decisions for future reference" },
   recall_memories: { name: "Recall Memories", icon: FileSearch, description: "Search stored memories for relevant context" },
   delegate_task: { name: "Delegate Task", icon: MessageSquare, description: "Propose work for specialist sub-agents (requires user approval)" },
-  fail_task: { name: "Fail Task", icon: XCircle, description: "Mark a task as failed with an error message when it cannot be completed" },
+  project_query: { name: "Project Query", icon: Database, description: "Query the projects database for agent-built project data" },
+  test_url: { name: "Test URL", icon: Globe, description: "Fetch a URL to verify it works — check deployments, links, and pages" },
+  fail_task: { name: "Fail Task", icon: XCircle, description: "Mark a task as failed when all alternatives are exhausted" },
+  github_create_repo: { name: "GitHub: Create Repo", icon: Wrench, description: "Create a new GitHub repository" },
+  github_push_file: { name: "GitHub: Push File", icon: Wrench, description: "Create or update files in a GitHub repository" },
+  sandbox_bash: { name: "Shell", icon: Cpu, description: "Run shell commands in the sandbox environment" },
+  sandbox_write_file: { name: "Write File", icon: Wrench, description: "Write files to the sandbox filesystem" },
+  sandbox_read_file: { name: "Read File", icon: FileSearch, description: "Read files from the sandbox filesystem" },
+  deploy_static_site: { name: "Deploy Site", icon: Rocket, description: "Deploy a static site and get a live URL instantly" },
+  register_project: { name: "Register Project", icon: Package, description: "Register a completed project in the platform" },
+  database_admin: { name: "Database Admin", icon: Database, description: "Create and manage tables in the projects database" },
+  design_system_search: { name: "Design System", icon: Palette, description: "Search design patterns, styles, and UX guidelines" },
+  manage_integrations: { name: "Manage Integrations", icon: Link2, description: "View, assign, or remove Composio app integrations for agents" },
 };
 
 const composioToolMeta: Record<string, { label: string; description: string }> = {
   apollo: { label: "Apollo", description: "People and company search, lead enrichment, contact discovery" },
   linkedin: { label: "LinkedIn", description: "Professional networking, prospect research, connection outreach" },
-  agent_mail: { label: "AgentMail", description: "Send and manage emails from the agent's dedicated email address" },
+  agentmail: { label: "AgentMail", description: "Send and manage emails from the agent's dedicated email address" },
   gmail: { label: "Gmail", description: "Send, read, and manage email campaigns" },
   exa: { label: "Exa", description: "AI-powered web search for deep research and content discovery" },
   firecrawl: { label: "Firecrawl", description: "Web scraping, crawling, and structured data extraction" },
@@ -42,12 +54,30 @@ const composioToolMeta: Record<string, { label: string; description: string }> =
   slack: { label: "Slack", description: "Team messaging, channel management, and notifications" },
   instantly: { label: "Instantly", description: "Cold email automation and deliverability optimization" },
   googlecalendar: { label: "Google Calendar", description: "Schedule meetings, manage events, and check availability" },
-  monday: { label: "Monday.com", description: "Project boards, task tracking, and team collaboration" },
+  googledocs: { label: "Google Docs", description: "Create and edit documents collaboratively" },
+  googlesheets: { label: "Google Sheets", description: "Create and manage spreadsheets with data" },
+  googledrive: { label: "Google Drive", description: "File storage, sharing, and collaboration" },
+  github: { label: "GitHub", description: "Repository management, code hosting, and collaboration" },
   figma: { label: "Figma", description: "Design file access, component inspection, and asset export" },
+  granola: { label: "Granola", description: "AI meeting notes, transcription, and action item extraction" },
+  perplexityai: { label: "Perplexity AI", description: "AI-powered research and question answering" },
+  monday: { label: "Monday.com", description: "Project boards, task tracking, and team collaboration" },
 };
 
-const orchestratorLocalTools = ["delegate_task", "create_task", "database_query", "store_memory", "recall_memories", "fail_task"];
-const specialistLocalTools = ["web_search", "database_query", "store_memory", "recall_memories"];
+const orchestratorLocalTools = ["delegate_task", "create_task", "database_query", "store_memory", "recall_memories", "test_url", "manage_integrations", "fail_task"];
+
+const engineeringLocalTools = [
+  "web_search", "database_query", "store_memory", "recall_memories", "project_query", "test_url", "fail_task",
+  "github_create_repo", "github_push_file", "sandbox_bash", "sandbox_write_file", "sandbox_read_file",
+  "deploy_static_site", "register_project", "database_admin",
+];
+
+const designerLocalTools = [
+  "web_search", "database_query", "store_memory", "recall_memories", "project_query", "test_url", "fail_task",
+  "design_system_search",
+];
+
+const defaultSpecialistTools = ["web_search", "database_query", "store_memory", "recall_memories", "project_query", "test_url", "fail_task"];
 
 const agentConfigs: Record<string, AgentConfig> = {
   orchestrator: {
@@ -126,12 +156,21 @@ const agentConfigs: Record<string, AgentConfig> = {
 const specialistSlugs = ["engineering", "growth", "research", "designer", "executive-assistant"];
 const allAgentSlugs = ["orchestrator", ...specialistSlugs];
 
+function getToolKeysForSlug(slug: string): string[] {
+  switch (slug) {
+    case "orchestrator": return orchestratorLocalTools;
+    case "engineering": return engineeringLocalTools;
+    case "designer": return designerLocalTools;
+    default: return defaultSpecialistTools;
+  }
+}
+
 function buildToolList(
   slug: string,
   agentId: string | undefined,
   externalTools: AgentToolRow[]
 ): ToolInfo[] {
-  const localKeys = slug === "orchestrator" ? orchestratorLocalTools : specialistLocalTools;
+  const localKeys = getToolKeysForSlug(slug);
   const tools: ToolInfo[] = localKeys.map((k) => localTools[k]).filter(Boolean);
 
   if (agentId) {

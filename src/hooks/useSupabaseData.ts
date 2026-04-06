@@ -259,6 +259,7 @@ export function useAgentTools() {
         .from("agent_tools")
         .select("id, agent_id, tool_name, tool_type, connection_source, is_enabled")
         .in("agent_id", agentIds)
+        .eq("connection_source", "composio")
         .eq("is_enabled", true);
       if (error) throw error;
       return (data || []) as AgentToolRow[];

@@ -1224,6 +1224,18 @@ async function toolDeployStaticSite(input) {
       if (resp.ok) {
         const data = await resp.json();
         const url = data.url ? "https://" + data.url : data.alias?.[0] ? "https://" + data.alias[0] : null;
+
+        // Disable SSO protection so the site is publicly accessible
+        if (data.projectId) {
+          try {
+            await fetch("https://api.vercel.com/v9/projects/" + data.projectId, {
+              method: "PATCH",
+              headers: { Authorization: "Bearer " + VERCEL_TOKEN, "Content-Type": "application/json" },
+              body: JSON.stringify({ ssoProtection: null }),
+            });
+          } catch (_) { /* non-fatal */ }
+        }
+
         await log("Deployed to Vercel: " + (url || data.url || "unknown"), "deploy_complete");
         return JSON.stringify({ success: true, url, deployment_url: data.url, project: project_name, files_deployed: files.length, provider: "vercel" });
       }

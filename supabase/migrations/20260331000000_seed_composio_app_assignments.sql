@@ -3,7 +3,14 @@
 -- per-agent allowlists. Each row's tool_name is the Composio app name (lowercased).
 -- The is_enabled toggle in CompanySettings now controls runtime access.
 
--- Ensure no duplicate (agent, tool) pairs
+-- Remove duplicate (agent_id, tool_name) rows before adding unique index.
+-- Keep one row per pair using ctid (physical row id).
+DELETE FROM public.agent_tools a
+USING public.agent_tools b
+WHERE a.agent_id = b.agent_id
+  AND a.tool_name = b.tool_name
+  AND a.ctid > b.ctid;
+
 CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_tools_agent_tool_unique
   ON public.agent_tools (agent_id, tool_name);
 

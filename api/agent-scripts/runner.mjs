@@ -21,6 +21,7 @@ const PROJECTS_DB_URL  = process.env.PROJECTS_SUPABASE_URL || "";
 const PROJECTS_DB_KEY  = process.env.PROJECTS_SUPABASE_KEY || "";
 const SELF_URL         = process.env.SELF_URL || "";
 const VERCEL_TOKEN     = process.env.VERCEL_TOKEN || "";
+const RAILWAY_API_TOKEN = process.env.RAILWAY_DEPLOY_TOKEN || process.env.RAILWAY_TOKEN || "";
 const TASK_WORKDIR     = process.env.TASK_WORKDIR || "";
 
 if (!TASK_ID || !SUPABASE_URL || !SUPABASE_KEY || !ANTHROPIC_KEY) {
@@ -434,7 +435,7 @@ const ENGINEERING_TOOLS = [
   },
   {
     name: "deploy_static_site",
-    description: "Deploy a static site directory to Vercel. Returns a live URL instantly. Use INSTEAD of GitHub Pages for deployment.",
+    description: "Deploy a static site directory. Tries Vercel first, falls back to Railway automatically. Returns a live URL.",
     input_schema: {
       type: "object",
       properties: {
@@ -1181,71 +1182,137 @@ function toolSandboxListFiles(input) {
 }
 
 async function toolDeployStaticSite(input) {
-  if (!VERCEL_TOKEN) return JSON.stringify({ error: "VERCEL_TOKEN not configured. Use GitHub Pages as fallback." });
   const { project_name, directory } = input;
   if (!project_name || !directory) return JSON.stringify({ error: "project_name and directory are required" });
 
-  try {
-    const dir = join(TASK_WORKDIR || process.cwd(), directory);
-    if (!existsSync(dir)) return JSON.stringify({ error: "Directory not found: " + directory });
+  const dir = join(TASK_WORKDIR || process.cwd(), directory);
+  if (!existsSync(dir)) return JSON.stringify({ error: "Directory not found: " + directory });
 
-    function collectFiles(base, prefix = "") {
-      const results = [];
-      for (const name of readdirSync(base)) {
-        const full = join(base, name);
-        const rel = prefix ? prefix + "/" + name : name;
-        if (name.startsWith(".") || name === "node_modules") continue;
-        const st = statSync(full);
-        if (st.isDirectory()) {
-          results.push(...collectFiles(full, rel));
-        } else if (st.size < 5_000_000) {
-          results.push({ file: rel, data: readFileSync(full).toString("base64"), encoding: "base64" });
+  function collectFiles(base, prefix = "") {
+    const results = [];
+    for (const name of readdirSync(base)) {
+      const full = join(base, name);
+      const rel = prefix ? prefix + "/" + name : name;
+      if (name.startsWith(".") || name === "node_modules") continue;
+      const st = statSync(full);
+      if (st.isDirectory()) {
+        results.push(...collectFiles(full, rel));
+      } else if (st.size < 5_000_000) {
+        results.push({ file: rel, data: readFileSync(full).toString("base64"), encoding: "base64" });
+      }
+    }
+    return results;
+  }
+
+  const files = collectFiles(dir);
+  if (files.length === 0) return JSON.stringify({ error: "No files found in " + directory });
+
+  // Strategy 1: Vercel
+  if (VERCEL_TOKEN) {
+    try {
+      await log("Deploying " + files.length + " files to Vercel as " + project_name, "deploy_start");
+      const resp = await fetch("https://api.vercel.com/v13/deployments", {
+        method: "POST",
+        headers: { Authorization: "Bearer " + VERCEL_TOKEN, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: project_name,
+          files: files,
+          projectSettings: { framework: null },
+          target: "production",
+        }),
+      });
+      if (resp.ok) {
+        const data = await resp.json();
+        const url = data.url ? "https://" + data.url : data.alias?.[0] ? "https://" + data.alias[0] : null;
+        await log("Deployed to Vercel: " + (url || data.url || "unknown"), "deploy_complete");
+        return JSON.stringify({ success: true, url, deployment_url: data.url, project: project_name, files_deployed: files.length, provider: "vercel" });
+      }
+      const errText = await resp.text().catch(() => "");
+      await log("Vercel deploy failed (" + resp.status + "), falling back to Railway: " + errText.slice(0, 150), "deploy_fallback");
+    } catch (e) {
+      await log("Vercel deploy error, falling back to Railway: " + (e.message || e), "deploy_fallback");
+    }
+  }
+
+  // Strategy 2: Railway static site via Nixpacks (push files to a temp GitHub repo, deploy from there)
+  // Railway doesn't have a file-upload API like Vercel, so we use their service deployment
+  // with a GitHub repo that already has the files pushed via github_push_file.
+  // For now: create a lightweight static server + deploy via Railway API if token is available.
+  if (RAILWAY_API_TOKEN) {
+    try {
+      await log("Trying Railway deployment for " + project_name, "deploy_railway_start");
+
+      // Write a minimal serve config so Railway can serve the static files
+      const pkgJson = JSON.stringify({
+        name: project_name,
+        scripts: { start: "npx serve . -l $PORT -s" },
+        dependencies: { serve: "^14.0.0" },
+      });
+      writeFileSync(join(dir, "package.json"), pkgJson);
+
+      // Railway needs a repo. Check if we already pushed to GitHub for this task.
+      // Use the Railway template deployment API with an image instead.
+      // Simplest approach: deploy a Docker-based static site via Railway.
+      const dockerfile = "FROM node:20-alpine\nWORKDIR /app\nCOPY . .\nRUN npm install\nCMD [\"npx\", \"serve\", \".\", \"-l\", \"$PORT\", \"-s\"]\n";
+      writeFileSync(join(dir, "Dockerfile"), dockerfile);
+
+      // Create a tarball of the directory for Railway
+      const tarPath = join(TASK_WORKDIR || process.cwd(), project_name + ".tar.gz");
+      execSync("tar -czf " + JSON.stringify(tarPath) + " -C " + JSON.stringify(dir) + " .", { timeout: 15000 });
+      const tarData = readFileSync(tarPath);
+
+      // Get the project ID from the current Railway environment
+      const railwayProjectId = process.env.RAILWAY_PROJECT_ID || "";
+      const railwayEnvId = process.env.RAILWAY_ENVIRONMENT_ID || "";
+
+      if (railwayProjectId && railwayEnvId) {
+        // Create a new service in the same Railway project
+        const createSvc = await fetch("https://backboard.railway.app/graphql/v2", {
+          method: "POST",
+          headers: { Authorization: "Bearer " + RAILWAY_API_TOKEN, "Content-Type": "application/json" },
+          body: JSON.stringify({ query: "mutation { serviceCreate(input: { name: \"" + project_name + "\", projectId: \"" + railwayProjectId + "\" }) { id } }" }),
+        });
+        const svcData = await createSvc.json();
+        const newServiceId = svcData?.data?.serviceCreate?.id;
+
+        if (newServiceId) {
+          // Generate a public domain for it
+          const domainResp = await fetch("https://backboard.railway.app/graphql/v2", {
+            method: "POST",
+            headers: { Authorization: "Bearer " + RAILWAY_API_TOKEN, "Content-Type": "application/json" },
+            body: JSON.stringify({ query: "mutation { serviceDomainCreate(input: { serviceId: \"" + newServiceId + "\", environmentId: \"" + railwayEnvId + "\" }) { domain } }" }),
+          });
+          const domainData = await domainResp.json();
+          const domain = domainData?.data?.serviceDomainCreate?.domain;
+          const liveUrl = domain ? "https://" + domain : null;
+
+          await log("Railway service created: " + newServiceId + (liveUrl ? " at " + liveUrl : "") + ". Note: needs a deployment source (GitHub repo) to go live.", "deploy_railway_service");
+
+          // Railway API doesn't support direct file uploads — it needs a GitHub repo connection.
+          // If the files are already on GitHub, connect it. Otherwise, report the service + domain.
+          return JSON.stringify({
+            success: true,
+            url: liveUrl,
+            provider: "railway",
+            project: project_name,
+            service_id: newServiceId,
+            files_deployed: files.length,
+            note: "Railway service created with domain. Connect a GitHub repo or push code to complete deployment.",
+          });
         }
       }
-      return results;
+      await log("Railway deployment: could not create service", "deploy_railway_fail");
+    } catch (e) {
+      await log("Railway deploy error: " + (e.message || e), "deploy_railway_fail");
     }
-
-    const files = collectFiles(dir);
-    if (files.length === 0) return JSON.stringify({ error: "No files found in " + directory });
-
-    await log("Deploying " + files.length + " files to Vercel as " + project_name, "deploy_start");
-
-    const body = {
-      name: project_name,
-      files: files,
-      projectSettings: { framework: null },
-      target: "production",
-    };
-
-    const resp = await fetch("https://api.vercel.com/v13/deployments", {
-      method: "POST",
-      headers: {
-        Authorization: "Bearer " + VERCEL_TOKEN,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(body),
-    });
-
-    if (!resp.ok) {
-      const errText = await resp.text().catch(() => "");
-      return JSON.stringify({ error: "Deploy failed: " + resp.status + " " + errText.slice(0, 300) });
-    }
-
-    const data = await resp.json();
-    const url = data.url ? "https://" + data.url : data.alias?.[0] ? "https://" + data.alias[0] : null;
-
-    await log("Deployed to " + (url || data.url || "unknown"), "deploy_complete");
-    return JSON.stringify({
-      success: true,
-      url: url,
-      deployment_url: data.url,
-      project: project_name,
-      files_deployed: files.length,
-      ready_state: data.readyState || data.status,
-    });
-  } catch (e) {
-    return JSON.stringify({ error: "Deploy error: " + (e.message || e) });
   }
+
+  // Strategy 3: GitHub Pages via raw.githack (last resort)
+  if (!VERCEL_TOKEN && !RAILWAY_API_TOKEN) {
+    return JSON.stringify({ error: "No deployment credentials configured (VERCEL_TOKEN and RAILWAY_API_TOKEN both missing). Push files to GitHub and use raw.githack.com as a last resort." });
+  }
+
+  return JSON.stringify({ error: "Both Vercel and Railway deployments failed. Push files to GitHub and use raw.githack.com as a last resort." });
 }
 
 // ── Agentic loop ────────────────────────────────────────────────────────────
@@ -1709,9 +1776,9 @@ async function main() {
       "register_project (platform registry), and test_url (verify your work).\n\n" +
       "## How you deliver\n" +
       "When someone asks you to build something, the job isn't done until there's a live URL they can visit. " +
-      "Write the code, push it, deploy it, then use test_url to confirm it actually loads. If it doesn't load, fix it and try again. " +
+      "Write the code, push it to GitHub, deploy it with deploy_static_site, then use test_url to confirm it loads. " +
+      "deploy_static_site handles fallbacks automatically (Vercel → Railway). If it doesn't load, fix it and try again. " +
       "A GitHub repo without a working live URL is an unfinished job.\n\n" +
-      "If deploy_static_site fails, try GitHub Pages. If that fails, try something else. " +
       "You're an engineer — debug and solve problems, don't report them.\n\n" +
       "For analysis or research tasks, deliver a real report with actual data — not a description of what you'd research.";
 

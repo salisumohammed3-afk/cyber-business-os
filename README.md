@@ -120,6 +120,159 @@ Agents coordinate through the Supabase task queue — they don't talk to each ot
 
 ---
 
+## Agent Execution Deep-Dive
+
+This section explains the full lifecycle of a task from the moment you type a message to the moment you get a result back.
+
+### Step 1: Chat Message → Delegation
+
+When you send a message, `api/quick-reply.ts` calls Claude Opus with the orchestrator's system prompt plus recent chat history, company context, active goals, and recent tasks. The orchestrator has **no tools** in chat mode — it's text-only.
+
+If the message needs real work, the orchestrator includes the marker `[NEEDS_DELEGATION]` followed by a task title and description. The frontend parses this out, shows you a task card with the preamble as an acknowledgment, and inserts a `proposed` row in the `tasks` table.
+
+If it's a quick question, the orchestrator just answers directly and the response is saved to `chat_messages`.
+
+### Step 2: Approval → Task Queue
+
+When you approve a task, the frontend calls `api/run-agent.ts`, which sets the task status from `proposed` to `pending`. This is a thin trigger — it does no execution itself.
+
+### Step 3: Worker Claims the Task
+
+The Railway worker (`worker/index.mjs`) polls Supabase every 5 seconds. When it finds a `pending` task, it claims it with a compare-and-swap update: `status: pending → running` filtered by `id + status`. If another worker already claimed it, the update returns empty and it moves on.
+
+The worker orders tasks by `priority DESC, created_at ASC` — higher priority first, then first-in-first-out.
+
+It runs up to 2 tasks concurrently (`MAX_CONCURRENT=2`). For each claimed task, it:
+
+1. Creates a working directory at `/tmp/agent-tasks/<taskId>`
+2. Forks `runner.mjs` as a child process with `TASK_ID`, `CONVERSATION_ID`, and `TASK_WORKDIR` in the environment
+3. Pipes stdout/stderr to the worker console with task ID prefixes
+4. Cleans up the working directory when the child exits
+
+### Step 4: The Agentic Loop
+
+`runner.mjs` is the core execution engine (~2130 lines). On startup it:
+
+1. **Loads the task** from Supabase
+2. **Loads the agent definition** — system prompt, model, temperature, time budget
+3. **Injects context** — company brief, active goals, Composio apps, installed skills, relevant memories (FTS)
+4. **Checks for a checkpoint** — if this is a retry, it resumes from the saved conversation state
+5. **Selects tools** based on the agent slug (orchestrator gets management tools, engineering gets sandbox + deploy, etc.)
+6. **Runs the loop:**
+
+```
+while (turn < 200 && timeLeft > 0):
+    if timeLeft < 60s:  inject urgency warning into conversation
+    if timeLeft < 15s:  inject "THIS IS YOUR FINAL STEP"
+
+    response = callClaude(model, systemPrompt, messages, tools)
+
+    if response has tool_use blocks:
+        if tool is fail_task AND retries < 2 AND timeLeft > 30s:
+            push back ("Don't give up, try different approach")
+            continue
+
+        for each tool_use block:
+            execute the tool
+            log input + output preview
+            append tool_result to messages
+
+        saveCheckpoint(messages, turn, toolCalls)
+        continue
+
+    else (text response):
+        return { status: "completed", text }
+
+if time expired:
+    return { status: "time_expired" }
+```
+
+The `callClaude` function retries on HTTP 429 (rate limit) with 15s backoff and on 5xx with 5s backoff, up to 3 attempts.
+
+### Step 5: Quality Review
+
+Every completed task goes through `reviewResult()`:
+
+1. **Automated URL check** — `checkOutputUrls()` fetches up to 3 deploy URLs and Google Doc/Sheet links to verify they load
+2. **Claude Sonnet review** — A separate Claude call evaluates whether there's a usable deliverable. The prompt asks: "Is there something the user can immediately use — a link that works, a report with real information, a document they can open?"
+3. **Verdict:**
+   - `ACCEPT:` → task marked completed, deliverables extracted and posted to chat
+   - `REJECT:` → agent gets the feedback and runs a revision loop (3-minute budget, same tools)
+   - Up to 2 revision attempts. If still rejected, task fails with the rejection reason.
+
+### Step 6: Deliverable Extraction & Notification
+
+`extractDeliverables()` scans all tool calls for actionable outputs:
+- `deploy_static_site` → live app URL
+- `register_project` → project ID
+- `github_create_repo` → repo URL
+- `composio_execute` with Google Docs/Sheets/Gmail actions → document links, email confirmations
+
+`formatNotification()` builds a markdown message with the agent name, task title, result summary, and deliverable links. This is inserted into `chat_messages` so you see it in the chat.
+
+### Step 7: Task Chaining (Handoff)
+
+If the original delegation included `next_agent` and `next_instruction` (stored in `task.metadata.handoff`), the runner creates a follow-up task:
+
+- `next_instruction` can include `{RESULT}` which is replaced with the actual output text
+- The new task is `pending` immediately — no approval needed
+- The `parent_task_id` links back to the original so the chain is traceable
+
+Example: Research agent finishes → system creates a Growth task with the research results injected → Growth agent runs outreach using those findings.
+
+### Step 8: Auto-Retry for Failed Delegated Tasks
+
+If a delegated task (source: `agent`) fails and hasn't been retried yet:
+
+1. A new task is created with the same agent and instruction, plus context about what went wrong
+2. The instruction includes: "A previous attempt FAILED with this error: ... You MUST avoid this same mistake."
+3. Up to 2 auto-retries (`auto_retry_count` in metadata)
+4. A notification is posted to chat: "Task failed — automatically retrying with adjusted approach"
+
+### Stuck Task Recovery
+
+The worker checks for stuck tasks every 10th poll cycle (~50 seconds):
+
+1. Finds tasks with status `running` and `started_at` older than 10 minutes (`STUCK_TIMEOUT_MIN`)
+2. Skips tasks that are still running locally (in `activeTasks` map)
+3. If the task has a checkpoint and fewer than 2 retries → reset to `pending` for retry
+4. Otherwise → mark as `failed` with "Timed out" error
+
+Additionally, when a child process exits, `reconcileRunnerExit()`:
+- Abnormal exit (non-zero code or signal) → immediately mark task as `failed`
+- Clean exit (code 0) → wait 5 seconds, then check if the task is still `running` (which means the runner didn't update the status itself) → mark as failed
+
+### Checkpoint & Resume
+
+After every tool call, the runner saves a checkpoint to `tasks.metadata.checkpoint`:
+- Serialized conversation messages (truncated to avoid bloat)
+- Current turn number
+- Tools used so far
+- Timestamp
+
+If a checkpoint is larger than 500KB, only the last 10 messages are saved. On retry, the runner restores these messages and skips the initial setup, continuing from where it left off.
+
+### Time Budgets
+
+- **Default:** 5 minutes (`DEFAULT_TIME_BUDGET_MS`)
+- **Per-agent override:** `agent_definitions.time_budget_seconds` takes priority
+- **Legacy:** If `max_turns` is set, time budget = `max(max_turns * 30s, 5 minutes)`
+- **Hard cap:** 200 turns absolute maximum regardless of time
+- **Turn awareness:** At <60s remaining, a system message warns the agent to wrap up. At <15s, it demands an immediate final answer.
+- **Revision budget:** 3 minutes per revision attempt (separate from the main budget)
+
+### Composio Integration
+
+External tools (Gmail, Apollo, Google Docs, Figma, etc.) are managed through [Composio](https://composio.dev):
+
+1. **Discovery:** On startup, `runner.mjs` fetches all active connected accounts from `backend.composio.dev/api/v1/connectedAccounts`
+2. **Filtering:** Cross-references active accounts against the agent's `agent_tools` rows (DB-driven, toggled from Company Settings UI)
+3. **Access control:** Each agent only sees apps assigned to it. The orchestrator has no Composio access. Attempting to use an unassigned app returns an error.
+4. **Two-step workflow:** Agents first call `composio_find_actions(app_name, use_case)` to discover available operations, then `composio_execute(action_id, params)` to run them. Action IDs are never hardcoded.
+5. **Account matching:** `composio_execute` finds the right connected account by matching the action ID prefix against app names (handles underscores and casing variations).
+
+---
+
 ## Database Schema
 
 | Table | Purpose |
@@ -446,6 +599,58 @@ Here's every credential the system uses and where it goes:
 - **Worker:** Pushes to `main` that touch `worker/` or `api/agent-scripts/` auto-deploy to Railway via GitHub Actions
 - **Database:** Run `npx supabase db push` to apply migrations to the remote Supabase project
 - **Manual Railway deploy:** `bash scripts/deploy-railway.sh`
+
+---
+
+## Troubleshooting
+
+### Common Issues
+
+**Anthropic 500 errors / MCP beta header issues**
+
+If agents fail with HTTP 500 from Anthropic, check the `anthropic-version` and `anthropic-beta` headers in `runner.mjs`. The Messages API uses `2023-06-01` — do not add MCP beta headers unless you're using Anthropic's MCP connector (which this project does not use).
+
+**Composio toolkit name mismatches**
+
+Composio app names must match exactly what the API returns (e.g., `apollo`, not `loxo`). If `composio_find_actions` returns empty results, verify the app name against connected accounts: the `manage_integrations` tool (via the orchestrator) or the Company Settings UI shows what's actually connected.
+
+**Self-delegation loops**
+
+The orchestrator could previously delegate tasks to itself, creating infinite loops. This is now guarded: `toolDelegateTask` rejects `agentDef.slug === agentSlug`. If you see a loop, check that the delegation target slug doesn't match the current agent.
+
+**`time_expired` treated as success**
+
+If an agent makes >2 tool calls but runs out of time, the system treats it as `completed` (on the theory that it did useful work). This can produce low-quality results. If you see tasks completing with minimal output, check `task_results.data.turns` — a high turn count with `time_expired` status means the budget was too short for the task.
+
+**Tasks stuck in `running` state**
+
+The worker recovers stuck tasks automatically (10-minute timeout), but if the worker itself is down, tasks stay stuck. Check:
+- Railway worker health: `system_heartbeats` table, `service_key = 'railway_worker'`
+- Worker logs in Railway dashboard or `terminal_logs` with `source = 'railway-worker'`
+
+**CEOChat default export / Vite build failure**
+
+If `npm run build` fails with a default export error, ensure `src/components/CEOChat.tsx` uses `export default` — Vite's code splitting requires it.
+
+**Low Anthropic credit balance**
+
+The system doesn't check credit balance proactively. If agents start failing with billing errors, check your Anthropic account at [console.anthropic.com](https://console.anthropic.com). The orchestrator (Opus) costs significantly more per call than specialists (Sonnet).
+
+### Verifying the System is Working
+
+```bash
+# Check worker health (should show recent timestamp)
+curl "YOUR_SUPABASE_URL/rest/v1/system_heartbeats?service_key=eq.railway_worker&select=last_seen_at" \
+  -H "apikey: YOUR_ANON_KEY"
+
+# Check for stuck tasks
+curl "YOUR_SUPABASE_URL/rest/v1/tasks?status=eq.running&select=id,title,started_at" \
+  -H "apikey: YOUR_ANON_KEY"
+
+# Check recent terminal logs
+curl "YOUR_SUPABASE_URL/rest/v1/terminal_logs?order=created_at.desc&limit=10&select=message,source,log_type" \
+  -H "apikey: YOUR_ANON_KEY"
+```
 
 ---
 

@@ -1,0 +1,228 @@
+# PARA Memory — Cyber Business OS
+# Format: atomic facts with metadata, following PARA memory skill conventions
+# Entity: cyber-business-os (project)
+# Last updated: 2026-04-09
+
+- id: arch-001
+  fact: "System uses three-tier architecture: Vercel (frontend + API), Railway (worker), Supabase (database + realtime)"
+  category: architecture
+  confidence: 1.0
+  source: codebase
+  created: 2026-04-09
+
+- id: arch-002
+  fact: "Two execution paths: quick-reply (Opus, no tools, <5s) for chat, runner.mjs (Sonnet, full tools, 1-10min) for tasks"
+  category: architecture
+  confidence: 1.0
+  source: codebase
+  created: 2026-04-09
+
+- id: arch-003
+  fact: "runner.mjs is ~2130 lines with zero external dependencies — only Node.js builtins + fetch"
+  category: architecture
+  confidence: 1.0
+  source: codebase
+  created: 2026-04-09
+
+- id: arch-004
+  fact: "Worker polls Supabase every 5s, claims tasks via CAS (compare-and-swap), forks runner.mjs per task, max 2 concurrent"
+  category: architecture
+  confidence: 1.0
+  source: codebase
+  created: 2026-04-09
+
+- id: arch-005
+  fact: "Quality review uses separate Claude Sonnet call to evaluate deliverables, up to 2 revision retries with 3-minute budget each"
+  category: architecture
+  confidence: 1.0
+  source: codebase
+  created: 2026-04-09
+
+- id: arch-006
+  fact: "Task chaining via metadata.handoff.next_agent + next_instruction with {RESULT} placeholder substitution"
+  category: architecture
+  confidence: 1.0
+  source: codebase
+  created: 2026-04-09
+
+- id: decision-001
+  fact: "Chose Vercel + Railway split because Vercel serverless has 10-60s timeout, agent loops need 1-10 minutes"
+  category: decision
+  confidence: 1.0
+  source: session-c5f6d027
+  created: 2026-04-09
+
+- id: decision-002
+  fact: "Chose Composio for external integrations to avoid managing OAuth tokens for 30+ services individually"
+  category: decision
+  confidence: 1.0
+  source: session-c5f6d027
+  created: 2026-04-09
+
+- id: decision-003
+  fact: "Replaced turn-based agent loop with time-budget model (default 5 minutes) for more predictable costs"
+  category: decision
+  confidence: 1.0
+  source: git-history
+  created: 2026-04-09
+
+- id: decision-004
+  fact: "Orchestrator has NO tools in chat mode (quick-reply) — keeps chat fast, delegates real work through task queue"
+  category: decision
+  confidence: 1.0
+  source: codebase
+  created: 2026-04-09
+
+- id: decision-005
+  fact: "runner.mjs uses raw Supabase REST API instead of JS client to avoid adding dependencies to the worker container"
+  category: decision
+  confidence: 1.0
+  source: codebase
+  created: 2026-04-09
+
+- id: decision-006
+  fact: "Evaluated Claude Managed Agents (Anthropic hosted runtime) — concluded it replaces infra layer but not business layer; not migrating, watching as it exits beta"
+  category: decision
+  confidence: 1.0
+  source: session-1582fb20
+  created: 2026-04-09
+
+- id: bugfix-001
+  fact: "Anthropic 500 errors were caused by deprecated MCP beta headers — removed mcp_toolset references and beta headers"
+  category: bugfix
+  confidence: 1.0
+  source: session-c5f6d027
+  created: 2026-04-09
+
+- id: bugfix-002
+  fact: "Composio toolkit 'loxo' was invalid — the correct toolkit name for lead data is 'apollo'"
+  category: bugfix
+  confidence: 1.0
+  source: session-c5f6d027
+  created: 2026-04-09
+
+- id: bugfix-003
+  fact: "Self-delegation loop fixed by adding guard: toolDelegateTask rejects when agentDef.slug === agentSlug"
+  category: bugfix
+  confidence: 1.0
+  source: session-c5f6d027
+  created: 2026-04-09
+
+- id: bugfix-004
+  fact: "time_expired treated as success when agent made >2 tool calls — can produce low-quality results, known tradeoff"
+  category: bugfix
+  confidence: 0.8
+  source: session-c5f6d027
+  created: 2026-04-09
+
+- id: bugfix-005
+  fact: "CEOChat.tsx needed default export for Vite code splitting — named export caused build failure"
+  category: bugfix
+  confidence: 1.0
+  source: session-5174ce00
+  created: 2026-04-09
+
+- id: bugfix-006
+  fact: "FTS query sanitization was needed — special characters in search queries broke Supabase full-text search"
+  category: bugfix
+  confidence: 1.0
+  source: git-history
+  created: 2026-04-09
+
+- id: bugfix-007
+  fact: "Vercel SSO protection was blocking agent-deployed sites — added auto-disable via PATCH /v9/projects/{id}"
+  category: bugfix
+  confidence: 1.0
+  source: git-history
+  created: 2026-04-09
+
+- id: ops-001
+  fact: "Worker health monitored via system_heartbeats table (service_key: railway_worker, updated every 5th poll)"
+  category: operations
+  confidence: 1.0
+  source: codebase
+  created: 2026-04-09
+
+- id: ops-002
+  fact: "Railway worker deployed via GitHub Actions on changes to worker/ or api/agent-scripts/ — see .github/workflows/deploy-railway.yml"
+  category: operations
+  confidence: 1.0
+  source: codebase
+  created: 2026-04-09
+
+- id: ops-003
+  fact: "Anthropic credit balance was flagged as low during session 38216589 — monitor billing at console.anthropic.com"
+  category: operations
+  confidence: 0.9
+  source: session-38216589
+  created: 2026-04-09
+
+- id: ops-004
+  fact: "API secrets were pasted in Cursor sessions — credential rotation is advised"
+  category: operations
+  confidence: 1.0
+  source: session-38216589
+  created: 2026-04-09
+
+- id: open-001
+  fact: "Apollo auth via Composio not yet confirmed working — need to verify connected account exists and is active"
+  category: open-item
+  confidence: 0.8
+  source: session-c5f6d027
+  created: 2026-04-09
+
+- id: open-002
+  fact: "Prompt caching (Anthropic cache breakpoints) not implemented — would reduce costs significantly on long conversations"
+  category: open-item
+  confidence: 1.0
+  source: session-1582fb20
+  created: 2026-04-09
+
+- id: open-003
+  fact: "Conversation compaction not implemented — long conversations send full context on every turn, increasing token usage"
+  category: open-item
+  confidence: 1.0
+  source: session-1582fb20
+  created: 2026-04-09
+
+- id: open-004
+  fact: "Sandbox security is weak — agent tasks run in bare /tmp directories on the Railway host, not isolated containers"
+  category: open-item
+  confidence: 1.0
+  source: session-1582fb20
+  created: 2026-04-09
+
+- id: open-005
+  fact: "Claude Managed Agents worth revisiting when multi-agent and memory features exit research preview"
+  category: open-item
+  confidence: 0.9
+  source: session-1582fb20
+  created: 2026-04-09
+
+- id: stack-001
+  fact: "Frontend: React 18, Vite 5, Tailwind 3, shadcn/ui (Radix), Framer Motion, TanStack Query, React Router 6"
+  category: tech-stack
+  confidence: 1.0
+  source: package.json
+  created: 2026-04-09
+
+- id: stack-002
+  fact: "Backend: Vercel serverless (TypeScript), Railway Docker worker (Node.js ESM), Supabase PostgreSQL + Realtime"
+  category: tech-stack
+  confidence: 1.0
+  source: codebase
+  created: 2026-04-09
+
+- id: stack-003
+  fact: "AI: Anthropic Claude API — claude-opus-4-6 for orchestrator chat, claude-sonnet-4-20250514 for specialists and review"
+  category: tech-stack
+  confidence: 1.0
+  source: codebase
+  created: 2026-04-09
+
+- id: stack-004
+  fact: "External integrations: Composio SDK for Apollo, Gmail, LinkedIn, Google Docs/Sheets/Calendar, Figma, Granola, etc."
+  category: tech-stack
+  confidence: 1.0
+  source: codebase
+  created: 2026-04-09

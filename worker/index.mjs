@@ -147,34 +147,33 @@ async function reconcileRunnerExit(taskId, code, signal) {
       return;
     }
 
-    setTimeout(async () => {
-      try {
-        const r2 = await sbSelect("tasks", { id: `eq.${taskId}` }, { select: "status,company_id", limit: 1 });
-        const t2 = r2?.[0];
-        if (t2?.status === "running") {
-          await sbUpdate(
-            "tasks",
-            {
-              status: "failed",
-              error_message: "Runner exited 0 but task still running (worker reconciliation)",
-              completed_at: new Date().toISOString(),
-            },
-            { id: `eq.${taskId}`, status: "eq.running" },
-          );
-          await termLog(
-            "Runner exit reconcile: task " + taskId.slice(0, 8) + " was still running after clean exit",
-            {
-              taskId,
-              companyId: t2.company_id,
-              logType: "worker_exit_reconcile",
-              metadata: { anomaly: "running_after_exit_0" },
-            },
-          );
-        }
-      } catch (e) {
-        emitWorkerLog("error", "Delayed exit reconcile error: " + e.message, { task_id: taskId });
+    // Immediate check — if runner exited 0 but task is still running, mark failed
+    try {
+      const r2 = await sbSelect("tasks", { id: `eq.${taskId}` }, { select: "status,company_id", limit: 1 });
+      const t2 = r2?.[0];
+      if (t2?.status === "running") {
+        await sbUpdate(
+          "tasks",
+          {
+            status: "failed",
+            error_message: "Runner exited 0 but task still running (worker reconciliation)",
+            completed_at: new Date().toISOString(),
+          },
+          { id: `eq.${taskId}`, status: "eq.running" },
+        );
+        await termLog(
+          "Runner exit reconcile: task " + taskId.slice(0, 8) + " was still running after clean exit",
+          {
+            taskId,
+            companyId: t2.company_id,
+            logType: "worker_exit_reconcile",
+            metadata: { anomaly: "running_after_exit_0" },
+          },
+        );
       }
-    }, 5000);
+    } catch (e) {
+      emitWorkerLog("error", "Exit reconcile error: " + e.message, { task_id: taskId });
+    }
   } catch (e) {
     emitWorkerLog("error", "reconcileRunnerExit: " + e.message, { task_id: taskId });
   }
@@ -183,6 +182,21 @@ async function reconcileRunnerExit(taskId, code, signal) {
 // ── Stuck task recovery ─────────────────────────────────────────────────────
 
 async function recoverStuckTasks() {
+  // Kill runners for tasks that were cancelled while running
+  try {
+    const cancelled = await sbSelect("tasks", { status: "eq.cancelled" }, { select: "id", limit: 20 });
+    for (const task of (cancelled || [])) {
+      const child = activeTasks.get(task.id);
+      if (child) {
+        child.kill("SIGTERM");
+        activeTasks.delete(task.id);
+        await termLog("Killed runner for cancelled task " + task.id.slice(0, 8), { taskId: task.id, logType: "cancel_cleanup" });
+      }
+    }
+  } catch (e) {
+    emitWorkerLog("error", "Cancel cleanup error: " + e.message, { log_type: "cancel_cleanup_error" });
+  }
+
   const cutoff = new Date(Date.now() - STUCK_TIMEOUT_MIN * 60 * 1000).toISOString();
   try {
     const stuck = await sbSelect("tasks", {

@@ -1,6 +1,6 @@
 import { useRef, useEffect, useState, useMemo, useCallback, type KeyboardEvent, type DragEvent, type ClipboardEvent } from 'react'
 import ReactMarkdown from 'react-markdown'
-import { Bot, Pencil, Globe, GitBranch, FileText, Mail, CheckCircle2, Sheet, Paperclip, X, Image as ImageIcon } from 'lucide-react'
+import { Bot, Pencil, Globe, GitBranch, FileText, Mail, CheckCircle2, Sheet, Paperclip, X, Image as ImageIcon, Loader2, MessageSquarePlus } from 'lucide-react'
 import { useLiveChat, type Attachment } from '@/hooks/useLiveChat'
 import { useCompany } from '@/contexts/CompanyContext'
 import { supabase } from '@/integrations/supabase/client'
@@ -43,7 +43,7 @@ const DELIVERABLE_ICONS: Record<string, typeof Globe> = {
 
 export function CEOChat() {
   const { company } = useCompany()
-  const { messages, loading, error, sendMessage } = useLiveChat(company?.id ?? null)
+  const { messages, loading, error, sendMessage, clearConversation } = useLiveChat(company?.id ?? null)
   const scrollContainerRef = useRef<HTMLDivElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -164,6 +164,18 @@ export function CEOChat() {
 
   return (
     <div className="flex flex-col h-full">
+      <div className="flex items-center justify-between px-4 py-2 border-b">
+        <span className="text-sm font-medium text-gray-600">Chat</span>
+        <button
+          onClick={clearConversation}
+          disabled={!company || messages.length === 0}
+          className="flex items-center gap-1 text-xs text-gray-500 hover:text-gray-700 disabled:opacity-40 disabled:cursor-not-allowed"
+          title="Start new conversation"
+        >
+          <MessageSquarePlus size={14} />
+          New Chat
+        </button>
+      </div>
       <div
         ref={scrollContainerRef}
         className="flex-1 overflow-y-auto p-4 space-y-4"
@@ -201,6 +213,18 @@ export function CEOChat() {
                 ? meta.attachments as Array<{ name: string; url: string; type: string; size: number }>
                 : []
             )
+
+            // Render progress messages as subtle status indicators
+            if (meta?.progress === true) {
+              return (
+                <div key={msg.id} className="flex justify-start">
+                  <div className="text-xs text-gray-400 italic px-4 py-1 flex items-center gap-1.5">
+                    <Loader2 size={10} className="animate-spin" />
+                    {msg.content}
+                  </div>
+                </div>
+              )
+            }
 
             if (msg.role === 'user') {
               return (

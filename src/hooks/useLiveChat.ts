@@ -55,6 +55,7 @@ export function useLiveChat(companyId: string | null) {
   const [waitingForReply, setWaitingForReply] = useState(false)
   const convIdRef = useRef<string | null>(conversationIdState)
   convIdRef.current = conversationIdState
+  const lastRealtimeRef = useRef<number>(0)
 
   // When companyId changes, load the stored conversation for that company
   useEffect(() => {
@@ -103,6 +104,8 @@ export function useLiveChat(companyId: string | null) {
   useEffect(() => {
     if (!conversationIdState || !waitingForReply) return
     const interval = setInterval(() => {
+      // Skip polling if Realtime delivered a message within the last 10 seconds
+      if (Date.now() - lastRealtimeRef.current < 10_000) return
       fetchMessages(conversationIdState)
     }, 2000)
     return () => clearInterval(interval)
@@ -123,6 +126,7 @@ export function useLiveChat(companyId: string | null) {
         },
         (payload) => {
           const row = payload.new as ChatMessageRow
+          lastRealtimeRef.current = Date.now()
           setMessages((prev) =>
             prev.some((m) => m.id === row.id) ? prev : [...prev, row]
           )
@@ -260,11 +264,21 @@ export function useLiveChat(companyId: string | null) {
     [companyId]
   )
 
+  const clearConversation = useCallback(() => {
+    if (!companyId) return
+    try { localStorage.removeItem(convStorageKey(companyId)) } catch {}
+    setConversationIdState(null)
+    convIdRef.current = null
+    setMessages([])
+    setWaitingForReply(false)
+  }, [companyId])
+
   return {
     messages,
     conversationId: conversationIdState,
     loading,
     error,
     sendMessage,
+    clearConversation,
   }
 }

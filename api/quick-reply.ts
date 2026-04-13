@@ -3,6 +3,21 @@ import type { VercelRequest, VercelResponse } from "@vercel/node";
 
 const DELEGATION_RE = /\[NEEDS_DELEGATION\]/;
 
+// In-memory rate limiter (resets on cold start / redeploy)
+const rateLimitMap = new Map<string, number[]>();
+const RATE_LIMIT_WINDOW = 60_000; // 1 minute
+const RATE_LIMIT_MAX = 10;
+
+function checkRateLimit(companyId: string): boolean {
+  const now = Date.now();
+  const timestamps = rateLimitMap.get(companyId) || [];
+  const recent = timestamps.filter(t => now - t < RATE_LIMIT_WINDOW);
+  if (recent.length >= RATE_LIMIT_MAX) return false;
+  recent.push(now);
+  rateLimitMap.set(companyId, recent);
+  return true;
+}
+
 const ROUTING_ADDENDUM = `
 
 ## How to respond
@@ -31,9 +46,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   const supabaseUrl =
     process.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL;
-  const supabaseKey =
-    process.env.SUPABASE_SERVICE_ROLE_KEY ||
-    process.env.VITE_SUPABASE_PUBLISHABLE_KEY;
+  const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
   const anthropicKey = process.env.ANTHROPIC_API_KEY;
 
   if (!supabaseUrl || !supabaseKey)
@@ -47,6 +60,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       .status(400)
       .json({ error: "conversation_id, company_id, and message are required" });
 
+  if (!checkRateLimit(company_id))
+    return res.status(429).json({ error: "Rate limit exceeded. Max " + RATE_LIMIT_MAX + " requests per minute." });
+
   const attachmentList: Array<{ name: string; url: string; type: string; size: number }> =
     Array.isArray(attachments) ? attachments : [];
 
@@ -57,7 +73,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       await Promise.all([
         supabase
           .from("agent_definitions")
-          .select("id, slug, system_prompt")
+          .select("id, slug, system_prompt, model")
           .eq("slug", "orchestrator")
           .eq("company_id", company_id),
         supabase
@@ -70,7 +86,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           .select("role, content, metadata")
           .eq("conversation_id", conversation_id)
           .order("created_at", { ascending: false })
-          .limit(12),
+          .limit(30),
         supabase
           .from("company_goals")
           .select(
@@ -148,11 +164,15 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         const meta = m.metadata as Record<string, unknown> | null;
         if (meta?.notification === true) return false;
         if (meta?.error === true) return false;
+        if (meta?.progress === true) return false; // skip progress messages
         return true;
       })
-      .map((m: Record<string, string>) => ({
+      .map((m: Record<string, string>, i: number, arr: Record<string, string>[]) => ({
         role: m.role === "user" ? ("user" as const) : ("assistant" as const),
-        content: m.content,
+        // Compact older messages (beyond last 8) to save tokens
+        content: i < arr.length - 8
+          ? (m.content || "").slice(0, 100) + ((m.content || "").length > 100 ? "..." : "")
+          : m.content,
       }));
 
     const messages: Array<{ role: "user" | "assistant"; content: unknown }> = [];
@@ -200,7 +220,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         "content-type": "application/json",
       },
       body: JSON.stringify({
-        model: "claude-opus-4-6",
+        model: orchestrator?.model || "claude-opus-4-6",
         max_tokens: 1024,
         temperature: 0.3,
         system: systemPrompt,

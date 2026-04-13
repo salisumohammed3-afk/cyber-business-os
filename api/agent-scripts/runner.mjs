@@ -6,7 +6,7 @@ import {
   readFileSync, writeFileSync, mkdirSync, existsSync,
   readdirSync, statSync,
 } from "node:fs";
-import { join, dirname } from "node:path";
+import { join, dirname, resolve } from "node:path";
 
 // ── Environment ─────────────────────────────────────────────────────────────
 
@@ -31,6 +31,13 @@ if (!TASK_ID || !SUPABASE_URL || !SUPABASE_KEY || !ANTHROPIC_KEY) {
 
 const RUN_ID = randomUUID();
 const USE_JSON_LOG = process.env.LOG_FORMAT === "json" || process.env.NODE_ENV === "production";
+
+// ── Token usage tracking ───────────────────────────────────────────────────
+const tokenUsage = {
+  input_tokens: 0, output_tokens: 0,
+  cache_creation_input_tokens: 0, cache_read_input_tokens: 0,
+  api_calls: 0,
+};
 
 // ── Supabase REST helpers ───────────────────────────────────────────────────
 
@@ -106,6 +113,7 @@ async function callClaude(model, system, messages, tools, maxTokens = 4096, temp
     const headers = {
       "x-api-key": ANTHROPIC_KEY,
       "anthropic-version": "2023-06-01",
+      "anthropic-beta": "prompt-caching-2024-07-31",
       "content-type": "application/json",
     };
 
@@ -119,7 +127,18 @@ async function callClaude(model, system, messages, tools, maxTokens = 4096, temp
       headers,
       body: JSON.stringify(body),
     });
-    if (resp.ok) return await resp.json();
+    if (resp.ok) {
+      const data = await resp.json();
+      // Track token usage
+      if (data.usage) {
+        tokenUsage.input_tokens += data.usage.input_tokens || 0;
+        tokenUsage.output_tokens += data.usage.output_tokens || 0;
+        tokenUsage.cache_creation_input_tokens += data.usage.cache_creation_input_tokens || 0;
+        tokenUsage.cache_read_input_tokens += data.usage.cache_read_input_tokens || 0;
+      }
+      tokenUsage.api_calls++;
+      return data;
+    }
 
     const is429 = resp.status === 429;
     const is5xx = resp.status >= 500;
@@ -370,7 +389,6 @@ const ENGINEERING_TOOLS = [
             required: ["name", "type"],
           },
         },
-        sql: { type: "string", description: "Raw ALTER TABLE SQL (table name will be prefixed)" },
       },
       required: ["action"],
     },
@@ -590,12 +608,26 @@ async function toolWebSearch(input) {
   return results || "No results found.";
 }
 
+const ALLOWED_QUERY_TABLES = new Set([
+  "agents", "tasks", "chat_messages", "conversations",
+  "agent_definitions", "memories", "companies", "company_goals", "projects",
+]);
+
 async function toolDatabaseQuery(input) {
+  if (!ALLOWED_QUERY_TABLES.has(input.table)) {
+    return JSON.stringify({ error: "Access denied: table '" + input.table + "' is not queryable. Allowed: " + [...ALLOWED_QUERY_TABLES].join(", ") });
+  }
+
   const params = new URLSearchParams({ select: input.select || "*" });
   if (input.limit) params.set("limit", String(input.limit));
   else params.set("limit", "25");
   if (input.order_by) params.set("order", input.order_by + "." + (input.ascending === false ? "desc" : "asc"));
   for (const f of (input.filters || [])) params.set(f.column, f.operator + "." + f.value);
+
+  // Enforce company isolation for multi-tenant safety
+  if (companyId && input.table !== "companies") {
+    params.set("company_id", "eq." + companyId);
+  }
 
   const r = await fetch(SUPABASE_URL + "/rest/v1/" + input.table + "?" + params, { headers: SB_HEADERS });
   if (!r.ok) { const e = await r.text(); return JSON.stringify({ error: e }); }
@@ -773,24 +805,18 @@ async function toolDatabaseAdmin(input) {
   }
 
   if (action === "alter_table") {
-    if (input.sql) {
-      const safeSql = input.sql.replace(new RegExp(input.table_name, "g"), fullName);
-      const { error } = await sbRpc(PROJECTS_DB_URL, PROJECTS_DB_KEY, "exec_sql", { query: safeSql });
-      if (error) return JSON.stringify({ error: "alter_table failed: " + error });
-      return JSON.stringify({ success: true, table: fullName });
+    if (!input.columns?.length) {
+      return JSON.stringify({ error: "columns array required for alter_table (raw SQL is not supported)" });
     }
-    if (input.columns?.length) {
-      const adds = input.columns.map(c =>
-        'ADD COLUMN IF NOT EXISTS "' + c.name + '" ' + c.type +
-        (c.nullable === false ? " NOT NULL" : "") +
-        (c.default ? " DEFAULT " + c.default : "")
-      );
-      const sql = 'ALTER TABLE public."' + fullName + '" ' + adds.join(", ");
-      const { error } = await sbRpc(PROJECTS_DB_URL, PROJECTS_DB_KEY, "exec_sql", { query: sql });
-      if (error) return JSON.stringify({ error: "alter_table failed: " + error });
-      return JSON.stringify({ success: true, table: fullName });
-    }
-    return JSON.stringify({ error: "columns or sql required for alter_table" });
+    const adds = input.columns.map(c =>
+      'ADD COLUMN IF NOT EXISTS "' + c.name + '" ' + c.type +
+      (c.nullable === false ? " NOT NULL" : "") +
+      (c.default ? " DEFAULT " + c.default : "")
+    );
+    const sql = 'ALTER TABLE public."' + fullName + '" ' + adds.join(", ");
+    const { error } = await sbRpc(PROJECTS_DB_URL, PROJECTS_DB_KEY, "exec_sql", { query: sql });
+    if (error) return JSON.stringify({ error: "alter_table failed: " + error });
+    return JSON.stringify({ success: true, table: fullName });
   }
 
   return JSON.stringify({ error: "Unknown action: " + action });
@@ -1107,6 +1133,21 @@ async function toolManageIntegrations(input) {
 
 // ── Sandbox filesystem tools (engineering agent only) ───────────────────────
 
+const STRIPPED_ENV_KEYS = [
+  "ANTHROPIC_API_KEY", "SUPABASE_KEY", "COMPOSIO_API_KEY",
+  "SUPABASE_SERVICE_ROLE_KEY", "VERCEL_TOKEN", "RAILWAY_TOKEN",
+  "RAILWAY_DEPLOY_TOKEN", "SERPER_API_KEY", "PROJECTS_SUPABASE_KEY",
+];
+
+function assertSafePath(requestedPath) {
+  const base = resolve(TASK_WORKDIR || process.cwd());
+  const resolved = resolve(base, requestedPath);
+  if (!resolved.startsWith(base + "/") && resolved !== base) {
+    throw new Error("Path traversal blocked: " + requestedPath + " resolves outside sandbox");
+  }
+  return resolved;
+}
+
 const BLOCKING_PATTERNS = [
   /\bhttp\.server\b/, /\bserve\s/, /\bnpx\s+serve\b/, /\blive-server\b/,
   /\bnginx\b/, /\bapache2?\b/, /\buvicorn\b/, /\bgunicorn\b/,
@@ -1125,13 +1166,16 @@ function toolSandboxBash(input) {
   }
 
   try {
-    const cwd = input.cwd || TASK_WORKDIR || process.cwd();
+    const cwd = assertSafePath(input.cwd || TASK_WORKDIR || ".");
+    const safeEnv = { ...process.env };
+    for (const key of STRIPPED_ENV_KEYS) delete safeEnv[key];
     const stdout = execSync(cmd, {
       cwd,
       encoding: "utf-8",
       timeout: 120_000,
       maxBuffer: 2 * 1024 * 1024,
       shell: true,
+      env: safeEnv,
     });
     return JSON.stringify({ stdout: stdout.slice(0, 8000) });
   } catch (e) {
@@ -1146,8 +1190,9 @@ function toolSandboxBash(input) {
 
 function toolSandboxReadFile(input) {
   try {
-    if (!existsSync(input.path)) return JSON.stringify({ error: "File not found: " + input.path });
-    const content = readFileSync(input.path, "utf-8");
+    const safePath = assertSafePath(input.path);
+    if (!existsSync(safePath)) return JSON.stringify({ error: "File not found: " + input.path });
+    const content = readFileSync(safePath, "utf-8");
     return JSON.stringify({ content: content.slice(0, 20000), truncated: content.length > 20000 });
   } catch (e) {
     return JSON.stringify({ error: e.message });
@@ -1156,9 +1201,10 @@ function toolSandboxReadFile(input) {
 
 function toolSandboxWriteFile(input) {
   try {
-    const dir = dirname(input.path);
+    const safePath = assertSafePath(input.path);
+    const dir = dirname(safePath);
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-    writeFileSync(input.path, input.content);
+    writeFileSync(safePath, input.content);
     return JSON.stringify({ success: true, path: input.path, bytes: input.content.length });
   } catch (e) {
     return JSON.stringify({ error: e.message });
@@ -1167,7 +1213,7 @@ function toolSandboxWriteFile(input) {
 
 function toolSandboxListFiles(input) {
   try {
-    const dir = input.path || TASK_WORKDIR || process.cwd();
+    const dir = assertSafePath(input.path || TASK_WORKDIR || ".");
     if (!existsSync(dir)) return JSON.stringify({ error: "Directory not found: " + dir });
     const entries = readdirSync(dir).map(name => {
       try {
@@ -1260,13 +1306,13 @@ async function toolDeployStaticSite(input) {
         scripts: { start: "npx serve . -l $PORT -s" },
         dependencies: { serve: "^14.0.0" },
       });
-      writeFileSync(join(dir, "package.json"), pkgJson);
+      if (!existsSync(join(dir, "package.json"))) writeFileSync(join(dir, "package.json"), pkgJson);
 
       // Railway needs a repo. Check if we already pushed to GitHub for this task.
       // Use the Railway template deployment API with an image instead.
       // Simplest approach: deploy a Docker-based static site via Railway.
       const dockerfile = "FROM node:20-alpine\nWORKDIR /app\nCOPY . .\nRUN npm install\nCMD [\"npx\", \"serve\", \".\", \"-l\", \"$PORT\", \"-s\"]\n";
-      writeFileSync(join(dir, "Dockerfile"), dockerfile);
+      if (!existsSync(join(dir, "Dockerfile"))) writeFileSync(join(dir, "Dockerfile"), dockerfile);
 
       // Create a tarball of the directory for Railway
       const tarPath = join(TASK_WORKDIR || process.cwd(), project_name + ".tar.gz");
@@ -1329,6 +1375,38 @@ async function toolDeployStaticSite(input) {
 
 // ── Agentic loop ────────────────────────────────────────────────────────────
 
+function compactMessages(messages) {
+  if (messages.length <= 15) return;
+  const keep = 8;
+  const head = messages.slice(0, 1);
+  const tail = messages.slice(-keep);
+  const middle = messages.slice(1, -keep);
+
+  const toolNames = [];
+  const textSnippets = [];
+  for (const m of middle) {
+    if (Array.isArray(m.content)) {
+      for (const b of m.content) {
+        if (b.type === "tool_use") toolNames.push(b.name);
+        if (b.type === "tool_result") textSnippets.push((b.content || "").slice(0, 100));
+      }
+    } else if (typeof m.content === "string" && m.role === "assistant") {
+      textSnippets.push(m.content.slice(0, 200));
+    }
+  }
+
+  const summary = "[Previous work summary: " + middle.length + " messages compacted. " +
+    "Tools used: " + [...new Set(toolNames)].join(", ") + ". " +
+    "Key outputs: " + textSnippets.slice(0, 3).join("; ").slice(0, 500) + "]";
+
+  messages.length = 0;
+  messages.push(head[0]);
+  messages.push({ role: "assistant", content: "Understood. Working on this." });
+  messages.push({ role: "user", content: summary });
+  messages.push({ role: "assistant", content: "Continuing from where I left off." });
+  for (const m of tail) messages.push(m);
+}
+
 async function saveCheckpoint(messages, turn, allToolCalls) {
   try {
     const serializable = messages.map(m => {
@@ -1343,10 +1421,15 @@ async function saveCheckpoint(messages, turn, allToolCalls) {
       }
       return m;
     });
+    const workSummary = "Completed " + turn + " steps. Tools used: " +
+      [...new Set(allToolCalls.map(t => t.tool))].join(", ") + ". " +
+      "Last actions: " + allToolCalls.slice(-3).map(t => t.tool + "(" + JSON.stringify(t.input).slice(0, 50) + ")").join(", ");
+
     const checkpoint = {
       messages: serializable,
       turn,
       tools_used: [...new Set(allToolCalls.map(t => t.tool))],
+      work_summary: workSummary,
       saved_at: new Date().toISOString(),
     };
     const jsonSize = JSON.stringify(checkpoint).length;
@@ -1378,6 +1461,16 @@ async function runLoop(model, systemPrompt, messages, tools, timeBudgetMs, tempe
     if (remaining <= 0) break;
 
     turn++;
+
+    // Check for cancellation every 5 turns
+    if (turn % 5 === 0) {
+      const taskCheck = await sbGet("tasks", { id: "eq." + TASK_ID }, { select: "status", single: true });
+      if (taskCheck?.status === "cancelled") {
+        await log("Task cancelled by user — exiting", "task_cancelled");
+        return { status: "cancelled", text: "Task was cancelled by user", toolCalls: allToolCalls, turns: turn };
+      }
+    }
+
     await log("Step " + turn + " (" + elapsed() + "s elapsed, " + Math.round(remaining / 1000) + "s left) — calling " + model);
 
     // Warn when genuinely running low on time (< 60s left, and we've been working for a while)
@@ -1396,6 +1489,13 @@ async function runLoop(model, systemPrompt, messages, tools, timeBudgetMs, tempe
     }
 
     const response = await callClaude(model, systemPrompt, messages, tools, 4096, temperature);
+
+    // Log per-turn token usage
+    if (response.usage) {
+      const u = response.usage;
+      await log("Tokens: " + (u.input_tokens || 0) + " in, " + (u.output_tokens || 0) + " out" +
+        (u.cache_read_input_tokens ? ", " + u.cache_read_input_tokens + " cache-read" : ""), "token_usage");
+    }
 
     const toolBlocks = response.content.filter(b => b.type === "tool_use");
 
@@ -1448,6 +1548,22 @@ async function runLoop(model, systemPrompt, messages, tools, timeBudgetMs, tempe
       messages.push({ role: "user", content: results });
 
       await saveCheckpoint(messages, turn, allToolCalls);
+
+      // Compact old messages every 5 turns to control context growth
+      if (turn % 5 === 0) compactMessages(messages);
+
+      // Post progress message to chat every 3 turns
+      if (turn % 3 === 0 && CONVERSATION_ID) {
+        const recentTools = allToolCalls.slice(-3).map(t => t.tool).join(", ");
+        await sbInsert("chat_messages", {
+          conversation_id: CONVERSATION_ID,
+          role: "orchestrator",
+          content: "Working on it... (step " + turn + ", using: " + recentTools + ")",
+          timestamp: new Date().toISOString(),
+          metadata: { progress: true, agent_slug: agentSlug, turn },
+        }).catch(() => {}); // non-fatal
+      }
+
       continue;
     }
 
@@ -1509,7 +1625,7 @@ async function checkOutputUrls(resultText, toolCalls) {
   return facts;
 }
 
-async function reviewResult(agentName, instruction, resultText, resultStatus, toolCalls) {
+async function reviewResult(agentName, instruction, resultText, resultStatus, toolCalls, previousRejection = null) {
   try {
     // Run automated URL health checks
     const urlFacts = await checkOutputUrls(resultText, toolCalls || []);
@@ -1547,7 +1663,10 @@ async function reviewResult(agentName, instruction, resultText, resultStatus, to
       "If the task asked for something to be built and there's no working link, that's not done. " +
       "If the task asked for research and the output is vague or generic, that's not done. " +
       "But if there's a real, usable output — even if it's not perfect — accept it.\n\n" +
-      "Respond with ACCEPT: followed by what the deliverable is, or REJECT: followed by what's specifically missing or broken.";
+      "Respond with ACCEPT: followed by what the deliverable is, or REJECT: followed by what's specifically missing or broken." +
+      (previousRejection
+        ? "\n\nPREVIOUS REJECTION REASON: " + previousRejection + "\nSpecifically check whether this issue has been addressed in the revised output."
+        : "");
 
     const resp = await callClaude("claude-sonnet-4-20250514",
       "You review agent work. Judge like a manager: is there a usable deliverable the user can act on right now?",
@@ -1694,6 +1813,15 @@ async function main() {
   }
   companyId = companyId || "11111111-1111-1111-1111-111111111111";
 
+  // Build system prompt as cached blocks for prompt caching
+  // Each block with cache_control gets cached by Anthropic (90% cost reduction on cache hits)
+  const systemBlocks = [];
+  const CACHE = { type: "ephemeral" };
+
+  // Block 1: Base agent prompt (stable across tasks for same agent)
+  systemBlocks.push({ type: "text", text: systemPrompt, cache_control: CACHE });
+
+  // Block 2: Company context
   const company = await sbGet("companies", { id: "eq." + companyId }, { select: "name,brief", single: true });
   if (company?.brief) {
     const b = company.brief;
@@ -1703,9 +1831,12 @@ async function main() {
     if (b.target_customers) parts.push("Customers: " + b.target_customers);
     if (b.tone_of_voice) parts.push("Tone: " + b.tone_of_voice);
     if (b.context_notes) parts.push("Notes: " + b.context_notes);
-    if (parts.length) systemPrompt += "\n\n## Company Context (" + company.name + ")\n" + parts.join("\n");
+    if (parts.length) {
+      systemBlocks.push({ type: "text", text: "\n\n## Company Context (" + company.name + ")\n" + parts.join("\n"), cache_control: CACHE });
+    }
   }
 
+  // Block 3: Active goals
   const goals = await sbGet("company_goals", {
     company_id: "eq." + companyId, status: "eq.active",
   }, { order: "priority.asc" });
@@ -1715,7 +1846,7 @@ async function main() {
       (g.target_metric ? " (" + (g.current_value ?? 0) + "/" + (g.target_value ?? "?") + " " + g.target_metric + ")" : "") +
       (g.timeframe ? " — " + g.timeframe : "")
     );
-    systemPrompt += "\n\n## Active Goals\n" + lines.join("\n");
+    systemBlocks.push({ type: "text", text: "\n\n## Active Goals\n" + lines.join("\n"), cache_control: CACHE });
   }
 
   // 4. Load external integrations
@@ -1740,16 +1871,17 @@ async function main() {
     }
   }
 
-  // 4b. Inject external integrations into system prompt
+  // Block 4: Composio integrations
   if (composioApps.length > 0) {
-    systemPrompt += "\n\n## External Integrations (via Composio)\n" +
+    systemBlocks.push({ type: "text", text: "\n\n## External Integrations (via Composio)\n" +
       "You have access to these external services. Use composio_find_actions(app_name, use_case) to discover available operations, then composio_execute(action_id, params) to run them.\n" +
       "Your allowed apps: " + composioApps.join(", ") + "\n" +
       "Workflow: 1) composio_find_actions → 2) composio_execute. Always discover actions first — do NOT guess action IDs.\n" +
-      "Only use apps listed above — do not attempt to use apps outside your role.";
+      "Only use apps listed above — do not attempt to use apps outside your role.",
+      cache_control: CACHE });
   }
 
-  // 4d. Load skills assigned to this agent
+  // Block 5: Skills
   if (agentDefId) {
     const links = await sbGet("agent_skill_links", {
       agent_definition_id: "eq." + agentDefId,
@@ -1760,17 +1892,18 @@ async function main() {
       const skillIds = links.map(l => l.skill_id);
       const skills = await sbGet("skills", { id: "in.(" + skillIds.join(",") + ")" });
       if (skills && skills.length > 0) {
-        systemPrompt += "\n\n## Installed Skills\nFollow these skill instructions carefully:\n";
+        let skillText = "\n\n## Installed Skills\nFollow these skill instructions carefully:\n";
         for (const skill of skills) {
-          systemPrompt += "\n### " + skill.name + "\n" + skill.content + "\n";
+          skillText += "\n### " + skill.name + "\n" + skill.content + "\n";
         }
+        systemBlocks.push({ type: "text", text: skillText, cache_control: CACHE });
         await log("Loaded " + skills.length + " skill(s): " + skills.map(s => s.name).join(", "), "skills_loaded");
       }
     }
   }
 
-  // 5. Operational rules
-  systemPrompt += "\n\n## How You Work\n" +
+  // Block 6: Operational rules (no cache_control — varies per task context)
+  let operationalRules = "\n\n## How You Work\n" +
     "You are a professional. You do the work, you test the work, you deliver the work.\n\n" +
     "Before you declare anything done, verify it yourself. If you deployed a site, use test_url to check it actually loads. " +
     "If you created a document, make sure it has real content. If you did research, make sure your report contains actual data and sources, not suggestions.\n\n" +
@@ -1780,8 +1913,10 @@ async function main() {
     "Everything else is just process. Never describe what you would do — do it.";
 
   if (agentSlug === "engineering") {
-    systemPrompt = "You are the Engineering Agent. You build things and deliver working products.\n\n" +
-      systemPrompt +
+    // Prepend engineering identity to the first block
+    systemBlocks[0] = { type: "text", text: "You are the Engineering Agent. You build things and deliver working products.\n\n" + systemBlocks[0].text, cache_control: CACHE };
+
+    operationalRules +=
       "\n\n## Your tools\n" +
       "You have: sandbox_write_file, sandbox_bash, sandbox_read_file, sandbox_list_files (local dev environment), " +
       "github_create_repo, github_push_file (version control), deploy_static_site (instant deployment), " +
@@ -1799,7 +1934,7 @@ async function main() {
     if (typeof rawInputCheck === "string") try { rawInputCheck = JSON.parse(rawInputCheck); } catch {}
     if (rawInputCheck?.project_id) {
       const pi = rawInputCheck;
-      systemPrompt += "\n\n## ACTIVE PROJECT EDIT MODE\n" +
+      operationalRules += "\n\n## ACTIVE PROJECT EDIT MODE\n" +
         "You are making changes to an EXISTING project. DO NOT create a new repo.\n" +
         "- Repository: " + (pi.repo_url || "N/A") + "\n" +
         "- Live URL: " + (pi.deploy_url || "N/A") + "\n" +
@@ -1813,6 +1948,8 @@ async function main() {
         "5. Summarise what you changed when done";
     }
   }
+
+  systemBlocks.push({ type: "text", text: operationalRules });
 
   // 6. Select tools for this agent
   let tools;
@@ -1868,10 +2005,11 @@ async function main() {
     if (memR?.ok) {
       const mems = await memR.json();
       if (mems.length > 0) {
-        systemPrompt += "\n\n## Relevant Memories\n" + mems.map(m => {
+        // Memories are task-specific, so no cache_control
+        systemBlocks.push({ type: "text", text: "\n\n## Relevant Memories\n" + mems.map(m => {
           const src = m.metadata?.agent_slug ? " (via " + m.metadata.agent_slug + ")" : "";
           return "- [" + m.category + "] " + m.content + src;
-        }).join("\n");
+        }).join("\n") });
       }
     }
   }
@@ -1885,13 +2023,22 @@ async function main() {
     await log("Resuming from checkpoint (" + (checkpoint.tools_used || []).join(", ") + ")", "checkpoint_resume");
     messages.length = 0;
     for (const m of checkpoint.messages) messages.push(m);
+
+    // Inject resume context so the agent knows what it already did
+    if (checkpoint.work_summary) {
+      messages.push({
+        role: "user",
+        content: "[SYSTEM] You are resuming from a checkpoint. Previous work summary: " + checkpoint.work_summary + ". Continue from where you left off.",
+      });
+    }
+
     existingToolCalls = (checkpoint.tools_used || []).map(t => ({ tool: t, input: {}, output: "(from checkpoint)", source: "checkpoint" }));
   }
 
   await log("Starting agentic loop — " + tools.length + " tools, " + Math.round(timeBudgetMs / 1000) + "s time budget", "loop_start");
 
-  // 10. Run the loop
-  const result = await runLoop(model, systemPrompt, messages, tools, timeBudgetMs, temperature, existingToolCalls);
+  // 10. Run the loop (pass systemBlocks for prompt caching)
+  const result = await runLoop(model, systemBlocks, messages, tools, timeBudgetMs, temperature, existingToolCalls);
 
   await log("Loop finished: " + result.status + " in " + result.turns + " turn(s), " + result.toolCalls.length + " tool call(s)");
 
@@ -1899,6 +2046,23 @@ async function main() {
   const isDelegated = task.source === "agent" && task.parent_task_id;
   let finalText = result.text;
   let finalToolCalls = result.toolCalls;
+
+  // Handle cancellation — skip review and all post-processing
+  if (result.status === "cancelled") {
+    await sbPatch("tasks", {
+      status: "cancelled",
+      completed_at: new Date().toISOString(),
+    }, { id: "eq." + TASK_ID });
+    await sbInsert("chat_messages", {
+      conversation_id: CONVERSATION_ID,
+      role: "orchestrator",
+      content: "Task was cancelled.",
+      timestamp: new Date().toISOString(),
+      metadata: { notification: true, agent_slug: agentSlug, cancelled: true },
+    });
+    await log("Task cancelled — exiting cleanly", "task_cancelled");
+    return;
+  }
 
   const isTimeoutString = result.text.startsWith("Time budget expired") || result.text.startsWith("Hit safety cap");
   const hasRealOutput = result.status === "completed" && !isTimeoutString;
@@ -1919,9 +2083,10 @@ async function main() {
     const MAX_REVIEW_RETRIES = 2;
     let reviewAttempt = 0;
     let currentResult = result;
+    let lastRejectionReason = null;
 
     while (reviewAttempt <= MAX_REVIEW_RETRIES) {
-      const review = await reviewResult(agentSlug, instruction, currentResult.text, currentResult.status, currentResult.toolCalls);
+      const review = await reviewResult(agentSlug, instruction, currentResult.text, currentResult.status, currentResult.toolCalls, lastRejectionReason);
       if (review.accepted) {
         reviewSummary = review.summary;
         finalText = currentResult.text;
@@ -1931,6 +2096,7 @@ async function main() {
         break;
       }
 
+      lastRejectionReason = review.summary;
       reviewAttempt++;
       if (reviewAttempt > MAX_REVIEW_RETRIES) {
         finalStatus = "failed";
@@ -1951,7 +2117,7 @@ async function main() {
       });
 
       const REVISION_TIME_BUDGET = 3 * 60 * 1000;
-      const retryResult = await runLoop(model, systemPrompt, revisionMessages, tools, REVISION_TIME_BUDGET, temperature, currentResult.toolCalls);
+      const retryResult = await runLoop(model, systemBlocks, revisionMessages, tools, REVISION_TIME_BUDGET, temperature, currentResult.toolCalls);
       await log("Revision loop done: " + retryResult.status + " in " + retryResult.turns + " turns", "review_revision_done");
 
       if (retryResult.status !== "completed") {
@@ -2021,11 +2187,12 @@ async function main() {
       tool_calls: finalToolCalls,
       turns: result.turns,
       model, agent_slug: agentSlug,
+      token_usage: tokenUsage,
       ...(finalStatus === "failed" ? { failed: true } : {}),
     },
   });
 
-  await log("Results written. Task " + finalStatus + ".", "task_" + (finalStatus === "completed" ? "complete" : "failed"));
+  await log("Results written. Task " + finalStatus + ". Tokens: " + tokenUsage.input_tokens + " in / " + tokenUsage.output_tokens + " out / " + tokenUsage.cache_read_input_tokens + " cache-read / " + tokenUsage.api_calls + " API calls", "task_" + (finalStatus === "completed" ? "complete" : "failed"));
 
   // 12. Child tasks are already inserted as 'pending' by delegate_task.
   if (childTasks.length > 0) {

@@ -14,6 +14,9 @@ Each task you propose should be:
 - Aligned with the company's active goals
 - **NOT a duplicate of any task already in the "Existing Proposed Tasks" list** — if a similar task is already proposed, skip it entirely. Only propose genuinely new ideas.
 
+## Goal-Gap Analysis
+For each active goal, assess how far behind schedule it is. Prioritize tasks that close the biggest gaps between current progress and target. If a goal is on track or ahead of schedule, don't propose work for it unless there's a strategic reason. Goals furthest from their targets relative to their deadlines should get the most attention.
+
 Available agents and their strengths:
 - orchestrator: Overall coordination, strategy, user communication
 - growth: Full revenue lifecycle — user acquisition, sales pipeline, outreach, pricing, campaigns, retention (has Apollo, LinkedIn, AgentMail, Meta Ads, ElevenLabs)
@@ -28,6 +31,7 @@ Respond ONLY with a JSON array of task objects. Each object must have:
 - "agent_slug": which agent to assign it to
 - "priority": 1-10 (10 = highest)
 - "tags": array of relevant tags
+- "goal_title": (optional) which company goal this task advances
 
 Example:
 [
@@ -197,6 +201,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         agent_slug: string;
         priority: number;
         tags: string[];
+        goal_title?: string;
       }>;
 
       try {
@@ -277,6 +282,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           priority: t.priority || 5,
           source: "proactive",
           tags: JSON.stringify(t.tags || []),
+          metadata: t.goal_title ? { goal_title: t.goal_title } : {},
         });
 
         if (!error) {
@@ -300,6 +306,31 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         log_type: "planner_complete",
         company_id: comp.id,
       });
+
+      // Post summary to chat so the user sees it
+      if (proposed > 0) {
+        const { data: latestConv } = await supabase
+          .from("conversations")
+          .select("id")
+          .eq("company_id", comp.id)
+          .order("created_at", { ascending: false })
+          .limit(1)
+          .single();
+
+        if (latestConv?.id) {
+          const proposedTitles = tasks
+            .filter((_, i) => i < proposed)
+            .map(t => `\u2022 ${t.title} (${t.agent_slug})`)
+            .join("\n");
+          await supabase.from("chat_messages").insert({
+            conversation_id: latestConv.id,
+            role: "orchestrator",
+            content: `\uD83E\uDDE0 I've proposed ${proposed} new task${proposed > 1 ? "s" : ""} based on your goals:\n${proposedTitles}\n\nReview them in the pipeline or say "approve all".`,
+            timestamp: new Date().toISOString(),
+            metadata: { notification: true, event_type: "task_proposed", source: "proactive-planner" },
+          });
+        }
+      }
 
       results.push({ company: comp.name, proposed, tasks: tasks.map((t) => t.title) });
     } catch (e) {

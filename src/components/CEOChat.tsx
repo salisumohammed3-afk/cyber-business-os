@@ -226,6 +226,26 @@ export function CEOChat() {
               )
             }
 
+            // Render notification messages as compact cards
+            if (meta?.notification === true && meta?.event_type) {
+              const eventIcon = meta.event_type === 'task_completed' ? '\u2705'
+                : meta.event_type === 'task_failed' ? '\u274C'
+                : meta.event_type === 'task_proposed' ? '\uD83D\uDCA1'
+                : '\uD83D\uDD14'
+              return (
+                <div key={msg.id} className="flex justify-start">
+                  <div className="text-xs border border-border/50 rounded-md px-3 py-2 max-w-[85%] bg-muted/30">
+                    <div className="flex items-center gap-1.5 text-muted-foreground">
+                      <span>{eventIcon}</span>
+                      <span className="font-medium">{meta.agent_slug ? AGENT_LABELS[meta.agent_slug as string] || meta.agent_slug : 'System'}</span>
+                      {meta.duration_min ? <span className="opacity-60">({meta.duration_min}min)</span> : null}
+                    </div>
+                    <div className="mt-1 text-foreground/80 whitespace-pre-wrap">{msg.content}</div>
+                  </div>
+                </div>
+              )
+            }
+
             if (msg.role === 'user') {
               return (
                 <div key={msg.id} className="flex justify-end">

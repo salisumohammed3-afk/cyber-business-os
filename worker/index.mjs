@@ -320,6 +320,138 @@ function runTask(taskId, conversationId) {
   return child;
 }
 
+// ── Auto-approve safe proposed tasks ────────────────────────────────────────
+
+async function autoApproveProposed() {
+  try {
+    // Fetch proposed tasks from proactive planner or agent delegation with high priority
+    const proposed = await sbSelect("tasks", {
+      status: "eq.proposed",
+      "priority": "gte.7",
+    }, { select: "id,title,agent_definition_id,company_id,source", limit: 10 });
+
+    if (!proposed?.length) return;
+
+    for (const task of proposed) {
+      // Only auto-approve tasks from proactive planner or agent delegation
+      if (!["proactive", "agent"].includes(task.source)) continue;
+
+      // Check company opt-in
+      const company = await sbSelect("companies", { id: `eq.${task.company_id}` }, { select: "auto_approve_enabled", limit: 1 });
+      if (!company?.[0]?.auto_approve_enabled) continue;
+
+      // Check agent safety flag
+      if (!task.agent_definition_id) continue;
+      const agentDef = await sbSelect("agent_definitions", { id: `eq.${task.agent_definition_id}` }, { select: "is_safe_auto_approve,slug", limit: 1 });
+      if (!agentDef?.[0]?.is_safe_auto_approve) continue;
+
+      // Dedup check: ensure no running/pending task with similar title
+      const existing = await sbSelect("tasks", {
+        company_id: `eq.${task.company_id}`,
+        status: "in.(pending,running)",
+      }, { select: "title", limit: 50 });
+
+      const normalize = s => s.toLowerCase().replace(/[^a-z0-9]/g, " ").replace(/\s+/g, " ").trim();
+      const taskNorm = normalize(task.title);
+      const isDupe = (existing || []).some(e => {
+        const existNorm = normalize(e.title);
+        if (existNorm === taskNorm) return true;
+        // Simple word overlap
+        const w1 = new Set(taskNorm.split(" ").filter(w => w.length > 2));
+        const w2 = new Set(existNorm.split(" ").filter(w => w.length > 2));
+        let shared = 0;
+        for (const w of w1) if (w2.has(w)) shared++;
+        return shared / Math.max(w1.size, w2.size, 1) > 0.7;
+      });
+      if (isDupe) continue;
+
+      // Auto-approve
+      const approved = await sbUpdate("tasks", {
+        status: "pending",
+      }, { id: `eq.${task.id}`, status: "eq.proposed" });
+
+      if (approved?.length) {
+        await termLog(`Auto-approved task ${task.id.slice(0, 8)}: "${task.title}" (${agentDef[0].slug}, priority ${task.priority || "?"})`, {
+          taskId: task.id,
+          companyId: task.company_id,
+          logType: "auto_approved",
+        });
+      }
+    }
+  } catch (e) {
+    emitWorkerLog("error", "Auto-approve error: " + e.message, { log_type: "auto_approve_error" });
+  }
+}
+
+// ── Recurring task execution ────────────────────────────────────────────────
+
+async function processRecurringTasks() {
+  try {
+    const recurring = await sbSelect("tasks", {
+      is_recurring: "eq.true",
+      status: "eq.completed",
+    }, { select: "id,title,description,agent_definition_id,company_id,input_data,priority,completed_at,metadata,source,tags", limit: 20 });
+
+    if (!recurring?.length) return;
+
+    const now = Date.now();
+    const SCHEDULE_MS = {
+      hourly: 60 * 60 * 1000,
+      daily: 24 * 60 * 60 * 1000,
+      weekly: 7 * 24 * 60 * 60 * 1000,
+      monthly: 30 * 24 * 60 * 60 * 1000,
+    };
+
+    for (const task of recurring) {
+      const schedule = task.recurrence_schedule || task.metadata?.recurrence_schedule;
+      if (!schedule) continue;
+
+      const intervalMs = SCHEDULE_MS[schedule.toLowerCase()] || null;
+      if (!intervalMs) continue;
+
+      const completedAt = new Date(task.completed_at).getTime();
+      const lastRecurrence = task.metadata?.last_recurrence_at ? new Date(task.metadata.last_recurrence_at).getTime() : 0;
+      const lastEvent = Math.max(completedAt, lastRecurrence);
+
+      if (now - lastEvent < intervalMs) continue;
+
+      // Clone the task
+      const cloned = await sbFetch("tasks", {
+        method: "POST",
+        body: JSON.stringify({
+          title: task.title,
+          description: task.description,
+          agent_definition_id: task.agent_definition_id,
+          company_id: task.company_id,
+          parent_task_id: task.id,
+          status: "pending",
+          priority: task.priority || 5,
+          input_data: task.input_data || {},
+          source: task.source || "recurring",
+          tags: task.tags || "[]",
+          metadata: { recurring_from: task.id },
+        }),
+        headers: { Prefer: "return=representation" },
+      });
+
+      // Update the parent's last_recurrence_at to prevent double-fires
+      await sbUpdate("tasks", {
+        metadata: { ...task.metadata, last_recurrence_at: new Date().toISOString() },
+      }, { id: `eq.${task.id}` });
+
+      if (cloned?.[0]?.id) {
+        await termLog(`Recurring task cloned: "${task.title}" → ${cloned[0].id.slice(0, 8)} (schedule: ${schedule})`, {
+          taskId: cloned[0].id,
+          companyId: task.company_id,
+          logType: "recurring_cloned",
+        });
+      }
+    }
+  } catch (e) {
+    emitWorkerLog("error", "Recurring tasks error: " + e.message, { log_type: "recurring_error" });
+  }
+}
+
 // ── Main poll loop ──────────────────────────────────────────────────────────
 
 let running = true;
@@ -329,6 +461,8 @@ async function poll() {
   // Recover stuck tasks every 10th poll
   if (pollCount % 10 === 0) {
     await recoverStuckTasks();
+    await autoApproveProposed();
+    await processRecurringTasks();
   }
   pollCount++;
 

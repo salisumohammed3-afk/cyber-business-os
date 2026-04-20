@@ -265,13 +265,14 @@ const BASE_TOOLS = [
   },
   {
     name: "recall_memories",
-    description: "Search stored memories for relevant context.",
+    description: "Search stored memories for relevant context. Use scope to control whose memories you see.",
     input_schema: {
       type: "object",
       properties: {
         query: { type: "string" },
         category: { type: "string" },
         limit: { type: "number" },
+        scope: { type: "string", description: "mine (your memories only, default), team (all company memories), or agent:<slug> (specific agent's memories)" },
       },
       required: ["query"],
     },
@@ -289,6 +290,43 @@ const BASE_TOOLS = [
         next_instruction: { type: "string", description: "Optional: instruction for the next agent. Use {RESULT} as placeholder for this agent's output." },
       },
       required: ["agent_slug", "instruction"],
+    },
+  },
+  {
+    name: "update_goal_progress",
+    description: "Report progress on a company goal after completing relevant work. Updates the goal's current_value.",
+    input_schema: {
+      type: "object",
+      properties: {
+        goal_title: { type: "string", description: "Title of the goal (fuzzy matched)" },
+        new_value: { type: "number", description: "New current_value for the metric" },
+        note: { type: "string", description: "Brief note on what you did to advance this goal" },
+      },
+      required: ["goal_title", "new_value"],
+    },
+  },
+  {
+    name: "read_agent_output",
+    description: "Read the output/deliverables from a completed task. Use to build on another agent's work.",
+    input_schema: {
+      type: "object",
+      properties: {
+        task_id: { type: "string", description: "Specific task ID to read" },
+        agent_slug: { type: "string", description: "Or: get the latest completed task by this agent" },
+      },
+    },
+  },
+  {
+    name: "message_agent",
+    description: "Leave a message for another agent. They'll see it on their next run. Use for coordination without full task delegation.",
+    input_schema: {
+      type: "object",
+      properties: {
+        target_agent: { type: "string", description: "Target agent slug: engineering, growth, research, designer, executive-assistant, orchestrator" },
+        message: { type: "string", description: "The message content" },
+        urgency: { type: "string", enum: ["fyi", "request", "blocker"], description: "fyi=informational, request=action needed, blocker=blocking your work" },
+      },
+      required: ["target_agent", "message"],
     },
   },
   {
@@ -536,6 +574,9 @@ async function executeTool(name, input) {
       case "create_task":        return await toolCreateTask(input);
       case "store_memory":       return await toolStoreMemory(input);
       case "recall_memories":    return await toolRecallMemories(input);
+      case "update_goal_progress": return await toolUpdateGoalProgress(input);
+      case "read_agent_output":  return await toolReadAgentOutput(input);
+      case "message_agent":      return await toolMessageAgent(input);
       case "delegate_task":      return await toolDelegateTask(input);
       case "project_query":      return await toolProjectQuery(input);
       case "database_admin":     return await toolDatabaseAdmin(input);
@@ -700,7 +741,26 @@ async function toolRecallMemories(input) {
     order: "importance.desc", limit: String(input.limit || 10),
   });
   if (companyId) params.set("company_id", "eq." + companyId);
-  if (input.category) params.set("category", "eq." + input.category);
+  if (input.category) {
+    params.set("category", "eq." + input.category);
+  } else {
+    // Exclude agent_message category by default (use category:"agent_message" to explicitly retrieve)
+    params.set("category", "neq.agent_message");
+  }
+
+  // Scope: "mine" (default) = this agent's memories, "team" = all, "agent:<slug>" = specific agent
+  const scope = (input.scope || "mine").trim();
+  if (scope === "mine" && agentDefId) {
+    params.set("agent_definition_id", "eq." + agentDefId);
+  } else if (scope.startsWith("agent:")) {
+    const targetSlug = scope.slice(6);
+    const targetAgent = await sbGet("agent_definitions", {
+      slug: "eq." + targetSlug, company_id: "eq." + companyId,
+    }, { select: "id", single: true });
+    if (targetAgent) params.set("agent_definition_id", "eq." + targetAgent.id);
+  }
+  // scope === "team" => no agent filter, sees all company memories
+
   const q = (input.query || "").trim().replace(/[^a-zA-Z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
   if (q.length > 2) {
     params.set("fts", "websearch." + q);
@@ -721,6 +781,145 @@ async function toolRecallMemories(input) {
   return JSON.stringify({ memories: results, count: results.length });
 }
 
+async function toolUpdateGoalProgress(input) {
+  if (!input.goal_title || input.new_value === undefined) {
+    return JSON.stringify({ error: "goal_title and new_value are required" });
+  }
+
+  // Fetch active goals for this company
+  const goals = await sbGet("company_goals", {
+    company_id: "eq." + companyId, status: "eq.active",
+  });
+  if (!goals?.length) return JSON.stringify({ error: "No active goals found" });
+
+  // Fuzzy match goal title
+  const normalize = s => s.toLowerCase().replace(/[^a-z0-9]/g, " ").replace(/\s+/g, " ").trim();
+  const targetNorm = normalize(input.goal_title);
+  let bestMatch = null;
+  let bestScore = 0;
+  for (const g of goals) {
+    const goalNorm = normalize(g.title);
+    // Word overlap scoring
+    const targetWords = new Set(targetNorm.split(" "));
+    const goalWords = new Set(goalNorm.split(" "));
+    let shared = 0;
+    for (const w of targetWords) if (goalWords.has(w)) shared++;
+    const score = shared / Math.max(targetWords.size, goalWords.size, 1);
+    if (score > bestScore) { bestScore = score; bestMatch = g; }
+  }
+  if (!bestMatch || bestScore < 0.3) {
+    return JSON.stringify({ error: "No matching goal found for '" + input.goal_title + "'. Active goals: " + goals.map(g => g.title).join(", ") });
+  }
+
+  // Update goal
+  const oldValue = bestMatch.current_value ?? 0;
+  await sbPatch("company_goals", {
+    current_value: input.new_value,
+  }, { id: "eq." + bestMatch.id });
+
+  // Store progress note as memory
+  const note = input.note || ("Updated " + bestMatch.title + " from " + oldValue + " to " + input.new_value);
+  await sbInsert("memories", {
+    content: note,
+    category: "metric",
+    importance: 7,
+    user_id: "00000000-0000-0000-0000-000000000000",
+    company_id: companyId,
+    agent_definition_id: agentDefId,
+    metadata: { source: "goal_update", agent_slug: agentSlug, goal_id: bestMatch.id, old_value: oldValue, new_value: input.new_value },
+  });
+
+  return JSON.stringify({
+    success: true,
+    goal: bestMatch.title,
+    previous: oldValue,
+    current: input.new_value,
+    target: bestMatch.target_value,
+    metric: bestMatch.target_metric,
+  });
+}
+
+async function toolReadAgentOutput(input) {
+  let taskFilter = {};
+  if (input.task_id) {
+    taskFilter = { id: "eq." + input.task_id };
+  } else if (input.agent_slug) {
+    const targetAgent = await sbGet("agent_definitions", {
+      slug: "eq." + input.agent_slug, company_id: "eq." + companyId,
+    }, { select: "id", single: true });
+    if (!targetAgent) return JSON.stringify({ error: "Agent '" + input.agent_slug + "' not found" });
+    taskFilter = { agent_definition_id: "eq." + targetAgent.id, status: "eq.completed" };
+  } else {
+    return JSON.stringify({ error: "Provide either task_id or agent_slug" });
+  }
+
+  // Fetch task
+  const params = new URLSearchParams({ ...taskFilter, select: "id,title,status,completed_at,agent_definition_id" });
+  if (companyId) params.set("company_id", "eq." + companyId);
+  params.set("order", "completed_at.desc");
+  params.set("limit", "1");
+  const taskR = await fetch(SUPABASE_URL + "/rest/v1/tasks?" + params, { headers: SB_HEADERS });
+  if (!taskR.ok) return JSON.stringify({ error: "Failed to fetch task" });
+  const tasks = await taskR.json();
+  if (!tasks.length) return JSON.stringify({ error: "No matching completed task found" });
+
+  const targetTask = tasks[0];
+  // Fetch result
+  const resultParams = new URLSearchParams({ task_id: "eq." + targetTask.id, select: "data", limit: "1" });
+  const resultR = await fetch(SUPABASE_URL + "/rest/v1/task_results?" + resultParams, { headers: SB_HEADERS });
+  if (!resultR.ok) return JSON.stringify({ error: "Failed to fetch task result" });
+  const results = await resultR.json();
+  if (!results.length) return JSON.stringify({ error: "No result found for task " + targetTask.id });
+
+  const data = results[0].data || {};
+  return JSON.stringify({
+    task_id: targetTask.id,
+    title: targetTask.title,
+    completed_at: targetTask.completed_at,
+    response: (data.response || "").slice(0, 3000),
+    tools_used: data.tools_used || [],
+    deliverables: data.tool_calls?.filter(t => t.tool === "deploy_static_site" || t.tool === "register_project" || t.tool === "github_push_file").map(t => ({ tool: t.tool, input: t.input })).slice(0, 5) || [],
+  });
+}
+
+async function toolMessageAgent(input) {
+  if (!input.target_agent || !input.message) {
+    return JSON.stringify({ error: "target_agent and message are required" });
+  }
+  if (input.target_agent === agentSlug) {
+    return JSON.stringify({ error: "Cannot message yourself" });
+  }
+
+  // Verify target agent exists
+  const targetAgent = await sbGet("agent_definitions", {
+    slug: "eq." + input.target_agent, company_id: "eq." + companyId,
+  }, { select: "id,name", single: true });
+  if (!targetAgent) return JSON.stringify({ error: "Agent '" + input.target_agent + "' not found" });
+
+  // Store as a memory targeted at the other agent
+  const result = await sbInsert("memories", {
+    content: input.message,
+    category: "agent_message",
+    importance: input.urgency === "blocker" ? 9 : input.urgency === "request" ? 7 : 5,
+    user_id: "00000000-0000-0000-0000-000000000000",
+    company_id: companyId,
+    agent_definition_id: targetAgent.id,
+    metadata: {
+      source: "agent_message",
+      from: agentSlug,
+      target_agent: input.target_agent,
+      urgency: input.urgency || "fyi",
+      task_id: TASK_ID,
+    },
+    // Messages expire after 7 days
+    expires_at: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
+  });
+  if (!result) return JSON.stringify({ error: "Failed to send message" });
+  return JSON.stringify({ success: true, sent_to: targetAgent.name, urgency: input.urgency || "fyi" });
+}
+
+const MAX_DELEGATION_DEPTH = 4;
+
 async function toolDelegateTask(input) {
   const agentDef = await sbGet("agent_definitions", {
     slug: "eq." + input.agent_slug, company_id: "eq." + companyId,
@@ -728,7 +927,14 @@ async function toolDelegateTask(input) {
   if (!agentDef) return JSON.stringify({ error: "Agent '" + input.agent_slug + "' not found" });
   if (agentDef.slug === agentSlug) return JSON.stringify({ error: "Cannot delegate to yourself" });
 
-  const taskMeta = {};
+  // Check delegation depth to prevent circular chains
+  const currentTask = await sbGet("tasks", { id: "eq." + TASK_ID }, { select: "metadata", single: true });
+  const currentDepth = (currentTask?.metadata?.delegation_depth) || 0;
+  if (currentDepth >= MAX_DELEGATION_DEPTH) {
+    return JSON.stringify({ error: "Maximum delegation depth (" + MAX_DELEGATION_DEPTH + ") reached. Complete this task yourself or store findings as a memory for the target agent." });
+  }
+
+  const taskMeta = { delegation_depth: currentDepth + 1 };
   if (input.next_agent) {
     taskMeta.handoff = {
       next_agent: input.next_agent,
@@ -743,12 +949,12 @@ async function toolDelegateTask(input) {
     parent_task_id: TASK_ID, company_id: companyId,
     status: "pending",
     input_data: { instruction: input.instruction, context: input.context || "" },
-    metadata: Object.keys(taskMeta).length > 0 ? taskMeta : {},
+    metadata: taskMeta,
     source: "agent",
   });
   if (!result) return JSON.stringify({ error: "Failed to create delegated task" });
   childTasks.push({ taskId: result[0].id, conversationId: CONVERSATION_ID });
-  return JSON.stringify({ success: true, agent: agentDef.name, task_id: result[0].id, status: "queued" });
+  return JSON.stringify({ success: true, agent: agentDef.name, task_id: result[0].id, status: "queued", delegation_depth: currentDepth + 1 });
 }
 
 async function toolProjectQuery(input) {
@@ -1836,17 +2042,21 @@ async function main() {
     }
   }
 
-  // Block 3: Active goals
+  // Block 3: Active goals — framed as mission, not just data
   const goals = await sbGet("company_goals", {
     company_id: "eq." + companyId, status: "eq.active",
   }, { order: "priority.asc" });
   if (goals?.length) {
     const lines = goals.map((g, i) =>
       (i + 1) + ". " + g.title +
-      (g.target_metric ? " (" + (g.current_value ?? 0) + "/" + (g.target_value ?? "?") + " " + g.target_metric + ")" : "") +
-      (g.timeframe ? " — " + g.timeframe : "")
+      (g.target_metric ? " — Progress: " + (g.current_value ?? 0) + "/" + (g.target_value ?? "?") + " " + g.target_metric : "") +
+      (g.timeframe ? " — Deadline: " + g.timeframe : "")
     );
-    systemBlocks.push({ type: "text", text: "\n\n## Active Goals\n" + lines.join("\n"), cache_control: CACHE });
+    systemBlocks.push({ type: "text", text: "\n\n## Your Mission\n" +
+      "Everything you do should ladder up to these company goals:\n" + lines.join("\n") + "\n\n" +
+      "When you complete work, use `update_goal_progress` if your work moved a goal metric forward. " +
+      "When you store a memory, note which goal it relates to if applicable.",
+      cache_control: CACHE });
   }
 
   // 4. Load external integrations
@@ -1910,7 +2120,11 @@ async function main() {
     "If something goes wrong, fix it. Try a different approach. Professionals don't give up on the first error — they find another way. " +
     "If an external service is down, work around it.\n\n" +
     "The only thing that matters is the output: a link the user can click, a document they can read, data they can act on. " +
-    "Everything else is just process. Never describe what you would do — do it.";
+    "Everything else is just process. Never describe what you would do — do it.\n\n" +
+    "## Memory\n" +
+    "You have persistent memory across tasks. Use `recall_memories` to check what you or your teammates already know before starting work. " +
+    "After completing significant work, store key findings, decisions, and learnings using `store_memory` — your future self and teammates will use them. " +
+    "Scopes: mine (default, your own memories), team (all agents), agent:<slug> (specific teammate).";
 
   if (agentSlug === "engineering") {
     // Prepend engineering identity to the first block
@@ -1991,26 +2205,168 @@ async function main() {
     messages.push({ role: "user", content: "Execute: " + (task.title || "No details provided.") });
   }
 
-  // 8. Inject relevant memories (full-text search, all keywords, expiry-aware)
+  // 8. Inject relevant memories
+  const allMemoryLines = [];
+
+  // 8a. Agent's own recent high-importance memories (always loaded, regardless of task keywords)
+  if (agentDefId) {
+    const ownMemParams = new URLSearchParams({
+      select: "content,category,metadata", order: "importance.desc,created_at.desc", limit: "5",
+      agent_definition_id: "eq." + agentDefId,
+      category: "neq.agent_message",
+      or: "(expires_at.is.null,expires_at.gt." + new Date().toISOString() + ")",
+    });
+    if (companyId) ownMemParams.set("company_id", "eq." + companyId);
+    const ownMemR = await fetch(SUPABASE_URL + "/rest/v1/memories?" + ownMemParams, { headers: SB_HEADERS }).catch(() => null);
+    if (ownMemR?.ok) {
+      const ownMems = await ownMemR.json();
+      for (const m of ownMems) {
+        allMemoryLines.push("- [" + m.category + "] " + m.content + " (your own memory)");
+      }
+    }
+  }
+
+  // 8b. Task-relevant memories (full-text search across all company memories)
   const keywords = instruction.split(/\s+/).filter(w => w.length > 3).map(w => w.replace(/[^a-zA-Z0-9]/g, "")).filter(Boolean).slice(0, 8);
   if (keywords.length > 0) {
     const ftsQuery = keywords.join(" or ");
     const memParams = new URLSearchParams({
       select: "content,category,metadata", order: "importance.desc", limit: "8",
       fts: "websearch." + ftsQuery,
+      category: "neq.agent_message",
       or: "(expires_at.is.null,expires_at.gt." + new Date().toISOString() + ")",
     });
     if (companyId) memParams.set("company_id", "eq." + companyId);
     const memR = await fetch(SUPABASE_URL + "/rest/v1/memories?" + memParams, { headers: SB_HEADERS }).catch(() => null);
     if (memR?.ok) {
       const mems = await memR.json();
-      if (mems.length > 0) {
-        // Memories are task-specific, so no cache_control
-        systemBlocks.push({ type: "text", text: "\n\n## Relevant Memories\n" + mems.map(m => {
-          const src = m.metadata?.agent_slug ? " (via " + m.metadata.agent_slug + ")" : "";
-          return "- [" + m.category + "] " + m.content + src;
-        }).join("\n") });
+      for (const m of mems) {
+        const src = m.metadata?.agent_slug ? " (via " + m.metadata.agent_slug + ")" : "";
+        const line = "- [" + m.category + "] " + m.content + src;
+        if (!allMemoryLines.includes(line)) allMemoryLines.push(line);
       }
+    }
+  }
+
+  // 8c. Inter-agent messages targeted at this agent
+  if (agentDefId) {
+    const msgParams = new URLSearchParams({
+      select: "content,metadata,created_at", order: "created_at.desc", limit: "5",
+      category: "eq.agent_message",
+      or: "(expires_at.is.null,expires_at.gt." + new Date().toISOString() + ")",
+    });
+    if (companyId) msgParams.set("company_id", "eq." + companyId);
+    // Filter messages targeted at this agent via metadata
+    msgParams.set("metadata->>target_agent", "eq." + agentSlug);
+    const msgR = await fetch(SUPABASE_URL + "/rest/v1/memories?" + msgParams, { headers: SB_HEADERS }).catch(() => null);
+    if (msgR?.ok) {
+      const msgs = await msgR.json();
+      if (msgs.length > 0) {
+        allMemoryLines.push("");
+        allMemoryLines.push("**Messages from other agents:**");
+        for (const m of msgs) {
+          const from = m.metadata?.from || "unknown";
+          const urgency = m.metadata?.urgency || "fyi";
+          allMemoryLines.push("- [from " + from + ", " + urgency + "] " + m.content);
+        }
+      }
+    }
+  }
+
+  if (allMemoryLines.length > 0) {
+    systemBlocks.push({ type: "text", text: "\n\n## Relevant Memories\n" + allMemoryLines.join("\n") });
+  }
+
+  // 8d. Role-specific context — load memories/data tailored to this agent's role
+  const roleContextLines = [];
+  if (companyId && agentSlug !== "orchestrator") {
+    const roleCategoryMap = {
+      growth: ["campaign", "outreach", "sales", "pipeline", "lead", "contact", "pricing"],
+      research: ["research", "analysis", "competitive-intel", "market", "trend"],
+      engineering: ["project", "deployment", "architecture", "bug", "technical"],
+      "executive-assistant": ["meeting", "email", "calendar", "scheduling", "client"],
+      designer: ["design", "brand", "ui", "ux", "mockup"],
+    };
+    const roleCategories = roleCategoryMap[agentSlug] || [];
+    if (roleCategories.length > 0) {
+      // Fetch memories with tags/categories matching this agent's domain
+      const tagFilter = roleCategories.map(c => "category.eq." + c).join(",");
+      const roleMemParams = new URLSearchParams({
+        select: "content,category,metadata", order: "importance.desc,created_at.desc", limit: "8",
+        or: "(" + tagFilter + ")",
+        category: "neq.agent_message",
+      });
+      roleMemParams.set("company_id", "eq." + companyId);
+      roleMemParams.set("or", "(" + roleCategories.map(c => "category.eq." + c).join(",")
+        + "," + roleCategories.map(t => "tags.cs.[\"" + t + "\"]").join(",") + ")");
+      const roleMemR = await fetch(SUPABASE_URL + "/rest/v1/memories?" + roleMemParams, { headers: SB_HEADERS }).catch(() => null);
+      if (roleMemR?.ok) {
+        const roleMems = await roleMemR.json();
+        for (const m of roleMems) {
+          const line = "- [" + m.category + "] " + m.content;
+          if (!allMemoryLines.includes(line)) roleContextLines.push(line);
+        }
+      }
+    }
+  }
+  if (roleContextLines.length > 0) {
+    systemBlocks.push({ type: "text", text: "\n\n## Domain Context (for your role)\n" + roleContextLines.join("\n") });
+  }
+
+  // 8e. Training examples — load high-quality examples so the agent learns from past successes
+  if (agentDefId) {
+    const trainingExamples = await sbGet("training_examples", {
+      agent_definition_id: "eq." + agentDefId,
+      is_active: "eq.true",
+    }, { order: "quality_score.desc", limit: 3 });
+    if (trainingExamples?.length) {
+      let examplesText = "\n\n## Examples of Good Work\nLearn from these high-quality past interactions:\n";
+      for (const ex of trainingExamples) {
+        examplesText += "\n**User asked:** " + (ex.user_message.length > 200 ? ex.user_message.slice(0, 200) + "..." : ex.user_message) +
+          "\n**You delivered:** " + (ex.assistant_response.length > 300 ? ex.assistant_response.slice(0, 300) + "..." : ex.assistant_response) +
+          "\n**Quality:** " + ex.quality_score + "/10\n";
+      }
+      systemBlocks.push({ type: "text", text: examplesText, cache_control: CACHE });
+      await log("Loaded " + trainingExamples.length + " training example(s)", "training_loaded");
+    }
+  }
+
+  // 8f. Team status — what are other agents currently working on?
+  if (companyId) {
+    const runningTasks = await sbGet("tasks", {
+      company_id: "eq." + companyId,
+      status: "in.(running,pending)",
+    }, { select: "title,status,started_at,agent_definition_id", order: "started_at.desc", limit: 10 });
+
+    const recentCompletedTasks = await sbGet("tasks", {
+      company_id: "eq." + companyId,
+      status: "eq.completed",
+    }, { select: "title,status,completed_at,agent_definition_id", order: "completed_at.desc", limit: 5 });
+
+    // Get agent name mappings
+    const allAgentDefs = await sbGet("agent_definitions", {
+      company_id: "eq." + companyId,
+    }, { select: "id,slug,name" });
+    const agentIdToName = {};
+    for (const a of (allAgentDefs || [])) agentIdToName[a.id] = a.name || a.slug;
+
+    const teamLines = [];
+    for (const t of (runningTasks || [])) {
+      if (t.agent_definition_id === agentDefId) continue; // skip self
+      const name = agentIdToName[t.agent_definition_id] || "Unknown";
+      const elapsed = t.started_at ? Math.round((Date.now() - new Date(t.started_at).getTime()) / 60000) + " min" : "";
+      teamLines.push("- **" + name + "**: " + t.title + " (" + t.status + (elapsed ? ", " + elapsed : "") + ")");
+    }
+    for (const t of (recentCompletedTasks || [])) {
+      if (t.agent_definition_id === agentDefId) continue; // skip self
+      const name = agentIdToName[t.agent_definition_id] || "Unknown";
+      const ago = t.completed_at ? Math.round((Date.now() - new Date(t.completed_at).getTime()) / 60000) : 0;
+      const agoStr = ago < 60 ? ago + " min ago" : Math.round(ago / 60) + "h ago";
+      teamLines.push("- **" + name + "**: " + t.title + " (completed " + agoStr + ")");
+    }
+
+    if (teamLines.length > 0) {
+      systemBlocks.push({ type: "text", text: "\n\n## Team Status\nWhat your teammates are working on:\n" + teamLines.join("\n") });
     }
   }
 
@@ -2194,7 +2550,89 @@ async function main() {
 
   await log("Results written. Task " + finalStatus + ". Tokens: " + tokenUsage.input_tokens + " in / " + tokenUsage.output_tokens + " out / " + tokenUsage.cache_read_input_tokens + " cache-read / " + tokenUsage.api_calls + " API calls", "task_" + (finalStatus === "completed" ? "complete" : "failed"));
 
-  // 12. Child tasks are already inserted as 'pending' by delegate_task.
+  // 12a. Auto-extract memories from completed tasks (non-blocking, uses Haiku)
+  if (finalStatus === "completed" && finalText.length > 200 && agentDefId) {
+    try {
+      // Gather memories already stored during this task run
+      const taskStarted = task.started_at || new Date(Date.now() - 10 * 60 * 1000).toISOString();
+      const existingMemParams = new URLSearchParams({
+        select: "content", limit: "10",
+        agent_definition_id: "eq." + agentDefId,
+        "created_at": "gte." + taskStarted,
+      });
+      if (companyId) existingMemParams.set("company_id", "eq." + companyId);
+      const existingMemR = await fetch(SUPABASE_URL + "/rest/v1/memories?" + existingMemParams, { headers: SB_HEADERS }).catch(() => null);
+      const existingMems = existingMemR?.ok ? await existingMemR.json() : [];
+      const existingList = existingMems.map(m => m.content).join("; ");
+
+      const extractPrompt = "You extract key learnings from an AI agent's completed work. Return a JSON array of 1-3 objects with {content, category, importance} where category is one of: business_context, user_preference, market_intel, decision, contact, metric, technical_finding, process_learning. importance is 1-10.\n\nOnly extract genuinely useful facts that would help this agent or teammates on FUTURE tasks. Skip generic observations.";
+      const extractInput = "Agent: " + agentSlug + "\nTask: " + instruction.slice(0, 300) + "\nTools used: " + [...new Set(finalToolCalls.map(t => t.tool))].join(", ") + "\nOutput summary: " + finalText.slice(0, 1500) +
+        (existingList ? "\n\nAlready stored during this run (DO NOT duplicate): " + existingList : "");
+
+      const extractResp = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: { "x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "claude-haiku-4-20250414",
+          max_tokens: 512,
+          temperature: 0.3,
+          system: extractPrompt,
+          messages: [{ role: "user", content: extractInput }],
+        }),
+      });
+
+      if (extractResp.ok) {
+        const extractData = await extractResp.json();
+        const extractText = extractData.content?.[0]?.text || "[]";
+        const jsonMatch = extractText.match(/\[[\s\S]*\]/);
+        if (jsonMatch) {
+          const extracted = JSON.parse(jsonMatch[0]);
+          let stored = 0;
+          for (const mem of extracted.slice(0, 3)) {
+            if (!mem.content || mem.content.length < 10) continue;
+            await sbInsert("memories", {
+              content: mem.content,
+              category: mem.category || "business_context",
+              importance: Math.min(10, Math.max(1, mem.importance || 5)),
+              user_id: "00000000-0000-0000-0000-000000000000",
+              company_id: companyId,
+              agent_definition_id: agentDefId,
+              metadata: { source: "auto_extract", agent_slug: agentSlug, task_id: TASK_ID },
+            });
+            stored++;
+          }
+          if (stored > 0) await log("Auto-extracted " + stored + " memory(ies) from task output", "memory_extracted");
+        }
+      }
+    } catch (extractErr) {
+      // Non-critical — don't fail the task over memory extraction
+      await log("Memory extraction failed (non-critical): " + (extractErr.message || extractErr), "memory_extract_error");
+    }
+  }
+
+  // 12b. Post completion notification for proactive/background tasks
+  if (finalStatus === "completed" && task.source !== "internal" && isDelegated) {
+    try {
+      const summary = finalText.slice(0, 200) + (finalText.length > 200 ? "..." : "");
+      const taskDuration = task.started_at ? Math.round((Date.now() - new Date(task.started_at).getTime()) / 60000) : 0;
+
+      // Always notify via chat for proactive tasks
+      if (CONVERSATION_ID) {
+        await sbInsert("chat_messages", {
+          conversation_id: CONVERSATION_ID,
+          role: "orchestrator",
+          content: "\u2705 **Task completed: " + (task.title || "Untitled") + "**\n" + summary +
+            (deliverables.length > 0 ? "\n\nDeliverables: " + deliverables.map(d => d.url || d.type).join(", ") : ""),
+          timestamp: new Date().toISOString(),
+          metadata: { notification: true, event_type: "task_completed", agent_slug: agentSlug, task_id: TASK_ID, duration_min: taskDuration },
+        });
+      }
+    } catch (notifyErr) {
+      await log("Notification failed (non-critical): " + (notifyErr.message || notifyErr), "notify_error");
+    }
+  }
+
+  // 12c. Child tasks are already inserted as 'pending' by delegate_task.
   if (childTasks.length > 0) {
     await log(childTasks.length + " child task(s) queued for pickup: " +
       childTasks.map(c => c.taskId.slice(0, 8)).join(", "));

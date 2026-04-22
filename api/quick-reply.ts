@@ -1,5 +1,7 @@
-import { createClient } from "@supabase/supabase-js";
+import { createClient, SupabaseClient } from "@supabase/supabase-js";
 import type { VercelRequest, VercelResponse } from "@vercel/node";
+
+export const maxDuration = 60;
 
 const DELEGATION_RE = /\[NEEDS_DELEGATION\]/;
 
@@ -7,6 +9,9 @@ const DELEGATION_RE = /\[NEEDS_DELEGATION\]/;
 const rateLimitMap = new Map<string, number[]>();
 const RATE_LIMIT_WINDOW = 60_000; // 1 minute
 const RATE_LIMIT_MAX = 10;
+
+// Tool-use loop cap — chat mode should answer quickly, not do a research project
+const MAX_TOOL_TURNS = 3;
 
 function checkRateLimit(companyId: string): boolean {
   const now = Date.now();
@@ -22,18 +27,181 @@ const ROUTING_ADDENDUM = `
 
 ## How to respond
 
-You're in chat mode — no tools available. Talk like a sharp, helpful colleague.
+You're Sal's AI colleague. Talk naturally like a smart teammate — not a chatbot, not a dispatcher.
 
-- **Answer directly** when you can: status updates, questions, ideas, plans, opinions, quick facts from what you already know.
-- **Delegate** when the request needs real work (research, building, designing, outreach, analysis). Include a brief acknowledgment then the marker:
+**Default: answer in this message.** You have tools to help you answer directly. Only delegate when the work genuinely can't fit in a short chat turn.
 
+**Answer directly** (no delegation):
+- Questions, opinions, ideas, status checks, pushback, clarifications
+- Quick reviews — use \`fetch_url\` to grab a page and tell Sal what you think
+- "What's running / what did we do / what are our goals" — use \`query_state\` to check
+- Summaries, recaps, brainstorms — your own knowledge is usually enough
+- Anything conversational
+
+**Delegate with [NEEDS_DELEGATION]** only when the work requires:
+- Multi-step execution across external services (sending emails, building/deploying software, creating Monday boards)
+- Deep research that needs multiple scraping rounds (not just reading one URL)
+- Producing a substantial deliverable (a report, a designed mockup, a campaign)
+- Actions that change the world (outreach, posting, scheduling meetings)
+
+If you're unsure, **just answer**. Sal can always explicitly ask you to delegate.
+
+When delegating, format:
 [NEEDS_DELEGATION]
 Task title
-What needs to be done.
+What specifically needs to be done.
 
-- If the user corrects you or says no, listen and move on.
-- Don't bring up old tasks or goals unless asked.
-- Be honest about what you can and can't do right now — but keep it brief, not a disclaimer.`;
+Don't delegate to "make sure the task is tracked" or "analyze this." If you can answer it, answer it.`;
+
+type ToolResultBlock = { type: "tool_result"; tool_use_id: string; content: string };
+type ToolUseBlock = { type: "tool_use"; id: string; name: string; input: Record<string, unknown> };
+type TextBlock = { type: "text"; text: string };
+type ImageBlock = { type: "image"; source: { type: "url"; url: string } };
+type ContentBlock = TextBlock | ImageBlock | ToolUseBlock | ToolResultBlock;
+type Message = { role: "user" | "assistant"; content: string | ContentBlock[] };
+
+// ── Tool definitions for chat mode ──────────────────────────────────────────
+
+const CHAT_TOOLS = [
+  {
+    name: "fetch_url",
+    description: "Fetch a URL and return its text content (HTML stripped). Use this to review websites, read articles, check if a page loads, or gather page content to answer a question. 15s timeout, returns up to 4KB of text.",
+    input_schema: {
+      type: "object",
+      properties: {
+        url: { type: "string", description: "Full URL starting with http:// or https://" },
+      },
+      required: ["url"],
+    },
+  },
+  {
+    name: "query_state",
+    description: "Look up current business state (tasks, memories, or goals) when the user asks about status, history, or what's happening. Returns JSON.",
+    input_schema: {
+      type: "object",
+      properties: {
+        type: {
+          type: "string",
+          enum: ["tasks", "memories", "goals"],
+          description: "What to query",
+        },
+        status: {
+          type: "string",
+          description: "For tasks only: filter by status (pending, running, completed, failed, proposed, cancelled)",
+        },
+        search: {
+          type: "string",
+          description: "For memories only: keyword search within content",
+        },
+        limit: { type: "number", description: "Max rows, default 10" },
+      },
+      required: ["type"],
+    },
+  },
+];
+
+async function runFetchUrl(input: Record<string, unknown>): Promise<string> {
+  const url = typeof input.url === "string" ? input.url : "";
+  if (!url || !url.startsWith("http")) {
+    return JSON.stringify({ error: "Invalid URL — must start with http:// or https://" });
+  }
+  try {
+    const r = await fetch(url, {
+      method: "GET",
+      redirect: "follow",
+      signal: AbortSignal.timeout(15000),
+      headers: { "User-Agent": "SalOS-ChatBot/1.0" },
+    });
+    const contentType = r.headers.get("content-type") || "";
+    let preview = "";
+    if (
+      contentType.includes("text") ||
+      contentType.includes("html") ||
+      contentType.includes("json")
+    ) {
+      const body = await r.text();
+      preview = body
+        .replace(/<script[\s\S]*?<\/script>/gi, "")
+        .replace(/<style[\s\S]*?<\/style>/gi, "")
+        .replace(/<[^>]+>/g, " ")
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, 4000);
+    }
+    return JSON.stringify({
+      status: r.status,
+      ok: r.ok,
+      content_type: contentType.split(";")[0],
+      url: r.url,
+      preview: preview || "(binary content)",
+    });
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : "timeout";
+    return JSON.stringify({ error: `Failed to reach ${url}: ${msg}` });
+  }
+}
+
+async function runQueryState(
+  supabase: SupabaseClient,
+  companyId: string,
+  input: Record<string, unknown>
+): Promise<string> {
+  const type = String(input.type || "");
+  const limit = Math.min(Number(input.limit) || 10, 25);
+
+  try {
+    if (type === "tasks") {
+      let q = supabase
+        .from("tasks")
+        .select("id,title,status,created_at,completed_at")
+        .eq("company_id", companyId)
+        .order("created_at", { ascending: false })
+        .limit(limit);
+      if (input.status) q = q.eq("status", String(input.status));
+      const { data, error } = await q;
+      if (error) return JSON.stringify({ error: error.message });
+      return JSON.stringify({ tasks: data || [] });
+    }
+    if (type === "memories") {
+      let q = supabase
+        .from("memories")
+        .select("content,category,importance,created_at")
+        .eq("company_id", companyId)
+        .neq("category", "agent_message")
+        .order("importance", { ascending: false })
+        .limit(limit);
+      if (input.search) q = q.ilike("content", `%${String(input.search)}%`);
+      const { data, error } = await q;
+      if (error) return JSON.stringify({ error: error.message });
+      return JSON.stringify({ memories: data || [] });
+    }
+    if (type === "goals") {
+      const { data, error } = await supabase
+        .from("company_goals")
+        .select("title,target_metric,current_value,target_value,timeframe,status")
+        .eq("company_id", companyId)
+        .order("priority", { ascending: true })
+        .limit(limit);
+      if (error) return JSON.stringify({ error: error.message });
+      return JSON.stringify({ goals: data || [] });
+    }
+    return JSON.stringify({ error: `Unknown type: ${type}` });
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return JSON.stringify({ error: msg });
+  }
+}
+
+async function runChatTool(
+  supabase: SupabaseClient,
+  companyId: string,
+  name: string,
+  input: Record<string, unknown>
+): Promise<string> {
+  if (name === "fetch_url") return runFetchUrl(input);
+  if (name === "query_state") return runQueryState(supabase, companyId, input);
+  return JSON.stringify({ error: `Unknown tool: ${name}` });
+}
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -166,21 +334,21 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         const meta = m.metadata as Record<string, unknown> | null;
         if (meta?.notification === true) return false;
         if (meta?.error === true) return false;
-        if (meta?.progress === true) return false; // skip progress messages
+        if (meta?.progress === true) return false;
         return true;
       })
       .map((m: Record<string, string>, i: number, arr: Record<string, string>[]) => ({
         role: m.role === "user" ? ("user" as const) : ("assistant" as const),
-        // Compact older messages (beyond last 8) to save tokens
-        content: i < arr.length - 8
-          ? (m.content || "").slice(0, 100) + ((m.content || "").length > 100 ? "..." : "")
-          : m.content,
+        content:
+          i < arr.length - 8
+            ? (m.content || "").slice(0, 100) + ((m.content || "").length > 100 ? "..." : "")
+            : m.content,
       }));
 
-    const messages: Array<{ role: "user" | "assistant"; content: unknown }> = [];
+    const messages: Message[] = [];
     for (const m of filtered) {
       const prev = messages[messages.length - 1];
-      if (prev && prev.role === m.role) {
+      if (prev && prev.role === m.role && typeof prev.content === "string") {
         prev.content = (prev.content as string) + "\n" + m.content;
       } else {
         messages.push({ ...m });
@@ -191,8 +359,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     if (!lastMsg || lastMsg.role !== "user" || lastMsg.content !== message) {
       if (attachmentList.length > 0) {
         const imageTypes = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
-        const contentBlocks: Array<Record<string, unknown>> = [];
-
+        const contentBlocks: ContentBlock[] = [];
         for (const att of attachmentList) {
           if (imageTypes.has(att.type)) {
             contentBlocks.push({
@@ -206,7 +373,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             });
           }
         }
-
         contentBlocks.push({ type: "text", text: message });
         messages.push({ role: "user", content: contentBlocks });
       } else {
@@ -214,35 +380,77 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       }
     }
 
-    const anthropicRes = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "x-api-key": anthropicKey,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({
-        model: orchestrator?.model || "claude-opus-4-6",
-        max_tokens: 1024,
-        temperature: 0.3,
-        system: systemPrompt,
-        messages,
-      }),
-    });
+    // ── Tool-use loop ───────────────────────────────────────────────────────
+    const model = orchestrator?.model || "claude-opus-4-6";
+    let reply = "";
+    let toolTurns = 0;
 
-    if (!anthropicRes.ok) {
-      const errBody = await anthropicRes.text().catch(() => "");
-      return res.status(502).json({
-        error: `Anthropic ${anthropicRes.status}: ${errBody.slice(0, 300)}`,
+    while (toolTurns <= MAX_TOOL_TURNS) {
+      const anthropicRes = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "x-api-key": anthropicKey,
+          "anthropic-version": "2023-06-01",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model,
+          max_tokens: 1024,
+          temperature: 0.3,
+          system: systemPrompt,
+          tools: CHAT_TOOLS,
+          messages,
+        }),
       });
+
+      if (!anthropicRes.ok) {
+        const errBody = await anthropicRes.text().catch(() => "");
+        return res.status(502).json({
+          error: `Anthropic ${anthropicRes.status}: ${errBody.slice(0, 300)}`,
+        });
+      }
+
+      const anthropicData = await anthropicRes.json();
+      const contentBlocks = (anthropicData.content || []) as ContentBlock[];
+      const stopReason = anthropicData.stop_reason;
+
+      const toolUses = contentBlocks.filter(
+        (b): b is ToolUseBlock => b.type === "tool_use"
+      );
+      const textBlocks = contentBlocks.filter(
+        (b): b is TextBlock => b.type === "text"
+      );
+      const assistantText = textBlocks.map(b => b.text).join("\n").trim();
+
+      // If no tool calls or we've hit the cap, finalize
+      if (
+        stopReason !== "tool_use" ||
+        toolUses.length === 0 ||
+        toolTurns >= MAX_TOOL_TURNS
+      ) {
+        reply = assistantText || "Sorry, I couldn't generate a reply.";
+        break;
+      }
+
+      // Record assistant's tool-use message
+      messages.push({ role: "assistant", content: contentBlocks });
+
+      // Run each tool
+      const toolResults: ContentBlock[] = [];
+      for (const tu of toolUses) {
+        const result = await runChatTool(supabase, company_id, tu.name, tu.input);
+        toolResults.push({
+          type: "tool_result",
+          tool_use_id: tu.id,
+          content: result.slice(0, 8000), // safety cap on tool output
+        });
+      }
+
+      messages.push({ role: "user", content: toolResults });
+      toolTurns++;
     }
 
-    const anthropicData = await anthropicRes.json();
-    const reply =
-      anthropicData.content?.[0]?.text ||
-      "Sorry, I couldn't generate a reply.";
-
-    // Check for delegation marker ANYWHERE in the response
+    // ── Delegation detection ────────────────────────────────────────────────
     const delegationMatch = reply.match(DELEGATION_RE);
 
     if (delegationMatch) {
@@ -258,9 +466,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         ? preamble
         : "I've queued that as a proposed task. You can review and approve it in the task pipeline.";
 
-      // Create a proposed task assigned to the orchestrator.
-      // The user reviews it in the pipeline and clicks "Approve & Run".
-      // The orchestrator then handles delegation to sub-agents.
       const taskInput: Record<string, unknown> = {
         instruction: taskDescription,
         context: message,
@@ -291,9 +496,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         timestamp: new Date().toISOString(),
       });
 
-      const taskId = taskInsert.data?.id;
-
-      return res.status(200).json({ mode: "proposed", task_id: taskId });
+      return res.status(200).json({ mode: "proposed", task_id: taskInsert.data?.id });
     }
 
     await supabase.from("chat_messages").insert({
@@ -303,7 +506,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       timestamp: new Date().toISOString(),
     });
 
-    return res.status(200).json({ mode: "direct" });
+    return res.status(200).json({ mode: "direct", tool_turns: toolTurns });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error("quick-reply error:", msg);

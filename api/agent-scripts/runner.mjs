@@ -39,6 +39,27 @@ const tokenUsage = {
   api_calls: 0,
 };
 
+// Cost ceiling per task (USD). Auto-cancels task if exceeded.
+// Override with MAX_TASK_COST_USD env var. Default: $2.
+const MAX_TASK_COST_USD = parseFloat(process.env.MAX_TASK_COST_USD || "2.0");
+
+// Rough Claude Sonnet pricing (USD per 1M tokens) — covers the most-used model.
+// Haiku is cheaper but we use the Sonnet rate as a safe ceiling estimator.
+const PRICE_INPUT_PER_M = 3.0;
+const PRICE_OUTPUT_PER_M = 15.0;
+const PRICE_CACHE_WRITE_PER_M = 3.75;
+const PRICE_CACHE_READ_PER_M = 0.30;
+
+function estimatedCostUsd() {
+  const u = tokenUsage;
+  return (
+    (u.input_tokens * PRICE_INPUT_PER_M) +
+    (u.output_tokens * PRICE_OUTPUT_PER_M) +
+    (u.cache_creation_input_tokens * PRICE_CACHE_WRITE_PER_M) +
+    (u.cache_read_input_tokens * PRICE_CACHE_READ_PER_M)
+  ) / 1_000_000;
+}
+
 // ── Supabase REST helpers ───────────────────────────────────────────────────
 
 const SB_HEADERS = {
@@ -1668,13 +1689,26 @@ async function runLoop(model, systemPrompt, messages, tools, timeBudgetMs, tempe
 
     turn++;
 
-    // Check for cancellation every 5 turns
-    if (turn % 5 === 0) {
+    // Check for cancellation every turn — user can hit "STOP ALL" at any time
+    {
       const taskCheck = await sbGet("tasks", { id: "eq." + TASK_ID }, { select: "status", single: true });
       if (taskCheck?.status === "cancelled") {
         await log("Task cancelled by user — exiting", "task_cancelled");
         return { status: "cancelled", text: "Task was cancelled by user", toolCalls: allToolCalls, turns: turn };
       }
+    }
+
+    // Cost ceiling — auto-cancel if we've burned too much money on one task
+    const costSoFar = estimatedCostUsd();
+    if (costSoFar > MAX_TASK_COST_USD) {
+      await log("Task hit cost ceiling ($" + costSoFar.toFixed(2) + " > $" + MAX_TASK_COST_USD + ") — auto-cancelling", "cost_ceiling_exceeded");
+      // Mark task as cancelled in DB so retries/children don't restart it
+      await sbPatch("tasks", {
+        status: "cancelled",
+        completed_at: new Date().toISOString(),
+        error_message: "Cost ceiling exceeded ($" + costSoFar.toFixed(2) + " > $" + MAX_TASK_COST_USD + ")",
+      }, { id: "eq." + TASK_ID });
+      return { status: "cancelled", text: "Task hit cost ceiling of $" + MAX_TASK_COST_USD, toolCalls: allToolCalls, turns: turn };
     }
 
     await log("Step " + turn + " (" + elapsed() + "s elapsed, " + Math.round(remaining / 1000) + "s left) — calling " + model);
@@ -2639,9 +2673,12 @@ async function main() {
   }
 
   // 13. Auto-retry for failed delegated tasks
+  // Disabled by default — auto-retry burns money when the root cause is usually
+  // a wrong approach, not a transient error. Set AUTO_RETRY_ENABLED=true to re-enable.
   const taskMeta2 = task.metadata || {};
   const retryCount = taskMeta2.auto_retry_count || 0;
-  const MAX_AUTO_RETRIES = 2;
+  const AUTO_RETRY_ENABLED = process.env.AUTO_RETRY_ENABLED === "true";
+  const MAX_AUTO_RETRIES = AUTO_RETRY_ENABLED ? 2 : 0;
 
   if (isDelegated && finalStatus === "failed" && retryCount < MAX_AUTO_RETRIES) {
     await log("Auto-retrying failed delegated task (attempt " + (retryCount + 1) + "/" + MAX_AUTO_RETRIES + ")", "auto_retry");

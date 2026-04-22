@@ -1,6 +1,6 @@
 import { useRef, useEffect, useState, useMemo, useCallback, type KeyboardEvent, type DragEvent, type ClipboardEvent } from 'react'
 import ReactMarkdown from 'react-markdown'
-import { Bot, Pencil, Globe, GitBranch, FileText, Mail, CheckCircle2, Sheet, Paperclip, X, Image as ImageIcon, Loader2, MessageSquarePlus } from 'lucide-react'
+import { Bot, Pencil, Globe, GitBranch, FileText, Mail, CheckCircle2, Sheet, Paperclip, X, Image as ImageIcon, Loader2, MessageSquarePlus, OctagonX } from 'lucide-react'
 import { useLiveChat, type Attachment } from '@/hooks/useLiveChat'
 import { useCompany } from '@/contexts/CompanyContext'
 import { supabase } from '@/integrations/supabase/client'
@@ -94,6 +94,54 @@ export function CEOChat() {
       .then(({ data }) => setProjectRefs((data as ProjectRef[]) || []))
   }, [company?.id])
 
+  // Poll for active tasks so the STOP ALL button can appear/disappear in realtime
+  const [activeTaskCount, setActiveTaskCount] = useState(0)
+  const [stopping, setStopping] = useState(false)
+  useEffect(() => {
+    if (!company?.id) {
+      setActiveTaskCount(0)
+      return
+    }
+    let cancelled = false
+    const check = async () => {
+      const { count } = await supabase
+        .from('tasks')
+        .select('id', { count: 'exact', head: true })
+        .eq('company_id', company.id)
+        .in('status', ['running', 'pending'])
+      if (!cancelled) setActiveTaskCount(count || 0)
+    }
+    check()
+    const interval = setInterval(check, 4000)
+    return () => {
+      cancelled = true
+      clearInterval(interval)
+    }
+  }, [company?.id, messages.length])
+
+  const handleStopAll = useCallback(async () => {
+    if (!company?.id) return
+    if (!confirm(`Stop all ${activeTaskCount} running task(s)? This cannot be undone.`)) return
+    setStopping(true)
+    try {
+      const r = await fetch('/api/cancel-all', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ company_id: company.id, include_proposed: false }),
+      })
+      if (!r.ok) {
+        const body = await r.json().catch(() => ({ error: 'unknown' }))
+        alert('Stop failed: ' + (body.error || r.statusText))
+      } else {
+        setActiveTaskCount(0)
+      }
+    } catch (err) {
+      alert('Stop failed: ' + (err instanceof Error ? err.message : String(err)))
+    } finally {
+      setStopping(false)
+    }
+  }, [company?.id, activeTaskCount])
+
   const projectUrlMap = useMemo(() => {
     const m = new Map<string, string>()
     for (const p of projectRefs) if (p.deploy_url) m.set(p.deploy_url.replace(/\/$/, ''), p.id)
@@ -166,15 +214,32 @@ export function CEOChat() {
     <div className="flex flex-col h-full">
       <div className="flex items-center justify-between px-4 py-2 border-b">
         <span className="text-sm font-medium text-gray-600">Chat</span>
-        <button
-          onClick={clearConversation}
-          disabled={!company || messages.length === 0}
-          className="flex items-center gap-1 text-xs text-gray-500 hover:text-gray-700 disabled:opacity-40 disabled:cursor-not-allowed"
-          title="Start new conversation"
-        >
-          <MessageSquarePlus size={14} />
-          New Chat
-        </button>
+        <div className="flex items-center gap-3">
+          {activeTaskCount > 0 && (
+            <button
+              onClick={handleStopAll}
+              disabled={stopping}
+              className="flex items-center gap-1 text-xs font-semibold text-white bg-red-600 hover:bg-red-700 disabled:bg-red-400 disabled:cursor-wait rounded px-2 py-1 transition-colors"
+              title={`Cancel all ${activeTaskCount} running/pending task(s)`}
+            >
+              {stopping ? (
+                <Loader2 size={14} className="animate-spin" />
+              ) : (
+                <OctagonX size={14} />
+              )}
+              STOP ALL ({activeTaskCount})
+            </button>
+          )}
+          <button
+            onClick={clearConversation}
+            disabled={!company || messages.length === 0}
+            className="flex items-center gap-1 text-xs text-gray-500 hover:text-gray-700 disabled:opacity-40 disabled:cursor-not-allowed"
+            title="Start new conversation"
+          >
+            <MessageSquarePlus size={14} />
+            New Chat
+          </button>
+        </div>
       </div>
       <div
         ref={scrollContainerRef}

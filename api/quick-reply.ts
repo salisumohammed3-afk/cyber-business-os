@@ -4,10 +4,12 @@ import type { VercelRequest, VercelResponse } from "@vercel/node";
 export const maxDuration = 60;
 
 // Markers the orchestrator emits to trigger structured cards in chat:
-//   [PROPOSE_WORK_ORDER]   -> work-order proposal (Stage 2)
+//   [PROPOSE_WORK_ORDER]   -> one-off work-order proposal (Stage 2)
 //   [PROPOSE_INTEGRATION]  -> integration setup card (API Center Phase 2)
+//   [PROPOSE_SCHEDULE]     -> recurring policy proposal (Stage 5)
 const WORK_ORDER_MARKER = "[PROPOSE_WORK_ORDER]";
 const INTEGRATION_MARKER = "[PROPOSE_INTEGRATION]";
+const SCHEDULE_MARKER = "[PROPOSE_SCHEDULE]";
 
 // Generic marker-then-JSON extractor. Handles multi-line JSON, single-line JSON,
 // JSON wrapped in code fences. Used for both work orders and integrations.
@@ -35,6 +37,10 @@ function extractIntegrationProposal(text: string) {
   return extractJsonAfterAnyMarker(text, INTEGRATION_MARKER);
 }
 
+function extractScheduleProposal(text: string) {
+  return extractJsonAfterAnyMarker(text, SCHEDULE_MARKER);
+}
+
 // In-memory rate limiter (resets on cold start / redeploy)
 const rateLimitMap = new Map<string, number[]>();
 const RATE_LIMIT_WINDOW = 60_000; // 1 minute
@@ -52,6 +58,7 @@ const WORK_ORDER_TYPES = [
   "send_outreach",
   "design_mockup",
   "meeting_admin",
+  "summary",
 ] as const;
 
 type WorkOrderType = (typeof WORK_ORDER_TYPES)[number];
@@ -63,6 +70,7 @@ const AGENT_FOR_TYPE: Record<WorkOrderType, string> = {
   send_outreach: "growth",
   design_mockup: "designer",
   meeting_admin: "executive-assistant",
+  summary: "orchestrator",
 };
 
 // Default cost/time caps. Stage 3 moves these to the runner registry.
@@ -73,6 +81,7 @@ const COST_CAP_USD: Record<WorkOrderType, number> = {
   send_outreach: 0.5,
   design_mockup: 1.0,
   meeting_admin: 0.3,
+  summary: 0.2,
 };
 
 const TIME_CAP_MIN: Record<WorkOrderType, number> = {
@@ -82,6 +91,7 @@ const TIME_CAP_MIN: Record<WorkOrderType, number> = {
   send_outreach: 5,
   design_mockup: 10,
   meeting_admin: 5,
+  summary: 3,
 };
 
 const OUTPUT_TARGET: Record<WorkOrderType, string> = {
@@ -91,6 +101,7 @@ const OUTPUT_TARGET: Record<WorkOrderType, string> = {
   send_outreach: "email_draft",
   design_mockup: "mockup_file",
   meeting_admin: "calendar_event",
+  summary: "memo",
 };
 
 // Tools each work order type requires for preflight checks.
@@ -108,6 +119,7 @@ const REQUIRED_INTEGRATIONS: Record<
   send_outreach: [{ vendor: "gmail", source: "composio" }],
   design_mockup: [],
   meeting_admin: [{ vendor: "googlecalendar", source: "composio" }],
+  summary: [],
 };
 
 interface WorkOrderProposal {
@@ -183,7 +195,42 @@ Sure — let's get OpenAI connected. Paste your API key and I'll wire it up.
 
 The system looks up the vendor in the registry, fills in the form fields (which credentials are needed, where to get them, what the test endpoint is), and shows Sal a card. Sal pastes the key, the system saves it encrypted, runs a connection test, and confirms. **Pick exactly one vendor per proposal.** Known vendors: openai, anthropic, github, resend, serper, exa.
 
-If Sal asks for a vendor that's NOT in this list (e.g., Twilio, Klaviyo), don't propose — say you can't add it via the API Center yet and tell him a custom integration needs a code change. Don't pretend.`;
+If Sal asks for a vendor that's NOT in this list (e.g., Twilio, Klaviyo), don't propose — say you can't add it via the API Center yet and tell him a custom integration needs a code change. Don't pretend.
+
+## Recurring schedules
+
+If Sal asks for something to happen on a recurring cadence (e.g. "every Monday at 9", "daily at 8am", "every hour", "the 1st of each month") — DO NOT propose a one-off work order. Propose a *schedule*. Output a one-line acknowledgment, then \`[PROPOSE_SCHEDULE]\`, then JSON:
+
+\`\`\`
+Got it — I'll set up a recurring policy for your approval.
+[PROPOSE_SCHEDULE]
+{
+  "name": "Short label, under 60 chars (e.g. 'Weekday morning briefing')",
+  "description": "What this schedule does, plain English",
+  "cadence": {
+    "type": "hourly" | "daily" | "weekly" | "monthly" | "cron",
+    /* Then ONE of: */
+    "minute": 0,                                       /* hourly */
+    "time": "08:00", "tz": "Europe/London",            /* daily */
+    "days": ["mon","tue","wed","thu","fri"], "time": "09:00", "tz": "Europe/London",  /* weekly */
+    "day_of_month": 1, "time": "09:00", "tz": "Europe/London",  /* monthly */
+    "expr": "0 9 * * 1"                                /* cron escape hatch */
+  },
+  "work_order": {
+    "type": "research" | "build_static_site" | "edit_project" | "send_outreach" | "design_mockup" | "meeting_admin" | "summary",
+    "title": "Short imperative title",
+    "description": "What the agent should do each time the schedule fires"
+  }
+}
+\`\`\`
+
+Pick the cadence type that matches the user's words. Default tz to "Europe/London" unless Sal specifies otherwise. Default minute to 0 for hourly. Days for weekly use lowercase 3-letter codes ("mon", "tue", etc.). Day_of_month is capped at 28 — for the 31st of the month use cron.
+
+The "summary" work-order type is for status briefings — gathers tasks/memories/goals and posts a chat-formatted recap. Use it for things like "give me a daily briefing" or "send me a weekly recap of progress."
+
+Sal will see a card showing the cadence in human-readable form (e.g. "every day at 09:00 Europe/London"), the next 3 firing times, what work order will fire each time, and the cost cap per firing. He approves the schedule once; firings then run automatically without re-approval. He can pause/delete from Settings → Schedules anytime.
+
+If the cadence is ambiguous (e.g. "regularly", "every so often"), ASK which cadence — don't guess.`;
 
 type ToolResultBlock = { type: "tool_result"; tool_use_id: string; content: string };
 type ToolUseBlock = { type: "tool_use"; id: string; name: string; input: Record<string, unknown> };
@@ -774,6 +821,104 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         vendor: vendorDef.vendor,
         existing: !!existingInt,
       });
+    }
+
+    // ── Schedule proposal detection (Stage 5: recurring policies) ───────────
+    const schedMatch = extractScheduleProposal(reply);
+    if (schedMatch) {
+      const { preamble, rawJson } = schedMatch;
+      let parsed: {
+        name?: string;
+        description?: string;
+        cadence?: { type?: string;[k: string]: unknown };
+        work_order?: { type?: string; title?: string; description?: string };
+      } | null = null;
+      try { parsed = JSON.parse(rawJson); } catch { parsed = null; }
+
+      if (!parsed?.cadence?.type || !parsed?.work_order?.type || !parsed?.name) {
+        await supabase.from("chat_messages").insert({
+          conversation_id, role: "system", kind: "error",
+          content: "Schedule proposal was malformed — missing name, cadence.type, or work_order.type.",
+          timestamp: new Date().toISOString(),
+          metadata: { kind: "error", source: "quick-reply", original_error: rawJson.slice(0, 500) },
+        });
+        return res.status(200).json({ mode: "malformed_schedule_proposal" });
+      }
+
+      const cadenceType = parsed.cadence.type;
+      const cadenceSpec: Record<string, unknown> = { ...parsed.cadence };
+      delete (cadenceSpec as { type?: unknown }).type;
+
+      // Validate via the shared helper so we catch bad cron exprs / out-of-range fields here
+      // instead of blowing up at fire time.
+      const sched = await import("./lib/schedule.mjs");
+      const cadErr = sched.validateCadence(cadenceType, cadenceSpec);
+      if (cadErr) {
+        await supabase.from("chat_messages").insert({
+          conversation_id, role: "system", kind: "error",
+          content: `Schedule cadence is invalid: ${cadErr}`,
+          timestamp: new Date().toISOString(),
+          metadata: { kind: "error", source: "quick-reply", original_error: cadErr },
+        });
+        return res.status(200).json({ mode: "invalid_schedule_cadence", error: cadErr });
+      }
+
+      const woType = parsed.work_order.type;
+      if (!WORK_ORDER_TYPES.includes(woType as WorkOrderType)) {
+        await supabase.from("chat_messages").insert({
+          conversation_id, role: "system", kind: "error",
+          content: `Schedule's work_order.type "${woType}" is not a valid type.`,
+          timestamp: new Date().toISOString(),
+          metadata: { kind: "error", source: "quick-reply" },
+        });
+        return res.status(200).json({ mode: "invalid_schedule_work_order_type" });
+      }
+
+      const tmplWoType = woType as WorkOrderType;
+      const cadenceHuman = sched.describeCadence(cadenceType, cadenceSpec);
+      let nextRuns: string[] = [];
+      try {
+        nextRuns = sched.previewNextRuns(cadenceType, cadenceSpec, 3, new Date()).map((d: Date) => d.toISOString());
+      } catch (e: unknown) {
+        const m = e instanceof Error ? e.message : String(e);
+        await supabase.from("chat_messages").insert({
+          conversation_id, role: "system", kind: "error",
+          content: `Schedule cadence cannot compute next run: ${m}`,
+          timestamp: new Date().toISOString(),
+          metadata: { kind: "error", source: "quick-reply", original_error: m },
+        });
+        return res.status(200).json({ mode: "schedule_cadence_unfulfillable" });
+      }
+
+      // Build the proposal payload the UI renders
+      const proposal = {
+        name: String(parsed.name).slice(0, 60),
+        description: parsed.description ? String(parsed.description).slice(0, 500) : "",
+        cadence_type: cadenceType,
+        cadence_spec: cadenceSpec,
+        cadence_human: cadenceHuman,
+        next_runs_preview: nextRuns,
+        work_order_template: {
+          type: tmplWoType,
+          agent: AGENT_FOR_TYPE[tmplWoType],
+          title: String(parsed.work_order.title || parsed.name).slice(0, 60),
+          description: String(parsed.work_order.description || parsed.description || "").slice(0, 2000),
+          estimated_cost_usd: COST_CAP_USD[tmplWoType],
+          estimated_minutes: TIME_CAP_MIN[tmplWoType],
+          output_target: OUTPUT_TARGET[tmplWoType],
+        },
+      };
+
+      const ackContent = preamble || `I've drafted a schedule for your approval — review the cadence and click Approve.`;
+
+      await supabase.from("chat_messages").insert({
+        conversation_id, role: "assistant", kind: "schedule_proposal",
+        content: ackContent,
+        timestamp: new Date().toISOString(),
+        metadata: { kind: "schedule_proposal", proposal },
+      });
+
+      return res.status(200).json({ mode: "schedule_proposed", proposal });
     }
 
     // ── Work order proposal detection ───────────────────────────────────────

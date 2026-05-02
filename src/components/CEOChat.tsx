@@ -1,6 +1,6 @@
 import { useRef, useEffect, useState, useMemo, useCallback, type KeyboardEvent, type DragEvent, type ClipboardEvent } from 'react'
 import ReactMarkdown from 'react-markdown'
-import { Bot, Pencil, Globe, GitBranch, FileText, Mail, CheckCircle2, Sheet, Paperclip, X, Image as ImageIcon, Loader2, MessageSquarePlus, OctagonX, Play, Clock, DollarSign, Wrench, AlertTriangle } from 'lucide-react'
+import { Bot, Pencil, Globe, GitBranch, FileText, Mail, CheckCircle2, Sheet, Paperclip, X, Image as ImageIcon, Loader2, MessageSquarePlus, OctagonX, Play, Clock, DollarSign, Wrench, AlertTriangle, CalendarClock, Repeat } from 'lucide-react'
 import { useLiveChat, type Attachment } from '@/hooks/useLiveChat'
 import { useCompany } from '@/contexts/CompanyContext'
 import { supabase } from '@/integrations/supabase/client'
@@ -28,6 +28,24 @@ interface IntegrationVendorDef {
     default?: string
     required?: boolean
   }>
+}
+
+interface ScheduleProposal {
+  name: string
+  description: string
+  cadence_type: string
+  cadence_spec: Record<string, unknown>
+  cadence_human: string
+  next_runs_preview: string[]
+  work_order_template: {
+    type: string
+    agent: string
+    title: string
+    description: string
+    estimated_cost_usd: number
+    estimated_minutes: number
+    output_target: string
+  }
 }
 
 interface WorkOrderProposal {
@@ -85,7 +103,7 @@ const DELIVERABLE_ICONS: Record<string, typeof Globe> = {
 
 export function CEOChat() {
   const { company } = useCompany()
-  const { messages, loading, error, sendMessage, clearConversation } = useLiveChat(company?.id ?? null)
+  const { messages, conversationId, loading, error, sendMessage, clearConversation } = useLiveChat(company?.id ?? null)
   const scrollContainerRef = useRef<HTMLDivElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -386,6 +404,22 @@ export function CEOChat() {
                     originalError={origError}
                     content={msg.content || ''}
                     companyId={company?.id || ''}
+                  />
+                </div>
+              )
+            }
+
+            // Render kind=schedule_proposal as a recurring policy approval card.
+            // Shows cadence in human terms, next 3 firing times, and the work-order
+            // template that will run each time. Approve creates a row in scheduled_tasks.
+            if (kind === 'schedule_proposal' && meta?.proposal) {
+              return (
+                <div key={msg.id} className="flex justify-start">
+                  <ScheduleProposalCard
+                    proposal={meta.proposal as ScheduleProposal}
+                    companyId={company?.id || ''}
+                    conversationId={conversationId || ''}
+                    preamble={msg.content || undefined}
                   />
                 </div>
               )
@@ -1057,3 +1091,143 @@ function IntegrationProblemCard({
     </div>
   )
 }
+
+// ── Schedule proposal card ──────────────────────────────────────────────────
+// Renders a recurring-policy proposal: cadence in plain English, next 3 fire
+// times, the work-order template that will run each time. Approve creates a
+// scheduled_tasks row via /api/schedules. Same backend the Settings UI uses.
+
+interface ScheduleProposalCardProps {
+  proposal: ScheduleProposal
+  companyId: string
+  conversationId: string
+  preamble?: string
+}
+
+function ScheduleProposalCard({ proposal, companyId, conversationId, preamble }: ScheduleProposalCardProps) {
+  const [submitting, setSubmitting] = useState(false)
+  const [done, setDone] = useState<null | { ok: boolean; message: string }>(null)
+
+  const approve = async () => {
+    if (!companyId) return
+    setSubmitting(true)
+    try {
+      const r = await fetch('/api/schedules', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          company_id: companyId,
+          conversation_id: conversationId,
+          name: proposal.name,
+          description: proposal.description,
+          cadence_type: proposal.cadence_type,
+          cadence_spec: proposal.cadence_spec,
+          work_order_template: proposal.work_order_template,
+        }),
+      })
+      const body = await r.json().catch(() => ({}))
+      if (!r.ok) {
+        setDone({ ok: false, message: body.error || r.statusText })
+      } else {
+        setDone({
+          ok: true,
+          message: `Schedule active. Next firing: ${formatTime(body.schedule?.next_run_at)}.`,
+        })
+      }
+    } catch (err) {
+      setDone({ ok: false, message: err instanceof Error ? err.message : String(err) })
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  if (done?.ok) {
+    return (
+      <div className="rounded-md border border-green-300 bg-green-50 px-3 py-2 max-w-[85%]">
+        <div className="flex items-center gap-2 text-sm text-green-800">
+          <CheckCircle2 size={14} />
+          <span className="font-semibold">{done.message}</span>
+        </div>
+      </div>
+    )
+  }
+
+  const tmpl = proposal.work_order_template
+  return (
+    <div className="rounded-md border border-purple-300 bg-purple-50 px-3 py-2 max-w-[85%] text-sm">
+      {preamble && <div className="text-foreground/80 whitespace-pre-wrap mb-2">{preamble}</div>}
+      <div className="rounded bg-white border border-purple-200 px-3 py-2">
+        <div className="text-xs uppercase tracking-wide font-semibold text-purple-700 mb-1 inline-flex items-center gap-1">
+          <Repeat size={11} /> Recurring schedule
+        </div>
+        <div className="font-medium mb-1">{proposal.name}</div>
+        {proposal.description && (
+          <div className="text-xs text-gray-600 mb-2 whitespace-pre-wrap">{proposal.description}</div>
+        )}
+
+        <div className="rounded bg-purple-50/70 border border-purple-200 px-2 py-1.5 text-xs mb-2">
+          <div className="inline-flex items-center gap-1 font-semibold text-purple-900">
+            <CalendarClock size={11} /> Cadence
+          </div>
+          <div className="text-foreground/80 mt-0.5">{proposal.cadence_human}</div>
+          {proposal.next_runs_preview && proposal.next_runs_preview.length > 0 && (
+            <div className="mt-1 text-gray-600">
+              Next: {proposal.next_runs_preview.slice(0, 3).map(formatTime).join(' · ')}
+            </div>
+          )}
+        </div>
+
+        <div className="rounded bg-blue-50/50 border border-blue-200 px-2 py-1.5 text-xs">
+          <div className="inline-flex items-center gap-1 font-semibold text-blue-900">
+            <Wrench size={11} /> Each firing runs
+          </div>
+          <div className="text-foreground/80 mt-0.5">
+            <span className="font-medium">{tmpl.type}</span>
+            <span className="text-gray-500"> · {tmpl.agent}</span>
+          </div>
+          <div className="text-gray-600 mt-0.5">{tmpl.title}</div>
+          <div className="text-gray-500 mt-0.5 inline-flex flex-wrap gap-3">
+            <span className="inline-flex items-center gap-0.5"><DollarSign size={10} /> ≤ ${tmpl.estimated_cost_usd.toFixed(2)}/run</span>
+            <span className="inline-flex items-center gap-0.5"><Clock size={10} /> ≤ {tmpl.estimated_minutes} min/run</span>
+            <span>→ {tmpl.output_target}</span>
+          </div>
+        </div>
+
+        {done && !done.ok && (
+          <div className="mt-2 text-xs text-red-700 rounded bg-red-50 border border-red-200 px-2 py-1">
+            {done.message}
+          </div>
+        )}
+
+        <div className="flex items-center gap-2 mt-2">
+          <button
+            onClick={approve}
+            disabled={submitting}
+            className="inline-flex items-center justify-center gap-1.5 rounded bg-purple-600 text-white text-xs px-3 py-1 hover:bg-purple-700 disabled:bg-gray-300"
+          >
+            {submitting ? <Loader2 size={12} className="animate-spin" /> : <Play size={12} />}
+            Approve schedule
+          </button>
+          <button
+            onClick={() => setDone({ ok: false, message: 'Cancelled. No schedule was created.' })}
+            disabled={submitting}
+            className="inline-flex items-center gap-1 px-3 py-1 text-xs rounded border border-gray-300 text-gray-700 hover:bg-gray-100"
+          >
+            <X size={12} />
+            Cancel
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function formatTime(iso: string | undefined): string {
+  if (!iso) return '?'
+  const d = new Date(iso)
+  if (isNaN(d.getTime())) return iso
+  const opts: Intl.DateTimeFormatOptions = { weekday: 'short', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }
+  return d.toLocaleString(undefined, opts)
+}
+
+export { ScheduleProposalCard }

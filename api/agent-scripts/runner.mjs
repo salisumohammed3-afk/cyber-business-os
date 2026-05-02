@@ -2438,6 +2438,12 @@ async function main() {
       "composio_find_actions", "composio_execute",
       "call_integration",
     ]),
+    // Summary: read-only state gathering. Used by scheduled briefings.
+    // No delegation, no external API calls — just query, recall, write the
+    // recap, store any new memories worth remembering.
+    summary: new Set([
+      "database_query", "store_memory", "recall_memories", "fail_task",
+    ]),
   };
 
   // Vendor allowlist per work-order type. call_integration enforces this at

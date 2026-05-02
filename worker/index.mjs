@@ -452,6 +452,105 @@ async function processRecurringTasks() {
   }
 }
 
+// ── Stage 5: fire due scheduled_tasks ───────────────────────────────────────
+// User pre-approves each schedule once via the chat card / Settings UI.
+// Worker fires firings as they come due, cloning the work_order_template into
+// a fresh tasks row with status=pending. The runner's existing tool lockdown
+// + cost cap apply to each firing.
+//
+// Safety: this is NOT gated behind an env var because each schedule is an
+// explicit user-approved row. Compare with WORKER_RECURRING (legacy
+// is_recurring tasks) which IS gated off.
+
+import { computeNextRun, describeCadence } from "./schedule.mjs";
+
+const WO_AGENT_FOR_TYPE = {
+  research: "research",
+  build_static_site: "engineering",
+  edit_project: "engineering",
+  send_outreach: "growth",
+  design_mockup: "designer",
+  meeting_admin: "executive-assistant",
+  summary: "orchestrator",
+};
+
+async function fireDueSchedules() {
+  try {
+    const nowIso = new Date().toISOString();
+    const due = await sbSelect("scheduled_tasks", {
+      is_active: "eq.true",
+      next_run_at: `lte.${nowIso}`,
+    }, { select: "*", limit: 20 });
+
+    if (!due?.length) return;
+
+    for (const sched of due) {
+      try {
+        // Compute next_run_at first so a firing failure doesn't lock the schedule
+        const nextRun = computeNextRun(sched.cadence_type, sched.cadence_spec, new Date(nowIso));
+        const tmpl = sched.work_order_template || {};
+        const woType = tmpl.type;
+        const agentSlug = tmpl.agent || WO_AGENT_FOR_TYPE[woType] || "orchestrator";
+
+        // Resolve agent_definition_id for this firing's agent
+        const agentRows = await sbSelect("agent_definitions", {
+          slug: `eq.${agentSlug}`,
+          company_id: `eq.${sched.company_id}`,
+        }, { select: "id", limit: 1 });
+        const agentId = agentRows?.[0]?.id || null;
+
+        const taskInsert = await sbInsert("tasks", {
+          company_id: sched.company_id,
+          agent_definition_id: agentId,
+          status: "pending",
+          title: tmpl.title || sched.name,
+          description: tmpl.description || sched.description || "",
+          source: "scheduled",
+          input_data: {
+            instruction: tmpl.description || sched.description || "",
+            context: `Scheduled firing of "${sched.name}" (${describeCadence(sched.cadence_type, sched.cadence_spec)})`,
+          },
+          metadata: {
+            work_order: {
+              type: woType,
+              agent: agentSlug,
+              estimated_cost_usd: tmpl.estimated_cost_usd || 0.5,
+              estimated_minutes: tmpl.estimated_minutes || 5,
+              output_target: tmpl.output_target || "memo",
+              preflight: [],
+            },
+            scheduled_task_id: sched.id,
+            run_kind: "scheduled",
+          },
+        });
+        const newTaskId = taskInsert?.[0]?.id || null;
+
+        await sbUpdate("scheduled_tasks", {
+          last_run_at: nowIso,
+          last_run_task_id: newTaskId,
+          next_run_at: nextRun.toISOString(),
+          total_fires: (sched.total_fires || 0) + 1,
+        }, { id: `eq.${sched.id}` });
+
+        await termLog(
+          `Fired schedule "${sched.name}" → task ${newTaskId?.slice(0, 8)}, next at ${nextRun.toISOString()}`,
+          { taskId: newTaskId, logType: "schedule_fired" }
+        );
+      } catch (innerErr) {
+        await sbUpdate("scheduled_tasks", {
+          total_failures: (sched.total_failures || 0) + 1,
+        }, { id: `eq.${sched.id}` });
+        emitWorkerLog("error", `Failed to fire schedule ${sched.id?.slice(0, 8)}: ${innerErr.message}`, {
+          log_type: "schedule_fire_error",
+          schedule_id: sched.id,
+        });
+      }
+    }
+  } catch (e) {
+    emitWorkerLog("error", "fireDueSchedules error: " + e.message, { log_type: "schedules_loop_error" });
+  }
+}
+
 // ── Main poll loop ──────────────────────────────────────────────────────────
 
 let running = true;
@@ -459,8 +558,10 @@ let pollCount = 0;
 
 async function poll() {
   // Recover stuck tasks every 10th poll.
-  // Auto-approve and recurring task processing are DISABLED — they were silent
-  // background spawners. Re-enable per-feature once we have explicit user controls.
+  // Auto-approve and legacy recurring-task processing are DISABLED by default —
+  // they were silent background spawners. Stage-5 scheduled_tasks (which are
+  // pre-approved per row) ARE fired every poll because the user explicitly
+  // approved each one.
   if (pollCount % 10 === 0) {
     await recoverStuckTasks();
     if (process.env.WORKER_AUTO_APPROVE === "true") {
@@ -470,6 +571,8 @@ async function poll() {
       await processRecurringTasks();
     }
   }
+  // Fire due schedules every poll cycle (~every 5s) for low latency
+  await fireDueSchedules();
   pollCount++;
 
   if (pollCount % 5 === 0) {

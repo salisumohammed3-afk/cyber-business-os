@@ -187,6 +187,7 @@ async function callClaude(model, system, messages, tools, maxTokens = 4096, temp
 
 let agentSlug = "unknown";
 let companyId = null;
+let agentDefId = null;
 let _composioAllowedApps = null;
 
 async function log(message, logType = "info", meta = {}) {
@@ -2212,7 +2213,7 @@ async function main() {
   let temperature = 0.7;
   const DEFAULT_TIME_BUDGET_MS = 5 * 60 * 1000; // 5 minutes
   let timeBudgetMs = DEFAULT_TIME_BUDGET_MS;
-  let agentDefId = null;
+  agentDefId = null;
 
   let defId = task.agent_definition_id;
   if (!defId) {

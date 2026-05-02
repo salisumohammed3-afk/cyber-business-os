@@ -1,7 +1,8 @@
 import { useState, useEffect, useCallback } from "react";
 import { useNavigate } from "react-router-dom";
-import { ArrowLeft, Save, Plus, Trash2, Target, Bot, Wrench, FileText, Bell } from "lucide-react";
+import { ArrowLeft, Save, Plus, Trash2, Target, Bot, Wrench, FileText, Bell, Plug } from "lucide-react";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { ApiCenterTab } from "@/components/ApiCenterTab";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
@@ -569,12 +570,16 @@ export default function CompanySettings() {
             <TabsTrigger value="notifications" className="flex items-center gap-1.5">
               <Bell size={14} /> Notifications
             </TabsTrigger>
+            <TabsTrigger value="api-center" className="flex items-center gap-1.5">
+              <Plug size={14} /> API Center
+            </TabsTrigger>
           </TabsList>
           <TabsContent value="brief"><BriefTab /></TabsContent>
           <TabsContent value="goals"><GoalsTab /></TabsContent>
           <TabsContent value="agents"><AgentsTab /></TabsContent>
           <TabsContent value="tools"><ToolsTab /></TabsContent>
           <TabsContent value="notifications"><NotificationsTab /></TabsContent>
+          <TabsContent value="api-center"><ApiCenterTab /></TabsContent>
         </Tabs>
       </div>
     </div>

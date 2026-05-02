@@ -324,10 +324,16 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             .join("\n");
           await supabase.from("chat_messages").insert({
             conversation_id: latestConv.id,
-            role: "orchestrator",
+            role: "system",
+            kind: "notification",
             content: `\uD83E\uDDE0 I've proposed ${proposed} new task${proposed > 1 ? "s" : ""} based on your goals:\n${proposedTitles}\n\nReview them in the pipeline or say "approve all".`,
             timestamp: new Date().toISOString(),
-            metadata: { notification: true, event_type: "task_proposed", source: "proactive-planner" },
+            metadata: {
+              kind: "notification",
+              notification: true,
+              event_type: "task_proposed",
+              source: "proactive-planner",
+            },
           });
         }
       }

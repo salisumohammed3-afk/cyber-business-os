@@ -306,6 +306,7 @@ export interface Database {
           id: string
           conversation_id: string | null
           role: string
+          kind: string | null
           content: string | null
           timestamp: string | null
           tool_calls: Json | null
@@ -316,6 +317,7 @@ export interface Database {
           id?: string
           conversation_id?: string | null
           role: string
+          kind?: string | null
           content?: string | null
           timestamp?: string | null
           tool_calls?: Json | null
@@ -326,6 +328,7 @@ export interface Database {
           id?: string
           conversation_id?: string | null
           role?: string
+          kind?: string | null
           content?: string | null
           timestamp?: string | null
           tool_calls?: Json | null

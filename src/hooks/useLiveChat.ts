@@ -190,6 +190,7 @@ export function useLiveChat(companyId: string | null) {
         id: msgId,
         conversation_id: convId,
         role: 'user',
+        kind: 'user_msg',
         content: text,
         timestamp: ts,
         metadata: msgMeta,

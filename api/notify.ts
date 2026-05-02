@@ -62,10 +62,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
         await supabase.from("chat_messages").insert({
           conversation_id: convId,
-          role: "orchestrator",
+          role: "system",
+          kind: "notification",
           content,
           timestamp: new Date().toISOString(),
           metadata: {
+            kind: "notification",
             notification: true,
             event_type,
             ...metadata,

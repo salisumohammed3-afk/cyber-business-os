@@ -318,7 +318,12 @@ export function CEOChat() {
             const meta = (msg.metadata && typeof msg.metadata === 'object' && !Array.isArray(msg.metadata))
               ? msg.metadata as Record<string, unknown>
               : null
-            const isNotification = meta?.notification === true
+            // kind: row column wins, fall back to metadata.kind for legacy rows
+            const kind: string =
+              (msg.kind as string | null | undefined) ||
+              (meta?.kind as string | undefined) ||
+              (msg.role === 'user' ? 'user_msg' : 'reply')
+            const isNotification = kind === 'notification' || meta?.notification === true
             const deliverables = (isNotification && Array.isArray(meta?.deliverables))
               ? meta.deliverables as Deliverable[]
               : []
@@ -331,7 +336,7 @@ export function CEOChat() {
             )
 
             // Render progress messages as subtle status indicators
-            if (meta?.progress === true) {
+            if (kind === 'progress' || meta?.progress === true) {
               return (
                 <div key={msg.id} className="flex justify-start">
                   <div className="text-xs text-gray-400 italic px-4 py-1 flex items-center gap-1.5">
@@ -343,7 +348,7 @@ export function CEOChat() {
             }
 
             // Render kind=work_order_proposal as an interactive approval card
-            if (meta?.kind === 'work_order_proposal' && meta.proposal) {
+            if (kind === 'work_order_proposal' && meta?.proposal) {
               const proposal = meta.proposal as WorkOrderProposal
               const taskId = (meta.task_id as string) || ''
               const typeLabel = WORK_ORDER_TYPE_LABELS[proposal.type] || proposal.type
@@ -412,7 +417,7 @@ export function CEOChat() {
             }
 
             // Render kind=work_order_status (approved / cancelled / completed / failed)
-            if (meta?.kind === 'work_order_status') {
+            if (kind === 'work_order_status') {
               const status = (meta.status as string) || 'unknown'
               const cost = typeof meta.cost_usd === 'number' ? meta.cost_usd : null
               const dur = typeof meta.duration_min === 'number' ? meta.duration_min : null
@@ -459,7 +464,7 @@ export function CEOChat() {
 
             // Render kind=error messages as a clear, actionable error card with the
             // real diagnostic visible. Replaces the old "Something went wrong" pattern.
-            if (meta?.kind === 'error' || meta?.error === true) {
+            if (kind === 'error' || meta?.error === true) {
               const source = (meta?.source as string) || 'system'
               const original = (meta?.original_error as string) || ''
               return (
@@ -488,7 +493,7 @@ export function CEOChat() {
             }
 
             // Render notification messages as compact cards
-            if (meta?.notification === true && meta?.event_type) {
+            if ((kind === 'notification' || meta?.notification === true) && meta?.event_type) {
               const eventIcon = meta.event_type === 'task_completed' ? '\u2705'
                 : meta.event_type === 'task_failed' ? '\u274C'
                 : meta.event_type === 'task_proposed' ? '\uD83D\uDCA1'

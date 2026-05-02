@@ -562,6 +562,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         await supabase.from("chat_messages").insert({
           conversation_id,
           role: "system",
+          kind: "error",
           content: `Chat error: ${errMsg.slice(0, 500)}`,
           timestamp: new Date().toISOString(),
           metadata: { kind: "error", source: "anthropic", original_error: errMsg },
@@ -622,6 +623,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         await supabase.from("chat_messages").insert({
           conversation_id,
           role: "system",
+          kind: "error",
           content:
             "Work order proposal was malformed — couldn't parse type. Try rephrasing your request, or ask me to clarify.",
           timestamp: new Date().toISOString(),
@@ -697,6 +699,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       await supabase.from("chat_messages").insert({
         conversation_id,
         role: "assistant",
+        kind: "work_order_proposal",
         content: ackContent,
         timestamp: new Date().toISOString(),
         metadata: {
@@ -716,6 +719,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     await supabase.from("chat_messages").insert({
       conversation_id,
       role: "assistant",
+      kind: "reply",
       content: reply,
       timestamp: new Date().toISOString(),
       metadata: { kind: "reply" },
@@ -731,6 +735,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       await supabase.from("chat_messages").insert({
         conversation_id,
         role: "system",
+        kind: "error",
         content: `Chat error: ${msg.slice(0, 500)}`,
         timestamp: new Date().toISOString(),
         metadata: { kind: "error", source: "quick-reply", original_error: msg },

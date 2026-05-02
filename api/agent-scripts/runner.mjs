@@ -1823,10 +1823,11 @@ async function runLoop(model, systemPrompt, messages, tools, timeBudgetMs, tempe
         const recentTools = allToolCalls.slice(-3).map(t => t.tool).join(", ");
         await sbInsert("chat_messages", {
           conversation_id: CONVERSATION_ID,
-          role: "orchestrator",
+          role: "system",
+          kind: "progress",
           content: "Working on it... (step " + turn + ", using: " + recentTools + ")",
           timestamp: new Date().toISOString(),
-          metadata: { progress: true, agent_slug: agentSlug, turn },
+          metadata: { kind: "progress", progress: true, agent_slug: agentSlug, turn },
         }).catch(() => {}); // non-fatal
       }
 
@@ -2443,10 +2444,16 @@ async function main() {
     }, { id: "eq." + TASK_ID });
     await sbInsert("chat_messages", {
       conversation_id: CONVERSATION_ID,
-      role: "orchestrator",
+      role: "system",
+      kind: "work_order_status",
       content: "Task was cancelled.",
       timestamp: new Date().toISOString(),
-      metadata: { notification: true, agent_slug: agentSlug, cancelled: true },
+      metadata: {
+        kind: "work_order_status",
+        status: "cancelled",
+        agent_slug: agentSlug,
+        task_id: TASK_ID,
+      },
     });
     await log("Task cancelled — exiting cleanly", "task_cancelled");
     return;
@@ -2489,7 +2496,8 @@ async function main() {
   if (!isDelegated) {
     await sbInsert("chat_messages", {
       conversation_id: CONVERSATION_ID,
-      role: "orchestrator",
+      role: isWorkOrder ? "system" : "orchestrator",
+      kind: isWorkOrder ? "work_order_status" : "reply",
       content: finalText,
       timestamp: new Date().toISOString(),
       metadata: isWorkOrder
@@ -2505,6 +2513,7 @@ async function main() {
             deliverables: deliverables.length > 0 ? deliverables : undefined,
           }
         : {
+            kind: "reply",
             model, turns: result.turns,
             tools_used: [...new Set(finalToolCalls.map(t => t.tool))],
             agent_slug: agentSlug,
@@ -2518,10 +2527,12 @@ async function main() {
 
     await sbInsert("chat_messages", {
       conversation_id: CONVERSATION_ID,
-      role: "orchestrator",
+      role: "system",
+      kind: "notification",
       content: notificationContent,
       timestamp: new Date().toISOString(),
       metadata: {
+        kind: "notification",
         notification: finalStatus === "completed",
         completed_task_id: TASK_ID,
         agent_slug: agentSlug,
@@ -2567,11 +2578,19 @@ async function main() {
       if (CONVERSATION_ID) {
         await sbInsert("chat_messages", {
           conversation_id: CONVERSATION_ID,
-          role: "orchestrator",
+          role: "system",
+          kind: "notification",
           content: "\u2705 **Task completed: " + (task.title || "Untitled") + "**\n" + summary +
             (deliverables.length > 0 ? "\n\nDeliverables: " + deliverables.map(d => d.url || d.type).join(", ") : ""),
           timestamp: new Date().toISOString(),
-          metadata: { notification: true, event_type: "task_completed", agent_slug: agentSlug, task_id: TASK_ID, duration_min: taskDuration },
+          metadata: {
+            kind: "notification",
+            notification: true,
+            event_type: "task_completed",
+            agent_slug: agentSlug,
+            task_id: TASK_ID,
+            duration_min: taskDuration,
+          },
         });
       }
     } catch (notifyErr) {
@@ -2616,6 +2635,7 @@ main().catch(async (err) => {
   await sbInsert("chat_messages", {
     conversation_id: CONVERSATION_ID,
     role: "system",
+    kind: "error",
     content: "Task failed: " + msg,
     timestamp: new Date().toISOString(),
     metadata: {

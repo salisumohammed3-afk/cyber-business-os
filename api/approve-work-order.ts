@@ -81,6 +81,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         await supabase.from("chat_messages").insert({
           conversation_id: task.conversation_id,
           role: "system",
+          kind: "work_order_status",
           content: `▶ Approved: "${task.title}". Running now.`,
           timestamp: nowIso,
           metadata: {
@@ -110,6 +111,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       await supabase.from("chat_messages").insert({
         conversation_id: task.conversation_id,
         role: "system",
+        kind: "work_order_status",
         content: `Cancelled: "${task.title}".`,
         timestamp: nowIso,
         metadata: {

@@ -102,12 +102,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
       await supabase.from("chat_messages").insert({
         conversation_id: convId,
-        role: "orchestrator",
+        role: "system",
+        kind: "work_order_status",
         content: `\uD83D\uDED1 **All work halted.** Cancelled ${toCancel.length} task(s):\n\n${taskList}${more}\n\nTell me what to do next — I'll wait for your instructions.`,
         timestamp: nowIso,
         metadata: {
-          notification: true,
-          event_type: "emergency_stop",
+          kind: "work_order_status",
+          status: "cancelled",
+          source: "emergency_stop",
           cancelled_count: toCancel.length,
         },
       });

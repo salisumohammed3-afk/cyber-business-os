@@ -54,6 +54,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   await supabase.from("chat_messages").insert({
     conversation_id: conversationId,
     role: "user",
+    kind: "user_msg",
     content: message,
     timestamp: new Date().toISOString(),
   });

@@ -1,5 +1,6 @@
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
 import type { VercelRequest, VercelResponse } from "@vercel/node";
+import { decryptCredentials } from "./lib/crypto.js";
 
 export const maxDuration = 60;
 
@@ -46,8 +47,11 @@ const rateLimitMap = new Map<string, number[]>();
 const RATE_LIMIT_WINDOW = 60_000; // 1 minute
 const RATE_LIMIT_MAX = 10;
 
-// Tool-use loop cap — chat mode should answer quickly, not do a research project
-const MAX_TOOL_TURNS = 3;
+// Tool-use loop cap — chat mode answers in a few turns, not a research project.
+// Bumped from 3 to 5 so the orchestrator can chain e.g.
+//   query_state -> call_integration -> reply
+// without hitting the cap on a multi-step admin question.
+const MAX_TOOL_TURNS = 5;
 
 // ── Work order types (shared with runner via task.metadata.work_order.type) ─
 
@@ -147,23 +151,65 @@ const ROUTING_ADDENDUM = `
 
 ## How to respond
 
-You're Sal's AI colleague. Talk naturally like a smart teammate.
+You're Sal's AI colleague and the master agent for this company. You have full read access to every part of the system (tasks, memories, goals, schedules, agents, **and every connected external service in the "Connected External Services" block above**) and write access to every part of state Sal owns. Act like it.
 
-**Default: answer in this message.** You have tools to read state (\`fetch_url\`, \`query_state\`) AND to do trivial admin (\`cancel_tasks\`, \`manage_schedule\`, \`store_memory\`). Only propose a work order when the request genuinely needs minutes of agent execution and tools you don't have access to in chat.
+**Hard rule: you are omniscient about this company's state.** The system prompt already tells you what integrations are connected, what schedules are active, what specialist agents exist. **Never tell Sal to "connect" something that's already in the Connected External Services list.** If he asks for App Store Connect data and ASC is in that list — call it. Don't bounce him back to settings.
 
-**Answer directly** for:
-- Questions, opinions, ideas, status checks, clarifications, pushback
-- Quick reviews of a URL — use \`fetch_url\` and reply
-- Looking up tasks / memories / goals / schedules — use \`query_state\`
-- Summaries, recaps, brainstorms — your own knowledge is enough
-- Anything conversational
+### How to choose what to do
 
-**Just do it** (no work order, no approval card) for trivial admin Sal asks for in chat:
-- "Clear the list" / "cancel those proposals" / "kill what's running" → \`cancel_tasks\` with the right status filter. If unclear which list, default to status="proposed" (un-approved drafts) and tell him what you cancelled.
-- "Pause the daily briefing" / "stop that schedule" / "delete the morning recap" → \`manage_schedule\` with action=pause/resume/delete and either schedule_id or a name_match substring.
-- "Remember that..." / "note that..." / "we now use X" → \`store_memory\` with the fact in your own words. Pick a sensible category from the enum.
+**Just answer (no tool):**
+- Questions, opinions, ideas, pushback, brainstorming using your own knowledge
 
-Don't ask for confirmation on these admin actions unless the operation is genuinely destructive and irreversible (e.g. deleting many things at once). For "clear my proposed task list" — just do it and report back the count + titles.
+**Read tools — use them aggressively, no permission needed:**
+- \`fetch_url\` — review websites, read public docs/articles
+- \`query_state\` — look up tasks / memories / goals / schedules from this company's DB
+- \`call_integration\` — call any GET action on a connected vendor. ASC list_apps, list_builds, list_app_store_versions, list_customer_reviews. GitHub list_repos. Whatever's in the Connected External Services block.
+
+**Write tools — also use freely, no approval card needed (these are bounded admin within this company's own state, no money/external side-effects):**
+- \`cancel_tasks\` (status filter or specific ids; default to status="proposed" for "clear the list")
+- \`manage_schedule\` (pause / resume / delete by name_match)
+- \`run_schedule_now\` (manual fire of an existing schedule)
+- \`update_goal\` (current_value, target_value, status by title_match)
+- \`store_memory\` (fact + category)
+
+**Work-order proposals (\`[PROPOSE_WORK_ORDER]\`) — only for things with real-world side-effects:**
+- Building/editing deployed code or sites (engineering)
+- Sending emails / running outreach (growth)
+- Posting to social / publishing (any agent)
+- Multi-minute deep research producing a deliverable (research)
+- Anything that sends, posts, deploys, or charges
+
+**Schedule proposals (\`[PROPOSE_SCHEDULE]\`) — only for things you want to recur on a cadence.**
+
+**Integration proposals (\`[PROPOSE_INTEGRATION]\`) — only when Sal asks to add something NOT already connected.**
+
+### Critical anti-patterns — don't do these
+
+- ❌ "You'll need to connect App Store Connect first" — IT'S CONNECTED. Look at your system prompt.
+- ❌ Proposing a work order to "research the App Store reviews for me" when you can just call \`call_integration({ vendor: "appstoreconnect", action: "list_customer_reviews", params: { app_id } })\` right now.
+- ❌ Asking permission to "look up tasks" or "check schedules" — just call \`query_state\` and answer.
+- ❌ Saying "I don't have access to X" — check Connected External Services first; if X is there, you DO have access.
+- ❌ Asking for confirmation before reversible state changes ("Are you sure you want to clear proposed tasks?") — just do it and report.
+
+### Format reminders for proposals (when needed)
+
+\`\`\`
+[PROPOSE_WORK_ORDER]
+{ "type": "research|build_static_site|edit_project|send_outreach|design_mockup|meeting_admin|summary",
+  "title": "...", "description": "..." }
+\`\`\`
+
+\`\`\`
+[PROPOSE_SCHEDULE]
+{ "name": "...", "description": "...",
+  "cadence": { "type":"daily|weekly|monthly|hourly|cron", ...spec },
+  "work_order": { "type": "...", "title": "...", "description": "..." } }
+\`\`\`
+
+\`\`\`
+[PROPOSE_INTEGRATION]
+{ "vendor": "openai|anthropic|github|resend|serper|exa|appstoreconnect" }
+\`\`\``;
 
 **Propose a work order** when the user clearly wants something done that needs:
 - Building or editing a deployed website / app (engineering)
@@ -352,6 +398,56 @@ const CHAT_TOOLS = [
         importance: { type: "number", description: "1-10, default 5" },
       },
       required: ["content"],
+    },
+  },
+  // ── External-service read access (App Store Connect, GitHub, Resend, etc.) ─
+  // Sal expects "all-knowing" — when he asks "how many builds today" or "show me
+  // last week's reviews," call the relevant integration directly. NEVER tell him
+  // to connect something that's already in the Connected External Services list.
+  {
+    name: "call_integration",
+    description:
+      "Call a connected external service. READ-ONLY in chat (only GET actions allowed). " +
+      "See the 'Connected External Services' block in your system prompt for exact vendors and " +
+      "actions available. Examples: appstoreconnect/list_apps, appstoreconnect/list_builds, " +
+      "github/list_repos. For WRITE actions (sending email, creating repos, posting outreach), " +
+      "propose a work order instead — those need approval cards because of side-effects.",
+    input_schema: {
+      type: "object",
+      properties: {
+        vendor: { type: "string", description: "Vendor slug, e.g. 'appstoreconnect', 'github'" },
+        action: { type: "string", description: "Action name (must be GET-method)" },
+        params: { type: "object", description: "Action params (see system prompt for shapes)" },
+      },
+      required: ["vendor", "action"],
+    },
+  },
+  {
+    name: "update_goal",
+    description:
+      "Update a company goal's current_value, status, or target_value. Match by goal title (case-insensitive substring).",
+    input_schema: {
+      type: "object",
+      properties: {
+        title_match: { type: "string", description: "Substring of the goal title" },
+        current_value: { type: "number" },
+        target_value: { type: "number" },
+        status: { type: "string", enum: ["active", "achieved", "paused", "abandoned"] },
+      },
+      required: ["title_match"],
+    },
+  },
+  {
+    name: "run_schedule_now",
+    description:
+      "Manually fire a scheduled work order RIGHT NOW (without affecting its cadence). Useful when Sal " +
+      "wants to test a schedule or get a one-off run. Match by schedule_id or name_match.",
+    input_schema: {
+      type: "object",
+      properties: {
+        schedule_id: { type: "string" },
+        name_match: { type: "string" },
+      },
     },
   },
 ];
@@ -569,6 +665,194 @@ async function runManageSchedule(
   return JSON.stringify({ ok: true, action, schedule: target.name });
 }
 
+// ── Read-only call_integration for chat mode ───────────────────────────────
+// Mirrors the runner's toolCallIntegration but enforces method === "GET".
+// Decrypts via the same INTEGRATIONS_ENCRYPTION_KEY. Signs JWT for jwt_es256
+// vendors. Substitutes {{var}} into the action's path.
+
+interface IntegrationActionDef {
+  name: string;
+  method: string;
+  path: string;
+  body_template?: Record<string, unknown>;
+}
+
+function substituteTemplate(template: unknown, params: Record<string, unknown>): unknown {
+  if (typeof template === "string") {
+    const m = template.match(/^\{\{(\w+)\}\}$/);
+    if (m) return params[m[1]];
+    return template.replace(/\{\{(\w+)\}\}/g, (_: string, k: string) => String(params[k] ?? ""));
+  }
+  if (Array.isArray(template)) return template.map(v => substituteTemplate(v, params));
+  if (template && typeof template === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(template as Record<string, unknown>)) {
+      out[k] = substituteTemplate(v, params);
+    }
+    return out;
+  }
+  return template;
+}
+
+async function runCallIntegration(
+  supabase: SupabaseClient,
+  companyId: string,
+  input: Record<string, unknown>
+): Promise<string> {
+  const vendor = String(input.vendor || "").toLowerCase();
+  const actionName = String(input.action || "");
+  const params = (input.params && typeof input.params === "object") ? input.params as Record<string, unknown> : {};
+  if (!vendor || !actionName) return JSON.stringify({ error: "vendor and action are required" });
+
+  const { data: row, error } = await supabase
+    .from("integrations")
+    .select("*")
+    .eq("company_id", companyId)
+    .eq("vendor", vendor)
+    .maybeSingle();
+  if (error) return JSON.stringify({ error: error.message });
+  if (!row) return JSON.stringify({
+    error: `${vendor} is not connected for this company. Tell Sal it needs to be added in Settings → API Center, or use [PROPOSE_INTEGRATION] to add it inline.`,
+  });
+  if (row.status === "broken") return JSON.stringify({
+    error: `${vendor} is connected but credentials are broken — last test failed. Tell Sal to reconnect via the Reconnect button or update credentials.`,
+  });
+
+  const actions = (row.actions || []) as IntegrationActionDef[];
+  const actionDef = actions.find(a => a.name === actionName);
+  if (!actionDef) {
+    const available = actions.map(a => `${a.name} (${a.method})`).join(", ");
+    return JSON.stringify({ error: `Action '${actionName}' not found for vendor '${vendor}'. Available: ${available}` });
+  }
+
+  if (actionDef.method !== "GET") {
+    return JSON.stringify({
+      error: `${vendor}.${actionName} is a ${actionDef.method} action with side-effects. ` +
+        `Chat mode only allows GET (reads). Propose a work order if Sal wants to actually perform this action.`,
+    });
+  }
+
+  // Decrypt creds using the same module integrations.ts uses
+  let creds: Record<string, string>;
+  try {
+    creds = decryptCredentials(row.encrypted_credentials) as Record<string, string>;
+  } catch (e: unknown) {
+    return JSON.stringify({ error: "Could not decrypt credentials: " + (e instanceof Error ? e.message : String(e)) });
+  }
+
+  const cfg = row.config || {};
+  const baseUrl = String(cfg.base_url || "").replace(/\/$/, "");
+  const path = substituteTemplate(actionDef.path, params) as string;
+  const url = baseUrl + path;
+
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (row.auth_type === "jwt_es256") {
+    try {
+      const { signAppStoreConnectJwt } = await import("./lib/jwt-es256.mjs");
+      const jwt = signAppStoreConnectJwt(creds.key_id, creds.issuer_id, creds.private_key);
+      if (cfg.auth_header_name) headers[String(cfg.auth_header_name)] = "Bearer " + jwt;
+    } catch (e: unknown) {
+      return JSON.stringify({ error: "Could not sign JWT: " + (e instanceof Error ? e.message : String(e)) });
+    }
+  } else if (cfg.auth_header_name && cfg.auth_header_template) {
+    let authValue = String(cfg.auth_header_template);
+    for (const [k, v] of Object.entries(creds)) {
+      authValue = authValue.replaceAll(`{{${k}}}`, String(v));
+    }
+    headers[String(cfg.auth_header_name)] = authValue;
+  }
+
+  let r: Response;
+  try {
+    r = await fetch(url, { method: "GET", headers, signal: AbortSignal.timeout(20_000) });
+  } catch (e: unknown) {
+    return JSON.stringify({ error: "Network error: " + (e instanceof Error ? e.message : String(e)) });
+  }
+
+  const text = await r.text();
+  let json: unknown = null;
+  try { json = JSON.parse(text); } catch { /* leave as text */ }
+
+  if (!r.ok) {
+    if (r.status === 401 || r.status === 403) {
+      // Mark broken so Sal sees the Reconnect card next time
+      await supabase.from("integrations").update({
+        status: "broken",
+        last_test_error: `Auth failed (${r.status}) on ${actionName}`,
+      }).eq("id", row.id);
+    }
+    return JSON.stringify({ error: `${vendor}.${actionName} returned HTTP ${r.status}: ${text.slice(0, 400)}` });
+  }
+
+  // Truncate if huge so we don't blow the chat-mode token budget
+  const summary = json ?? text.slice(0, 6000);
+  return JSON.stringify({ ok: true, status: r.status, response: summary });
+}
+
+async function runUpdateGoal(
+  supabase: SupabaseClient,
+  companyId: string,
+  input: Record<string, unknown>
+): Promise<string> {
+  const titleMatch = typeof input.title_match === "string" ? input.title_match : "";
+  if (!titleMatch) return JSON.stringify({ error: "title_match is required" });
+
+  const { data: candidates } = await supabase
+    .from("company_goals")
+    .select("id, title")
+    .eq("company_id", companyId)
+    .ilike("title", `%${titleMatch}%`);
+  if (!candidates?.length) return JSON.stringify({ error: `No goal matched "${titleMatch}"` });
+  if (candidates.length > 1) return JSON.stringify({
+    error: `${candidates.length} goals matched. Be more specific.`,
+    candidates: candidates.map((c: { id: string; title: string }) => ({ id: c.id, title: c.title })),
+  });
+
+  const updates: Record<string, unknown> = {};
+  if (typeof input.current_value === "number") updates.current_value = input.current_value;
+  if (typeof input.target_value === "number") updates.target_value = input.target_value;
+  if (typeof input.status === "string") updates.status = input.status;
+  if (Object.keys(updates).length === 0) return JSON.stringify({ error: "Nothing to update" });
+
+  const { error } = await supabase.from("company_goals").update(updates).eq("id", candidates[0].id);
+  if (error) return JSON.stringify({ error: error.message });
+  return JSON.stringify({ ok: true, goal: candidates[0].title, updates });
+}
+
+async function runRunScheduleNow(
+  supabase: SupabaseClient,
+  companyId: string,
+  input: Record<string, unknown>
+): Promise<string> {
+  const id = typeof input.schedule_id === "string" ? input.schedule_id : null;
+  const nameMatch = typeof input.name_match === "string" ? input.name_match : null;
+  if (!id && !nameMatch) return JSON.stringify({ error: "Provide schedule_id or name_match" });
+
+  let q = supabase.from("scheduled_tasks").select("id, name").eq("company_id", companyId);
+  if (id) q = q.eq("id", id);
+  else if (nameMatch) q = q.ilike("name", `%${nameMatch}%`);
+  const { data: rows, error } = await q;
+  if (error) return JSON.stringify({ error: error.message });
+  if (!rows?.length) return JSON.stringify({ error: "No schedule matched" });
+  if (rows.length > 1) return JSON.stringify({
+    error: `${rows.length} schedules matched. Be more specific.`,
+    candidates: rows.map((r: { id: string; name: string }) => ({ id: r.id, name: r.name })),
+  });
+
+  // Reuse the run-now endpoint we already built
+  const proto = process.env.VERCEL_URL ? "https" : "http";
+  const host = process.env.VERCEL_URL || "localhost:3000";
+  const url = `${proto}://${host}/api/schedules?id=${rows[0].id}&action=run-now`;
+  try {
+    const r = await fetch(url, { method: "POST" });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) return JSON.stringify({ error: "run-now failed: " + (body.error || r.statusText) });
+    return JSON.stringify({ ok: true, schedule: rows[0].name, task_id: body.task_id });
+  } catch (e: unknown) {
+    return JSON.stringify({ error: "run-now fetch failed: " + (e instanceof Error ? e.message : String(e)) });
+  }
+}
+
 async function runStoreMemory(
   supabase: SupabaseClient,
   companyId: string,
@@ -612,6 +896,9 @@ async function runChatTool(
   if (name === "cancel_tasks") return runCancelTasks(supabase, companyId, input);
   if (name === "manage_schedule") return runManageSchedule(supabase, companyId, input);
   if (name === "store_memory") return runStoreMemory(supabase, companyId, input);
+  if (name === "call_integration") return runCallIntegration(supabase, companyId, input);
+  if (name === "update_goal") return runUpdateGoal(supabase, companyId, input);
+  if (name === "run_schedule_now") return runRunScheduleNow(supabase, companyId, input);
   return JSON.stringify({ error: `Unknown tool: ${name}` });
 }
 
@@ -755,7 +1042,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   const supabase = createClient(supabaseUrl, supabaseKey);
 
   try {
-    const [agentsRes, companyRes, historyRes, goalsRes, tasksRes] =
+    const [agentsRes, companyRes, historyRes, goalsRes, tasksRes, integrationsRes, schedulesRes, allAgentsRes] =
       await Promise.all([
         supabase
           .from("agent_definitions")
@@ -788,6 +1075,22 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           .in("status", ["pending", "running", "completed"])
           .order("created_at", { ascending: false })
           .limit(10),
+        supabase
+          .from("integrations")
+          .select("vendor, display_name, status, actions")
+          .eq("company_id", company_id)
+          .in("status", ["active", "unverified"]),
+        supabase
+          .from("scheduled_tasks")
+          .select("name, cadence_type, cadence_spec, is_active, next_run_at")
+          .eq("company_id", company_id)
+          .order("created_at", { ascending: false })
+          .limit(20),
+        supabase
+          .from("agent_definitions")
+          .select("slug, name")
+          .eq("company_id", company_id)
+          .order("slug", { ascending: true }),
       ]);
 
     const orchestrator = agentsRes.data?.[0] || null;
@@ -837,6 +1140,56 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       );
       systemPrompt +=
         "\n\n## Recent Tasks (background only — do NOT bring these up unless asked)\n" +
+        lines.join("\n");
+    }
+
+    // Connected integrations: tell the orchestrator EXACTLY what's wired up so
+    // it never says "connect X" for something already connected. Lists per-vendor
+    // GET actions it can dispatch via call_integration without an approval card.
+    if (integrationsRes.data?.length) {
+      const lines: string[] = [];
+      for (const i of integrationsRes.data as Array<{
+        vendor: string;
+        display_name: string;
+        status: string;
+        actions: Array<{ name: string; method: string; description?: string }> | null;
+      }>) {
+        const reads = (i.actions || []).filter(a => a.method === "GET").map(a => a.name);
+        const writes = (i.actions || []).filter(a => a.method !== "GET").map(a => a.name);
+        const statusTag = i.status === "active" ? "" : ` [${i.status}]`;
+        let line = `- **${i.display_name}** (\`${i.vendor}\`)${statusTag}`;
+        if (reads.length) line += `\n  - read (chat-callable): ${reads.join(", ")}`;
+        if (writes.length) line += `\n  - write (work-order only): ${writes.join(", ")}`;
+        lines.push(line);
+      }
+      systemPrompt +=
+        "\n\n## Connected External Services\n" +
+        lines.join("\n") +
+        "\n\nThese are ALREADY CONNECTED. Never tell Sal to 'connect' them. " +
+        "Use `call_integration({ vendor, action, params })` to invoke read actions " +
+        "directly in chat (e.g. App Store Connect builds, GitHub repos, Resend logs). " +
+        "Write actions (sending email, creating repos) need a work-order proposal because they have side-effects.";
+    }
+
+    if (schedulesRes.data?.length) {
+      const lines = schedulesRes.data.map((s: Record<string, unknown>) => {
+        const status = s.is_active ? "active" : "PAUSED";
+        const next = s.is_active ? ` next ${String(s.next_run_at).slice(0, 16).replace("T", " ")}Z` : "";
+        return `- "${s.name}" [${status}] cadence=${s.cadence_type}${next}`;
+      });
+      systemPrompt +=
+        "\n\n## Active Schedules (recurring policies Sal already approved)\n" +
+        lines.join("\n") +
+        "\n\nUse `manage_schedule` to pause/resume/delete by name match. " +
+        "Use `query_state({type:'schedules'})` for full details when needed.";
+    }
+
+    if (allAgentsRes.data?.length) {
+      const lines = allAgentsRes.data.map(
+        (a: Record<string, string>) => `- \`${a.slug}\`: ${a.name}`
+      );
+      systemPrompt +=
+        "\n\n## Specialist Agents Available For Delegation\n" +
         lines.join("\n");
     }
 

@@ -820,12 +820,31 @@ async function toolCallIntegration(input) {
     return JSON.stringify({ error: "Network error calling " + vendor + ": " + (e.message || e) });
   }
 
-  // Self-healing: if auth failed, mark broken so the user is told
+  // Self-healing: if auth failed, mark broken AND post an integration_problem
+  // card to the conversation so the user sees a Reconnect button immediately.
   if (r.status === 401 || r.status === 403) {
     const errText = await r.text().catch(() => "");
+    const briefError = `${r.status} ${errText.slice(0, 150)}`.trim();
     await markIntegrationBroken(row.id, "Auth failed (" + r.status + ") on " + action);
+    if (CONVERSATION_ID) {
+      await sbInsert("chat_messages", {
+        conversation_id: CONVERSATION_ID,
+        role: "system",
+        kind: "integration_problem",
+        content: `⚠ Integration broken: ${row.display_name || vendor} returned ${r.status} on ${action}. Reconnect to fix.`,
+        timestamp: new Date().toISOString(),
+        metadata: {
+          kind: "integration_problem",
+          vendor: row.vendor,
+          display_name: row.display_name,
+          integration_id: row.id,
+          action,
+          original_error: briefError,
+        },
+      }).catch(() => {}); // non-fatal; agent still gets the error response
+    }
     return JSON.stringify({
-      error: `Authentication failed (${r.status}) calling ${vendor}.${action}. The integration has been marked broken — Sal needs to update the credentials in the API Center. Detail: ${errText.slice(0, 200)}`,
+      error: `Authentication failed (${r.status}) calling ${vendor}.${action}. The integration has been marked broken — Sal has been notified to update credentials in the API Center.`,
     });
   }
 

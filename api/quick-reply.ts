@@ -94,14 +94,20 @@ const OUTPUT_TARGET: Record<WorkOrderType, string> = {
 };
 
 // Tools each work order type requires for preflight checks.
-// Composio app names are lowercase (matches Composio API).
-const REQUIRED_INTEGRATIONS: Record<WorkOrderType, string[]> = {
+// "native" sources check the integrations table (API Center).
+// "composio" sources check Composio's connectedAccounts API.
+type IntegrationSource = "native" | "composio";
+
+const REQUIRED_INTEGRATIONS: Record<
+  WorkOrderType,
+  Array<{ vendor: string; source: IntegrationSource }>
+> = {
   research: [],
-  build_static_site: ["github"],
-  edit_project: ["github"],
-  send_outreach: ["gmail"],
+  build_static_site: [{ vendor: "github", source: "native" }],
+  edit_project: [{ vendor: "github", source: "native" }],
+  send_outreach: [{ vendor: "gmail", source: "composio" }],
   design_mockup: [],
-  meeting_admin: ["googlecalendar"],
+  meeting_admin: [{ vendor: "googlecalendar", source: "composio" }],
 };
 
 interface WorkOrderProposal {
@@ -351,18 +357,70 @@ async function checkComposioConnected(appName: string): Promise<"ready" | "missi
   }
 }
 
-async function buildPreflight(type: WorkOrderType): Promise<WorkOrderProposal["preflight"]> {
+// Check the API Center / integrations table.
+// Returns:
+//   ready     -> integration row exists and isn't broken
+//   missing   -> no row, OR row exists with status='broken' (re-auth needed)
+//   unknown   -> couldn't query (treat as warning, don't block)
+async function checkNativeIntegrationConnected(
+  supabase: SupabaseClient,
+  companyId: string,
+  vendor: string
+): Promise<{ status: "ready" | "missing" | "unknown"; note?: string }> {
+  try {
+    const { data, error } = await supabase
+      .from("integrations")
+      .select("id, status")
+      .eq("company_id", companyId)
+      .eq("vendor", vendor)
+      .maybeSingle();
+    if (error) return { status: "unknown", note: `Could not check: ${error.message}` };
+    if (!data) {
+      return {
+        status: "missing",
+        note: `Connect ${vendor} in Settings → API Center before approving.`,
+      };
+    }
+    if (data.status === "broken") {
+      return {
+        status: "missing",
+        note: `${vendor} credentials are invalid — reconnect in API Center before approving.`,
+      };
+    }
+    if (data.status === "inactive") {
+      return {
+        status: "missing",
+        note: `${vendor} is currently disabled — re-enable in API Center before approving.`,
+      };
+    }
+    return { status: "ready" };
+  } catch (err: unknown) {
+    const m = err instanceof Error ? err.message : String(err);
+    return { status: "unknown", note: `Could not check: ${m}` };
+  }
+}
+
+async function buildPreflight(
+  supabase: SupabaseClient,
+  companyId: string,
+  type: WorkOrderType
+): Promise<WorkOrderProposal["preflight"]> {
   const required = REQUIRED_INTEGRATIONS[type] || [];
   const checks: WorkOrderProposal["preflight"] = [];
-  for (const tool of required) {
-    const status = await checkComposioConnected(tool);
-    const note =
-      status === "missing"
-        ? `Connect ${tool} in Integrations before approving.`
-        : status === "unknown"
-        ? `Could not verify ${tool} connection.`
-        : undefined;
-    checks.push({ tool, status, note });
+  for (const req of required) {
+    if (req.source === "native") {
+      const result = await checkNativeIntegrationConnected(supabase, companyId, req.vendor);
+      checks.push({ tool: req.vendor, status: result.status, note: result.note });
+    } else {
+      const status = await checkComposioConnected(req.vendor);
+      const note =
+        status === "missing"
+          ? `Connect ${req.vendor} (Composio) before approving.`
+          : status === "unknown"
+          ? `Could not verify ${req.vendor} connection.`
+          : undefined;
+      checks.push({ tool: req.vendor, status, note });
+    }
   }
   return checks;
 }
@@ -752,7 +810,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         estimated_cost_usd: COST_CAP_USD[type],
         estimated_minutes: TIME_CAP_MIN[type],
         output_target: OUTPUT_TARGET[type],
-        preflight: await buildPreflight(type),
+        preflight: await buildPreflight(supabase, company_id, type),
       };
 
       // Resolve agent_definition_id for the chosen agent

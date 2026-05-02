@@ -369,6 +369,28 @@ export function CEOChat() {
               )
             }
 
+            // Render kind=integration_problem — auth failure on a connected integration.
+            // Shows the vendor + error + a Reconnect button that opens an inline
+            // IntegrationProposalCard for the same vendor (re-uses the proposal flow).
+            if (kind === 'integration_problem') {
+              const vendor = (meta?.vendor as string) || ''
+              const displayName = (meta?.display_name as string) || vendor
+              const action = (meta?.action as string) || 'a call'
+              const origError = (meta?.original_error as string) || ''
+              return (
+                <div key={msg.id} className="flex justify-start">
+                  <IntegrationProblemCard
+                    vendor={vendor}
+                    displayName={displayName}
+                    action={action}
+                    originalError={origError}
+                    content={msg.content || ''}
+                    companyId={company?.id || ''}
+                  />
+                </div>
+              )
+            }
+
             // Render kind=integration_proposal as an inline form for adding/updating an integration.
             // Same backend (/api/integrations) as Settings -> API Center; both flows write to the same row.
             if (kind === 'integration_proposal' && meta?.vendor_def) {
@@ -424,9 +446,17 @@ export function CEOChat() {
                       {missing.length > 0 && (
                         <div className="mb-2 rounded bg-amber-50 border border-amber-200 px-2 py-1.5 text-xs text-amber-800 flex items-start gap-1.5">
                           <AlertTriangle size={12} className="mt-0.5 flex-shrink-0" />
-                          <span>
-                            Missing integrations: <b>{missing.map(m => m.tool).join(', ')}</b>. Connect them before approving.
-                          </span>
+                          <div>
+                            <div>
+                              Missing integrations: <b>{missing.map(m => m.tool).join(', ')}</b>. Connect them before approving.
+                            </div>
+                            <Link
+                              to="/company-settings"
+                              className="inline-flex items-center gap-1 text-blue-700 hover:underline mt-0.5"
+                            >
+                              Open API Center →
+                            </Link>
+                          </div>
                         </div>
                       )}
                       <div className="flex items-center gap-2 mt-2">
@@ -943,3 +973,87 @@ function IntegrationProposalCard({ vendorDef, existing, companyId, preamble }: I
 }
 
 export { IntegrationProposalCard }
+
+// ── Integration problem card ────────────────────────────────────────────────
+// Shown when the runner detects auth failure on a connected integration. Uses
+// the same form as IntegrationProposalCard but enters edit-mode (existing
+// connection) and pre-loads the vendor def from /api/integrations?vendors=1.
+
+interface IntegrationProblemCardProps {
+  vendor: string
+  displayName: string
+  action: string
+  originalError: string
+  content: string
+  companyId: string
+}
+
+function IntegrationProblemCard({
+  vendor,
+  displayName,
+  action,
+  originalError,
+  content,
+  companyId,
+}: IntegrationProblemCardProps) {
+  const [reconnecting, setReconnecting] = useState(false)
+  const [vendorDef, setVendorDef] = useState<IntegrationVendorDef | null>(null)
+  const [existing, setExisting] = useState<{ id: string; status: string; credential_preview: string | null } | null>(null)
+
+  const startReconnect = async () => {
+    setReconnecting(true)
+    try {
+      const [vRes, iRes] = await Promise.all([
+        fetch('/api/integrations?vendors=1'),
+        fetch(`/api/integrations?company_id=${companyId}`),
+      ])
+      if (vRes.ok) {
+        const { vendors } = await vRes.json()
+        const def = (vendors as IntegrationVendorDef[]).find(v => v.vendor === vendor)
+        if (def) setVendorDef(def)
+      }
+      if (iRes.ok) {
+        const { integrations } = await iRes.json()
+        const found = (integrations as Array<{ id: string; vendor: string; status: string; credential_preview: string | null }>).find(i => i.vendor === vendor)
+        if (found) setExisting({ id: found.id, status: found.status, credential_preview: found.credential_preview })
+      }
+    } catch (err) {
+      alert('Could not load reconnect form: ' + (err instanceof Error ? err.message : String(err)))
+      setReconnecting(false)
+    }
+  }
+
+  if (vendorDef) {
+    return (
+      <IntegrationProposalCard
+        vendorDef={vendorDef}
+        existing={existing}
+        companyId={companyId}
+        preamble={`Reconnecting ${displayName} — paste a fresh key.`}
+      />
+    )
+  }
+
+  return (
+    <div className="rounded-md border border-red-300 bg-red-50 px-3 py-2 max-w-[85%] text-sm">
+      <div className="flex items-center gap-1.5 font-semibold text-red-800 mb-1">
+        <AlertTriangle size={14} />
+        <span>Integration broken: {displayName}</span>
+      </div>
+      <div className="text-xs text-red-700 mb-2 whitespace-pre-wrap">
+        Auth failed on <code>{action}</code>{originalError ? `: ${originalError}` : ''}.
+        {content && content !== `⚠ Integration broken: ${displayName} returned ${originalError.split(' ')[0]} on ${action}. Reconnect to fix.` && (
+          <div className="mt-1">{content}</div>
+        )}
+      </div>
+      <button
+        onClick={startReconnect}
+        disabled={reconnecting}
+        className="inline-flex items-center gap-1 text-xs px-2 py-1 rounded bg-red-600 text-white hover:bg-red-700 disabled:bg-gray-300"
+      >
+        {reconnecting ? <Loader2 size={12} className="animate-spin" /> : null}
+        Reconnect {displayName}
+      </button>
+    </div>
+  )
+}

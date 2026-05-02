@@ -184,9 +184,9 @@ function GoalsTab() {
         return (
           <Card key={g.id}>
             <CardContent className="pt-4 space-y-3">
-              <div className="flex items-start justify-between">
-                <div>
-                  <div className="flex items-center gap-2">
+              <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-2">
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2 flex-wrap">
                     <h3 className="font-medium text-sm">{g.title}</h3>
                     <Badge variant={g.status === "active" ? "default" : "secondary"} className="text-xs">
                       {g.status}
@@ -196,7 +196,7 @@ function GoalsTab() {
                   {g.description && <p className="text-xs text-muted-foreground mt-1">{g.description}</p>}
                   {g.timeframe && <p className="text-xs text-muted-foreground">{g.timeframe}</p>}
                 </div>
-                <div className="flex items-center gap-1">
+                <div className="flex items-center gap-1 shrink-0 flex-wrap">
                   {g.status === "active" && (
                     <button onClick={() => updateGoalStatus(g.id, "achieved")} className="text-xs px-2 py-1 rounded border hover:bg-green-50">
                       Mark Achieved
@@ -303,15 +303,15 @@ function AgentsTab() {
       {agents.map((a) => (
         <Card key={a.id}>
           <CardHeader className="pb-2">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-2">
+            <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+              <div className="flex items-center gap-2 flex-wrap min-w-0">
                 <CardTitle className="text-sm">{a.name}</CardTitle>
                 <Badge variant="outline" className="text-xs">{a.slug}</Badge>
                 {a.is_orchestrator && <Badge className="text-xs">orchestrator</Badge>}
               </div>
-              <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                <span>{a.model?.split("-").slice(0, 2).join("-")}</span>
-                <span>{(builtInToolsByAgent[a.slug] || builtInToolsByAgent.research).length} tools</span>
+              <div className="flex items-center gap-2 text-xs text-muted-foreground shrink-0 flex-wrap">
+                <span className="whitespace-nowrap">{a.model?.split("-").slice(0, 2).join("-")}</span>
+                <span className="whitespace-nowrap">{(builtInToolsByAgent[a.slug] || builtInToolsByAgent.research).length} tools</span>
                 <button
                   onClick={() => {
                     setEditingId(editingId === a.id ? null : a.id);

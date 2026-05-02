@@ -182,10 +182,10 @@ export function ApiCenterTab() {
                   return (
                     <div
                       key={i.id}
-                      className="rounded-md border border-border bg-card p-3 flex items-center gap-3"
+                      className="rounded-md border border-border bg-card p-3 flex flex-col sm:flex-row sm:items-center gap-3"
                     >
-                      <div className="flex-1">
-                        <div className="flex items-center gap-2">
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2 flex-wrap">
                           <span className="font-medium text-sm">{i.display_name}</span>
                           <span className={`text-xs px-1.5 py-0.5 rounded border ${STATUS_STYLES[i.status]}`}>
                             {i.status === "active" && <CheckCircle2 size={10} className="inline mr-1" />}
@@ -194,9 +194,9 @@ export function ApiCenterTab() {
                           </span>
                         </div>
                         <div className="text-xs text-muted-foreground mt-0.5 flex items-center gap-2">
-                          <span>{i.credential_preview || "no key"}</span>
+                          <span className="truncate">{i.credential_preview || "no key"}</span>
                           {v?.docs_url && (
-                            <a href={v.docs_url} target="_blank" rel="noreferrer" className="hover:text-foreground">
+                            <a href={v.docs_url} target="_blank" rel="noreferrer" className="hover:text-foreground shrink-0">
                               <ExternalLink size={11} className="inline" />
                             </a>
                           )}
@@ -205,36 +205,38 @@ export function ApiCenterTab() {
                           <div className="text-xs text-red-700 mt-1">{i.last_test_error}</div>
                         )}
                       </div>
-                      <button
-                        onClick={() => handleTest(i.id)}
-                        disabled={testingId === i.id}
-                        className="text-xs flex items-center gap-1 px-2 py-1 rounded border border-border hover:bg-secondary disabled:opacity-50"
-                        title="Test connection"
-                      >
-                        {testingId === i.id ? (
-                          <Loader2 size={12} className="animate-spin" />
-                        ) : (
-                          <RotateCw size={12} />
-                        )}
-                        Test
-                      </button>
-                      <button
-                        onClick={() => {
-                          const def = vendors.find(vv => vv.vendor === i.vendor);
-                          if (def) setEditingVendor(def);
-                        }}
-                        className="text-xs px-2 py-1 rounded border border-border hover:bg-secondary"
-                        title="Update credentials"
-                      >
-                        Edit
-                      </button>
-                      <button
-                        onClick={() => handleDelete(i.id, i.display_name)}
-                        className="text-xs flex items-center gap-1 px-2 py-1 rounded border border-red-200 text-red-700 hover:bg-red-50"
-                        title="Disconnect"
-                      >
-                        <Trash2 size={12} />
-                      </button>
+                      <div className="flex items-center gap-2 shrink-0 flex-wrap">
+                        <button
+                          onClick={() => handleTest(i.id)}
+                          disabled={testingId === i.id}
+                          className="text-xs flex items-center gap-1 px-2 py-1 rounded border border-border hover:bg-secondary disabled:opacity-50"
+                          title="Test connection"
+                        >
+                          {testingId === i.id ? (
+                            <Loader2 size={12} className="animate-spin" />
+                          ) : (
+                            <RotateCw size={12} />
+                          )}
+                          Test
+                        </button>
+                        <button
+                          onClick={() => {
+                            const def = vendors.find(vv => vv.vendor === i.vendor);
+                            if (def) setEditingVendor(def);
+                          }}
+                          className="text-xs px-2 py-1 rounded border border-border hover:bg-secondary"
+                          title="Update credentials"
+                        >
+                          Edit
+                        </button>
+                        <button
+                          onClick={() => handleDelete(i.id, i.display_name)}
+                          className="text-xs flex items-center gap-1 px-2 py-1 rounded border border-red-200 text-red-700 hover:bg-red-50"
+                          title="Disconnect"
+                        >
+                          <Trash2 size={12} />
+                        </button>
+                      </div>
                     </div>
                   );
                 })}

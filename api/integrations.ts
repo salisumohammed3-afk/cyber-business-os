@@ -5,8 +5,8 @@ import {
   decryptCredentials,
   maskCredential,
   type EncryptedBlob,
-} from "./lib/crypto";
-import { getVendor, listVendors } from "./lib/vendor-registry";
+} from "./lib/crypto.js";
+import { getVendor, listVendors } from "./lib/vendor-registry.js";
 
 // API Center backend.
 //

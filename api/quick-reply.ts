@@ -705,7 +705,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       }
 
       // Look up the vendor in the registry — same source of truth as the API Center
-      const { getVendor } = await import("./lib/vendor-registry");
+      const { getVendor } = await import("./lib/vendor-registry.js");
       const vendorDef = parsedInt?.vendor ? getVendor(parsedInt.vendor) : null;
 
       if (!vendorDef) {

@@ -2,7 +2,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import { Resend } from "resend";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
 import type { VercelRequest, VercelResponse } from "@vercel/node";
-import { finishJobRun, startJobRun } from "./job-run-ledger";
+import { finishJobRun, startJobRun } from "./job-run-ledger.js";
 
 export const maxDuration = 120;
 

@@ -282,7 +282,7 @@ const CHAT_TOOLS = [
         },
         max: {
           type: "number",
-          description: "Safety cap on number to cancel. Default 50, max 50.",
+          description: "Safety cap on number to cancel. Default 500, max 500. Iterate if more.",
         },
       },
     },
@@ -489,7 +489,7 @@ async function runCancelTasks(
 ): Promise<string> {
   const status = typeof input.status === "string" ? input.status : null;
   const taskIds = Array.isArray(input.task_ids) ? (input.task_ids as string[]).filter(s => typeof s === "string") : null;
-  const cap = Math.min(Number(input.max) || 50, 50);
+  const cap = Math.min(Number(input.max) || 500, 500);
 
   if (!status && (!taskIds || taskIds.length === 0)) {
     return JSON.stringify({
@@ -1176,7 +1176,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
 
     // ── Tool-use loop ───────────────────────────────────────────────────────
-    const model = orchestrator?.model || "claude-opus-4-6";
+    // Chat orchestrator uses Sonnet by default — Opus 4.6 was 3x slower with no
+    // material quality difference for chat reasoning + tool routing.
+    // Override per-company by setting agent_definitions.model on the orchestrator row.
+    const model = orchestrator?.model || "claude-sonnet-4-20250514";
     let reply = "";
     let toolTurns = 0;
 

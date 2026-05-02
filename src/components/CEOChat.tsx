@@ -103,7 +103,7 @@ const DELIVERABLE_ICONS: Record<string, typeof Globe> = {
 
 export function CEOChat() {
   const { company } = useCompany()
-  const { messages, conversationId, loading, error, sendMessage, clearConversation } = useLiveChat(company?.id ?? null)
+  const { messages, conversationId, loading, error, waitingForReply, sendMessage, stopThinking, clearConversation } = useLiveChat(company?.id ?? null)
   const scrollContainerRef = useRef<HTMLDivElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -298,14 +298,25 @@ export function CEOChat() {
     }
   }, [addFiles])
 
-  const isWaitingForResponse =
-    messages.length > 0 && messages[messages.length - 1]?.role === 'user'
+  // "Waiting for orchestrator response" — true while quick-reply is in-flight.
+  // Sourced from the hook (set true on send, false on response/error/abort).
+  const isWaitingForResponse = waitingForReply
 
   return (
     <div className="flex flex-col h-full">
       <div className="flex items-center justify-between px-4 py-2 border-b">
         <span className="text-sm font-medium text-gray-600">Chat</span>
         <div className="flex items-center gap-3">
+          {isWaitingForResponse && (
+            <button
+              onClick={stopThinking}
+              className="flex items-center gap-1 text-xs font-semibold text-white bg-amber-600 hover:bg-amber-700 rounded px-2 py-1 transition-colors"
+              title="Abort the in-flight chat reply (frees the UI immediately)"
+            >
+              <OctagonX size={14} />
+              STOP THINKING
+            </button>
+          )}
           {activeTaskCount > 0 && (
             <button
               onClick={handleStopAll}

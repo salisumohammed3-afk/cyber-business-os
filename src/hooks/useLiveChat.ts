@@ -56,6 +56,9 @@ export function useLiveChat(companyId: string | null) {
   const convIdRef = useRef<string | null>(conversationIdState)
   convIdRef.current = conversationIdState
   const lastRealtimeRef = useRef<number>(0)
+  // Holds the current in-flight quick-reply fetch's abort controller so the
+  // user can hit STOP THINKING to kill the call from the client side.
+  const inFlightRef = useRef<AbortController | null>(null)
 
   // When companyId changes, load the stored conversation for that company
   useEffect(() => {
@@ -204,6 +207,9 @@ export function useLiveChat(companyId: string | null) {
       // Chat is chat. No fallback path. If quick-reply fails, the user sees a real error
       // in the conversation (quick-reply persists an error message on its end).
       // We do NOT silently spawn a task — that's how runaways start.
+      // AbortController lets the user hit STOP THINKING to kill the in-flight call.
+      const ac = new AbortController()
+      inFlightRef.current = ac
       try {
         const qr = await fetch('/api/quick-reply', {
           method: 'POST',
@@ -214,6 +220,7 @@ export function useLiveChat(companyId: string | null) {
             message: text + attachmentContext,
             attachments: attachments.length > 0 ? attachments : undefined,
           }),
+          signal: ac.signal,
         })
 
         if (!qr.ok) {
@@ -225,13 +232,31 @@ export function useLiveChat(companyId: string | null) {
         }
       } catch (qrError) {
         const m = qrError instanceof Error ? qrError.message : String(qrError)
-        console.error('Quick-reply network error:', m)
-        setError(new Error(`Network error reaching chat: ${m}`))
-        setWaitingForReply(false)
+        // AbortError is the user clicking STOP THINKING — clear UI silently.
+        if (qrError instanceof DOMException && qrError.name === 'AbortError') {
+          setWaitingForReply(false)
+        } else {
+          console.error('Quick-reply network error:', m)
+          setError(new Error(`Network error reaching chat: ${m}`))
+          setWaitingForReply(false)
+        }
+      } finally {
+        if (inFlightRef.current === ac) inFlightRef.current = null
       }
     },
     [companyId]
   )
+
+  // Abort the in-flight quick-reply call. Doesn't stop the server-side LLM call
+  // mid-flight (Vercel doesn't surface that), but it frees the UI immediately
+  // and the function self-terminates when its 60s budget hits or it returns.
+  const stopThinking = useCallback(() => {
+    if (inFlightRef.current) {
+      inFlightRef.current.abort()
+      inFlightRef.current = null
+    }
+    setWaitingForReply(false)
+  }, [])
 
   const clearConversation = useCallback(() => {
     if (!companyId) return
@@ -247,7 +272,9 @@ export function useLiveChat(companyId: string | null) {
     conversationId: conversationIdState,
     loading,
     error,
+    waitingForReply,
     sendMessage,
+    stopThinking,
     clearConversation,
   }
 }

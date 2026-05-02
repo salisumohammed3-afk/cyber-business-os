@@ -1051,17 +1051,42 @@ async function toolDatabaseAdmin(input) {
 }
 
 async function toolRegisterProject(input) {
-  const result = await sbInsert("projects", {
-    company_id: companyId, name: input.name,
+  // UPSERT by (company_id, name). The unique index in migration
+  // 20260424000000_projects_unique_name.sql guarantees we never duplicate.
+  // PostgREST: send Prefer: resolution=merge-duplicates with on_conflict.
+  const row = {
+    company_id: companyId,
+    name: input.name,
     description: input.description || null,
     repo_url: input.repo_url || null,
     deploy_url: input.deploy_url || null,
     tables_created: input.tables_created || [],
     status: input.status || "building",
     created_by_task_id: TASK_ID,
+    updated_at: new Date().toISOString(),
+  };
+  const params = new URLSearchParams({ on_conflict: "company_id,name" });
+  const r = await fetch(SUPABASE_URL + "/rest/v1/projects?" + params, {
+    method: "POST",
+    headers: {
+      ...SB_HEADERS,
+      Prefer: "return=representation,resolution=merge-duplicates",
+    },
+    body: JSON.stringify(row),
   });
-  if (!result) return JSON.stringify({ error: "Failed to register project" });
-  return JSON.stringify({ success: true, project_id: result[0]?.id });
+  if (!r.ok) {
+    const errText = await r.text().catch(() => "");
+    return JSON.stringify({ error: "Failed to register project: " + errText.slice(0, 300) });
+  }
+  const result = await r.json();
+  const project = result[0];
+  const isNew = project?.created_at === project?.updated_at;
+  return JSON.stringify({
+    success: true,
+    project_id: project?.id,
+    action: isNew ? "registered" : "updated",
+    note: isNew ? "New project registered." : "Existing project updated (no duplicate created).",
+  });
 }
 
 // ── Composio account cache ──────────────────────────────────────────────────
@@ -1828,101 +1853,11 @@ async function runLoop(model, systemPrompt, messages, tools, timeBudgetMs, tempe
   };
 }
 
-// ── Quality review (for delegated tasks) ────────────────────────────────────
-
-// Quick health check — just tests if important output URLs are reachable.
-// The real quality assessment is done by the agents themselves.
-async function checkOutputUrls(resultText, toolCalls) {
-  const facts = [];
-
-  // Gather URLs from deliverables
-  const urlPattern = /https?:\/\/[^\s)>"]+/g;
-  const allUrls = [...new Set((resultText.match(urlPattern) || []).filter(u =>
-    !u.includes("api.anthropic.com") && !u.includes("supabase.co") &&
-    !u.includes("api.github.com") && !u.includes("serper.dev")
-  ))];
-
-  const deployUrls = allUrls.filter(u =>
-    u.includes("github.io") || u.includes("vercel.app") || u.includes("netlify.app") ||
-    u.includes("docs.google.com") || u.includes("sheets.google.com")
-  );
-
-  // Also check registered project
-  const projects = await sbGet("projects", { created_by_task_id: "eq." + TASK_ID });
-  if (projects?.length && projects[0].deploy_url) {
-    const pu = projects[0].deploy_url;
-    if (!deployUrls.includes(pu)) deployUrls.unshift(pu);
-  }
-
-  for (const url of deployUrls.slice(0, 3)) {
-    try {
-      const r = await fetch(url, { method: "GET", redirect: "follow", signal: AbortSignal.timeout(12000) });
-      facts.push({ url, status: r.status, ok: r.ok });
-    } catch (e) {
-      facts.push({ url, status: 0, ok: false, error: (e.message || "timeout").slice(0, 60) });
-    }
-  }
-
-  return facts;
-}
-
-async function reviewResult(agentName, instruction, resultText, resultStatus, toolCalls, previousRejection = null) {
-  try {
-    // Run automated URL health checks
-    const urlFacts = await checkOutputUrls(resultText, toolCalls || []);
-    const brokenUrls = urlFacts.filter(f => !f.ok);
-    const workingUrls = urlFacts.filter(f => f.ok);
-
-    if (urlFacts.length > 0) {
-      await log("URL checks: " + workingUrls.length + " ok, " + brokenUrls.length + " broken", "review_url_check");
-    }
-
-    // Build context for the reviewer — give it real facts, not rules
-    let urlContext = "";
-    if (workingUrls.length > 0) {
-      urlContext += "\n\nWorking URLs (verified by automated check):\n" + workingUrls.map(u => "✓ " + u.url + " → " + u.status).join("\n");
-    }
-    if (brokenUrls.length > 0) {
-      urlContext += "\n\nBroken URLs (verified by automated check):\n" + brokenUrls.map(u => "✗ " + u.url + " → " + (u.error || "HTTP " + u.status)).join("\n");
-    }
-
-    const toolsSummary = (toolCalls || []).length > 0
-      ? "\n\nTools used: " + [...new Set((toolCalls || []).map(t => t.tool))].join(", ") + " (" + toolCalls.length + " total calls)"
-      : "\n\nTools used: NONE";
-
-    // The agent tested its own URLs? Note that.
-    const selfTested = (toolCalls || []).some(t => t.tool === "test_url");
-
-    const prompt = "You are reviewing work submitted by " + agentName + ".\n\n" +
-      "TASK: " + instruction + "\n\n" +
-      "OUTPUT:\n" + resultText.slice(0, 3000) +
-      urlContext + toolsSummary +
-      (selfTested ? "\n\nNote: The agent tested its own URLs before submitting." : "") +
-      "\n\nThink about this like a manager reviewing an employee's work. " +
-      "The question is simple: is there a usable deliverable here? Something the user can immediately use — " +
-      "a link that works, a report with real information, a document they can open?\n\n" +
-      "If the task asked for something to be built and there's no working link, that's not done. " +
-      "If the task asked for research and the output is vague or generic, that's not done. " +
-      "But if there's a real, usable output — even if it's not perfect — accept it.\n\n" +
-      "Respond with ACCEPT: followed by what the deliverable is, or REJECT: followed by what's specifically missing or broken." +
-      (previousRejection
-        ? "\n\nPREVIOUS REJECTION REASON: " + previousRejection + "\nSpecifically check whether this issue has been addressed in the revised output."
-        : "");
-
-    const resp = await callClaude("claude-sonnet-4-20250514",
-      "You review agent work. Judge like a manager: is there a usable deliverable the user can act on right now?",
-      [{ role: "user", content: prompt }], [], 512, 0.3);
-
-    const verdict = resp.content.find(b => b.type === "text")?.text || "";
-    if (verdict.startsWith("ACCEPT:")) return { accepted: true, summary: verdict.slice(7).trim() };
-    if (verdict.startsWith("REJECT:")) return { accepted: false, summary: verdict.slice(7).trim() };
-    await log("Review verdict ambiguous (no ACCEPT/REJECT prefix): " + verdict.slice(0, 100), "review_ambiguous");
-    return { accepted: false, summary: "Review inconclusive — could not determine if output meets requirements" };
-  } catch (err) {
-    await log("Review error: " + (err?.message || err), "review_error");
-    return { accepted: false, summary: "Review failed due to an error — manual check needed" };
-  }
-}
+// ── Quality review — REMOVED in Stage 3 ────────────────────────────────────
+// The reviewResult / checkOutputUrls helpers were the engine of the invisible
+// 3x-cost LLM-judge loop. They're gone. If we want URL health checks later,
+// they belong in a tool the agent calls explicitly (test_url already does this),
+// not a hidden post-task gate that retries up to 3 times.
 
 // ── Deliverable Extraction ───────────────────────────────────────────────────
 
@@ -2522,7 +2457,6 @@ async function main() {
   const didWorkButTimedOut = result.status === "time_expired" && result.toolCalls.length > 2 && !isTimeoutString;
 
   let finalStatus = (hasRealOutput || didWorkButTimedOut) ? "completed" : "failed";
-  let reviewSummary = null;
   let failReason = null;
 
   if (finalStatus === "failed" && result.status === "time_expired") {
@@ -2531,59 +2465,12 @@ async function main() {
     failReason = finalText.slice(0, 500);
   }
 
-  // 11. Quality review for ALL completed tasks (not just delegated)
-  if (finalStatus === "completed") {
-    const MAX_REVIEW_RETRIES = 2;
-    let reviewAttempt = 0;
-    let currentResult = result;
-    let lastRejectionReason = null;
-
-    while (reviewAttempt <= MAX_REVIEW_RETRIES) {
-      const review = await reviewResult(agentSlug, instruction, currentResult.text, currentResult.status, currentResult.toolCalls, lastRejectionReason);
-      if (review.accepted) {
-        reviewSummary = review.summary;
-        finalText = currentResult.text;
-        finalToolCalls = currentResult.toolCalls;
-        finalStatus = "completed";
-        await log("Review: ACCEPTED" + (reviewAttempt > 0 ? " (after " + reviewAttempt + " revision(s))" : ""), "review_accepted");
-        break;
-      }
-
-      lastRejectionReason = review.summary;
-      reviewAttempt++;
-      if (reviewAttempt > MAX_REVIEW_RETRIES) {
-        finalStatus = "failed";
-        failReason = "Rejected after " + MAX_REVIEW_RETRIES + " revision attempts: " + review.summary;
-        finalText = failReason;
-        await log("Review: FINAL REJECT after " + MAX_REVIEW_RETRIES + " retries — " + review.summary, "review_rejected");
-        break;
-      }
-
-      await log("Review: REJECTED (attempt " + reviewAttempt + "/" + MAX_REVIEW_RETRIES + ") — " + review.summary + ". Sending back for revision.", "review_retry");
-
-      const revisionMessages = [...messages];
-      revisionMessages.push({
-        role: "user",
-        content: "Your work was reviewed and sent back. Here's the feedback:\n\n" +
-          review.summary + "\n\n" +
-          "Fix the issues and deliver a working result. Use test_url to verify your links before submitting again.",
-      });
-
-      const REVISION_TIME_BUDGET = 3 * 60 * 1000;
-      const retryResult = await runLoop(model, systemBlocks, revisionMessages, tools, REVISION_TIME_BUDGET, temperature, currentResult.toolCalls);
-      await log("Revision loop done: " + retryResult.status + " in " + retryResult.turns + " turns", "review_revision_done");
-
-      if (retryResult.status !== "completed") {
-        finalStatus = "failed";
-        failReason = "Failed during revision attempt " + reviewAttempt + ": " + retryResult.text;
-        finalText = failReason;
-        await log("Revision attempt " + reviewAttempt + " failed: " + retryResult.status, "review_revision_failed");
-        break;
-      }
-
-      currentResult = retryResult;
-    }
-  }
+  // 11. (Removed in Stage 3) Invisible LLM-judge review loop with up to 3
+  // revision cycles. It was a hidden 3x cost multiplier with no user benefit
+  // — review failures were retried automatically, so users couldn't tell that
+  // their "completed" task was actually 3 attempts. If we want quality gates
+  // later they go where they belong: opt-in per work-order type, with
+  // cost+turn count visible to the user.
 
   // 12. Extract deliverables from the latest result (post-revision if applicable)
   const deliverables = extractDeliverables(finalToolCalls || []);
@@ -2636,9 +2523,7 @@ async function main() {
       timestamp: new Date().toISOString(),
       metadata: {
         notification: finalStatus === "completed",
-        review: true,
-        review_summary: reviewSummary,
-        reviewed_task_id: TASK_ID,
+        completed_task_id: TASK_ID,
         agent_slug: agentSlug,
         deliverables: deliverables.length > 0 ? deliverables : undefined,
       },
@@ -2667,65 +2552,10 @@ async function main() {
 
   await log("Results written. Task " + finalStatus + ". Tokens: " + tokenUsage.input_tokens + " in / " + tokenUsage.output_tokens + " out / " + tokenUsage.cache_read_input_tokens + " cache-read / " + tokenUsage.api_calls + " API calls", "task_" + (finalStatus === "completed" ? "complete" : "failed"));
 
-  // 12a. Auto-extract memories from completed tasks (non-blocking, uses Haiku)
-  if (finalStatus === "completed" && finalText.length > 200 && agentDefId) {
-    try {
-      // Gather memories already stored during this task run
-      const taskStarted = task.started_at || new Date(Date.now() - 10 * 60 * 1000).toISOString();
-      const existingMemParams = new URLSearchParams({
-        select: "content", limit: "10",
-        agent_definition_id: "eq." + agentDefId,
-        "created_at": "gte." + taskStarted,
-      });
-      if (companyId) existingMemParams.set("company_id", "eq." + companyId);
-      const existingMemR = await fetch(SUPABASE_URL + "/rest/v1/memories?" + existingMemParams, { headers: SB_HEADERS }).catch(() => null);
-      const existingMems = existingMemR?.ok ? await existingMemR.json() : [];
-      const existingList = existingMems.map(m => m.content).join("; ");
-
-      const extractPrompt = "You extract key learnings from an AI agent's completed work. Return a JSON array of 1-3 objects with {content, category, importance} where category is one of: business_context, user_preference, market_intel, decision, contact, metric, technical_finding, process_learning. importance is 1-10.\n\nOnly extract genuinely useful facts that would help this agent or teammates on FUTURE tasks. Skip generic observations.";
-      const extractInput = "Agent: " + agentSlug + "\nTask: " + instruction.slice(0, 300) + "\nTools used: " + [...new Set(finalToolCalls.map(t => t.tool))].join(", ") + "\nOutput summary: " + finalText.slice(0, 1500) +
-        (existingList ? "\n\nAlready stored during this run (DO NOT duplicate): " + existingList : "");
-
-      const extractResp = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: { "x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json" },
-        body: JSON.stringify({
-          model: "claude-haiku-4-20250414",
-          max_tokens: 512,
-          temperature: 0.3,
-          system: extractPrompt,
-          messages: [{ role: "user", content: extractInput }],
-        }),
-      });
-
-      if (extractResp.ok) {
-        const extractData = await extractResp.json();
-        const extractText = extractData.content?.[0]?.text || "[]";
-        const jsonMatch = extractText.match(/\[[\s\S]*\]/);
-        if (jsonMatch) {
-          const extracted = JSON.parse(jsonMatch[0]);
-          let stored = 0;
-          for (const mem of extracted.slice(0, 3)) {
-            if (!mem.content || mem.content.length < 10) continue;
-            await sbInsert("memories", {
-              content: mem.content,
-              category: mem.category || "business_context",
-              importance: Math.min(10, Math.max(1, mem.importance || 5)),
-              user_id: "00000000-0000-0000-0000-000000000000",
-              company_id: companyId,
-              agent_definition_id: agentDefId,
-              metadata: { source: "auto_extract", agent_slug: agentSlug, task_id: TASK_ID },
-            });
-            stored++;
-          }
-          if (stored > 0) await log("Auto-extracted " + stored + " memory(ies) from task output", "memory_extracted");
-        }
-      }
-    } catch (extractErr) {
-      // Non-critical — don't fail the task over memory extraction
-      await log("Memory extraction failed (non-critical): " + (extractErr.message || extractErr), "memory_extract_error");
-    }
-  }
+  // 12a. (Removed in Stage 3) Auto-extract memories using Haiku post-task.
+  // Hidden ~$0.002/task, but added latency and weird false-positive memories.
+  // Agents can use store_memory explicitly during a run if there's something
+  // worth remembering. Manual is fine; auto was noise.
 
   // 12b. Post completion notification for proactive/background tasks
   if (finalStatus === "completed" && task.source !== "internal" && isDelegated) {
@@ -2755,80 +2585,15 @@ async function main() {
       childTasks.map(c => c.taskId.slice(0, 8)).join(", "));
   }
 
-  // 13. Auto-retry for failed delegated tasks
-  // Disabled by default — auto-retry burns money when the root cause is usually
-  // a wrong approach, not a transient error. Set AUTO_RETRY_ENABLED=true to re-enable.
-  const taskMeta2 = task.metadata || {};
-  const retryCount = taskMeta2.auto_retry_count || 0;
-  const AUTO_RETRY_ENABLED = process.env.AUTO_RETRY_ENABLED === "true";
-  const MAX_AUTO_RETRIES = AUTO_RETRY_ENABLED ? 2 : 0;
+  // 13. (Removed in Stage 3) Auto-retry of failed tasks. The "Task failed —
+  // automatically retrying" loop spawned a fresh runner with a modified prompt,
+  // burning credits on the same wrong approach. If a task fails, it stays
+  // failed; the user can read the error and re-propose explicitly.
 
-  if (isDelegated && finalStatus === "failed" && retryCount < MAX_AUTO_RETRIES) {
-    await log("Auto-retrying failed delegated task (attempt " + (retryCount + 1) + "/" + MAX_AUTO_RETRIES + ")", "auto_retry");
-
-    const retryTask = await sbInsert("tasks", {
-      title: task.title,
-      description: task.description,
-      agent_definition_id: task.agent_definition_id,
-      conversation_id: CONVERSATION_ID,
-      parent_task_id: task.parent_task_id || TASK_ID,
-      company_id: companyId,
-      status: "pending",
-      input_data: {
-        instruction: instruction + "\n\nIMPORTANT CONTEXT: A previous attempt at this task FAILED with this error:\n" +
-          failReason + "\n\nYou MUST avoid this same mistake. Adjust your approach and try a different strategy.",
-        context: (typeof task.input_data === "object" ? task.input_data?.context : "") || "",
-      },
-      metadata: { ...taskMeta2, auto_retry_count: retryCount + 1, previous_task_id: TASK_ID },
-      source: "agent",
-    });
-
-    if (retryTask?.[0]?.id) {
-      await log("Retry task created: " + retryTask[0].id.slice(0, 8), "auto_retry_created");
-      await sbInsert("chat_messages", {
-        conversation_id: CONVERSATION_ID,
-        role: "orchestrator",
-        content: "Task failed — automatically retrying with adjusted approach (attempt " + (retryCount + 1) + "/" + MAX_AUTO_RETRIES + ").",
-        timestamp: new Date().toISOString(),
-        metadata: { notification: true, retry: true, original_task_id: TASK_ID },
-      });
-    }
-  }
-
-  // 14. Handoff chain: if this task has a next_agent, auto-create the follow-up task
-  const handoff = (task.metadata || {}).handoff;
-  if (handoff?.next_agent && finalStatus === "completed") {
-    const nextAgentDef = await sbGet("agent_definitions", {
-      slug: "eq." + handoff.next_agent, company_id: "eq." + companyId,
-    }, { select: "id,name", single: true });
-
-    if (nextAgentDef) {
-      const nextInstruction = (handoff.next_instruction || "Continue from previous agent output.")
-        .replace(/\{RESULT\}/g, finalText);
-
-      const handoffTask = await sbInsert("tasks", {
-        title: "Handoff: " + handoff.next_agent + " — " + nextInstruction.slice(0, 60),
-        description: nextInstruction,
-        agent_definition_id: nextAgentDef.id,
-        conversation_id: CONVERSATION_ID,
-        parent_task_id: task.parent_task_id || TASK_ID,
-        company_id: companyId,
-        status: "pending",
-        input_data: {
-          instruction: nextInstruction,
-          context: "Previous agent (" + agentSlug + ") output:\n\n" + finalText,
-          deliverables: deliverables,
-        },
-        source: "agent",
-      });
-
-      if (handoffTask?.[0]?.id) {
-        await log("Handoff: created task " + handoffTask[0].id.slice(0, 8) + " for " + handoff.next_agent, "handoff_created");
-      }
-    } else {
-      await log("Handoff skipped: agent '" + handoff.next_agent + "' not found", "handoff_error");
-    }
-  }
+  // 14. (Removed in Stage 3) Agent handoff chains via metadata.handoff.next_agent.
+  // Multi-agent chains spawn fresh runner processes with no shared state and
+  // unbounded cost compounding. If a workflow needs two agents, that's two
+  // work orders and two approvals.
 
   await log("Runner complete. Exiting.");
 }

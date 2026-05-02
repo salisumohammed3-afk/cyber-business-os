@@ -1,12 +1,32 @@
 import { useRef, useEffect, useState, useMemo, useCallback, type KeyboardEvent, type DragEvent, type ClipboardEvent } from 'react'
 import ReactMarkdown from 'react-markdown'
-import { Bot, Pencil, Globe, GitBranch, FileText, Mail, CheckCircle2, Sheet, Paperclip, X, Image as ImageIcon, Loader2, MessageSquarePlus, OctagonX } from 'lucide-react'
+import { Bot, Pencil, Globe, GitBranch, FileText, Mail, CheckCircle2, Sheet, Paperclip, X, Image as ImageIcon, Loader2, MessageSquarePlus, OctagonX, Play, Clock, DollarSign, Wrench, AlertTriangle } from 'lucide-react'
 import { useLiveChat, type Attachment } from '@/hooks/useLiveChat'
 import { useCompany } from '@/contexts/CompanyContext'
 import { supabase } from '@/integrations/supabase/client'
 import { Link } from 'react-router-dom'
 
 interface ProjectRef { id: string; deploy_url: string }
+
+interface WorkOrderProposal {
+  type: string
+  agent: string
+  title: string
+  description: string
+  estimated_cost_usd: number
+  estimated_minutes: number
+  output_target: string
+  preflight: { tool: string; status: 'ready' | 'missing' | 'unknown'; note?: string }[]
+}
+
+const WORK_ORDER_TYPE_LABELS: Record<string, string> = {
+  research: 'Research',
+  build_static_site: 'Build Static Site',
+  edit_project: 'Edit Project',
+  send_outreach: 'Send Outreach',
+  design_mockup: 'Design Mockup',
+  meeting_admin: 'Meeting / Admin',
+}
 
 interface Deliverable {
   type: string
@@ -118,6 +138,37 @@ export function CEOChat() {
       clearInterval(interval)
     }
   }, [company?.id, messages.length])
+
+  // Track which work orders are being approved/cancelled (for spinner state)
+  const [pendingActionTaskId, setPendingActionTaskId] = useState<string | null>(null)
+
+  const handleWorkOrderAction = useCallback(
+    async (taskId: string, action: 'approve' | 'cancel') => {
+      setPendingActionTaskId(taskId)
+      try {
+        const r = await fetch('/api/approve-work-order', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ task_id: taskId, action }),
+        })
+        if (!r.ok) {
+          const body = await r.json().catch(() => ({ error: r.statusText }))
+          alert(
+            (action === 'approve' ? 'Approve failed: ' : 'Cancel failed: ') +
+              (body.error || r.statusText)
+          )
+        }
+      } catch (err) {
+        alert(
+          (action === 'approve' ? 'Approve failed: ' : 'Cancel failed: ') +
+            (err instanceof Error ? err.message : String(err))
+        )
+      } finally {
+        setPendingActionTaskId(null)
+      }
+    },
+    []
+  )
 
   const handleStopAll = useCallback(async () => {
     if (!company?.id) return
@@ -286,6 +337,121 @@ export function CEOChat() {
                   <div className="text-xs text-gray-400 italic px-4 py-1 flex items-center gap-1.5">
                     <Loader2 size={10} className="animate-spin" />
                     {msg.content}
+                  </div>
+                </div>
+              )
+            }
+
+            // Render kind=work_order_proposal as an interactive approval card
+            if (meta?.kind === 'work_order_proposal' && meta.proposal) {
+              const proposal = meta.proposal as WorkOrderProposal
+              const taskId = (meta.task_id as string) || ''
+              const typeLabel = WORK_ORDER_TYPE_LABELS[proposal.type] || proposal.type
+              const missing = (proposal.preflight || []).filter(p => p.status === 'missing')
+              const isPending = pendingActionTaskId === taskId
+              return (
+                <div key={msg.id} className="flex justify-start">
+                  <div className="rounded-md border border-blue-300 bg-blue-50 px-3 py-2 max-w-[85%] text-sm">
+                    {msg.content && (
+                      <div className="text-foreground/80 whitespace-pre-wrap mb-2">
+                        {msg.content}
+                      </div>
+                    )}
+                    <div className="rounded bg-white border border-blue-200 px-3 py-2">
+                      <div className="text-xs uppercase tracking-wide font-semibold text-blue-700 mb-1">
+                        Work order: {typeLabel}
+                      </div>
+                      <div className="font-medium mb-1">{proposal.title}</div>
+                      <div className="text-xs text-gray-600 mb-2 whitespace-pre-wrap">
+                        {proposal.description}
+                      </div>
+                      <div className="flex flex-wrap gap-3 text-xs text-gray-700 mb-2">
+                        <span className="inline-flex items-center gap-1">
+                          <Wrench size={11} /> {proposal.agent}
+                        </span>
+                        <span className="inline-flex items-center gap-1">
+                          <DollarSign size={11} /> ≤ ${proposal.estimated_cost_usd.toFixed(2)}
+                        </span>
+                        <span className="inline-flex items-center gap-1">
+                          <Clock size={11} /> ≤ {proposal.estimated_minutes} min
+                        </span>
+                        <span className="inline-flex items-center gap-1">
+                          → {proposal.output_target}
+                        </span>
+                      </div>
+                      {missing.length > 0 && (
+                        <div className="mb-2 rounded bg-amber-50 border border-amber-200 px-2 py-1.5 text-xs text-amber-800 flex items-start gap-1.5">
+                          <AlertTriangle size={12} className="mt-0.5 flex-shrink-0" />
+                          <span>
+                            Missing integrations: <b>{missing.map(m => m.tool).join(', ')}</b>. Connect them before approving.
+                          </span>
+                        </div>
+                      )}
+                      <div className="flex items-center gap-2 mt-2">
+                        <button
+                          onClick={() => handleWorkOrderAction(taskId, 'approve')}
+                          disabled={!taskId || isPending || missing.length > 0}
+                          className="inline-flex items-center gap-1 px-3 py-1 text-xs font-semibold rounded bg-blue-600 text-white hover:bg-blue-700 disabled:bg-gray-300 disabled:cursor-not-allowed"
+                        >
+                          {isPending ? <Loader2 size={12} className="animate-spin" /> : <Play size={12} />}
+                          Approve
+                        </button>
+                        <button
+                          onClick={() => handleWorkOrderAction(taskId, 'cancel')}
+                          disabled={!taskId || isPending}
+                          className="inline-flex items-center gap-1 px-3 py-1 text-xs rounded border border-gray-300 text-gray-700 hover:bg-gray-100 disabled:opacity-50 disabled:cursor-not-allowed"
+                        >
+                          <X size={12} />
+                          Cancel
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )
+            }
+
+            // Render kind=work_order_status (approved / cancelled / completed / failed)
+            if (meta?.kind === 'work_order_status') {
+              const status = (meta.status as string) || 'unknown'
+              const cost = typeof meta.cost_usd === 'number' ? meta.cost_usd : null
+              const dur = typeof meta.duration_min === 'number' ? meta.duration_min : null
+              const woType = (meta.work_order_type as string) || ''
+              const typeLabel = WORK_ORDER_TYPE_LABELS[woType] || woType
+              const icon =
+                status === 'completed' ? '✅' :
+                status === 'failed' ? '❌' :
+                status === 'cancelled' ? '🚫' :
+                status === 'approved' ? '▶' :
+                '🔔'
+              const deliverables = (Array.isArray(meta.deliverables) ? meta.deliverables : []) as Deliverable[]
+              return (
+                <div key={msg.id} className="flex justify-start">
+                  <div className="rounded-md border border-border/60 bg-muted/40 px-3 py-2 max-w-[85%] text-sm">
+                    <div className="flex items-center gap-2 text-muted-foreground text-xs mb-1">
+                      <span>{icon}</span>
+                      <span className="font-semibold uppercase tracking-wide">{status}</span>
+                      {typeLabel && <span>· {typeLabel}</span>}
+                      {cost !== null && <span>· ${cost.toFixed(2)}</span>}
+                      {dur !== null && <span>· {dur} min</span>}
+                    </div>
+                    <div className="text-foreground/80 whitespace-pre-wrap">{msg.content}</div>
+                    {deliverables.length > 0 && (
+                      <div className="mt-2 flex flex-wrap gap-1.5">
+                        {deliverables.map((d, i) => (
+                          <a
+                            key={i}
+                            href={d.url || '#'}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="inline-flex items-center gap-1 px-2 py-0.5 text-xs rounded bg-white border border-border hover:bg-gray-50"
+                          >
+                            <Globe size={11} />
+                            {d.label || d.type}
+                          </a>
+                        ))}
+                      </div>
+                    )}
                   </div>
                 </div>
               )

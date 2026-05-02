@@ -3,7 +3,28 @@ import type { VercelRequest, VercelResponse } from "@vercel/node";
 
 export const maxDuration = 60;
 
-const DELEGATION_RE = /\[NEEDS_DELEGATION\]/;
+// Work order proposals are emitted by the orchestrator in this format:
+// [PROPOSE_WORK_ORDER]
+// { ...JSON conforming to WorkOrderProposal... }
+// We match the marker then capture the JSON object that follows. The regex is
+// permissive (handles single-line JSON, multi-line JSON, JSON wrapped in code
+// fences) — extractJsonAfterMarker() does the heavy lifting.
+const WORK_ORDER_MARKER = "[PROPOSE_WORK_ORDER]";
+
+function extractJsonAfterMarker(text: string): { preamble: string; rawJson: string } | null {
+  const idx = text.indexOf(WORK_ORDER_MARKER);
+  if (idx < 0) return null;
+  const preamble = text.slice(0, idx).trim();
+  const after = text.slice(idx + WORK_ORDER_MARKER.length);
+  // Find the first '{' and the matching last '}' (greedy — assumes proposal is
+  // the only top-level object after the marker, which the prompt enforces).
+  const firstBrace = after.indexOf("{");
+  if (firstBrace < 0) return null;
+  const lastBrace = after.lastIndexOf("}");
+  if (lastBrace <= firstBrace) return null;
+  const rawJson = after.slice(firstBrace, lastBrace + 1);
+  return { preamble, rawJson };
+}
 
 // In-memory rate limiter (resets on cold start / redeploy)
 const rateLimitMap = new Map<string, number[]>();
@@ -12,6 +33,78 @@ const RATE_LIMIT_MAX = 10;
 
 // Tool-use loop cap — chat mode should answer quickly, not do a research project
 const MAX_TOOL_TURNS = 3;
+
+// ── Work order types (shared with runner via task.metadata.work_order.type) ─
+
+const WORK_ORDER_TYPES = [
+  "research",
+  "build_static_site",
+  "edit_project",
+  "send_outreach",
+  "design_mockup",
+  "meeting_admin",
+] as const;
+
+type WorkOrderType = (typeof WORK_ORDER_TYPES)[number];
+
+const AGENT_FOR_TYPE: Record<WorkOrderType, string> = {
+  research: "research",
+  build_static_site: "engineering",
+  edit_project: "engineering",
+  send_outreach: "growth",
+  design_mockup: "designer",
+  meeting_admin: "executive-assistant",
+};
+
+// Default cost/time caps. Stage 3 moves these to the runner registry.
+const COST_CAP_USD: Record<WorkOrderType, number> = {
+  research: 0.5,
+  build_static_site: 2.0,
+  edit_project: 1.5,
+  send_outreach: 0.5,
+  design_mockup: 1.0,
+  meeting_admin: 0.3,
+};
+
+const TIME_CAP_MIN: Record<WorkOrderType, number> = {
+  research: 5,
+  build_static_site: 15,
+  edit_project: 10,
+  send_outreach: 5,
+  design_mockup: 10,
+  meeting_admin: 5,
+};
+
+const OUTPUT_TARGET: Record<WorkOrderType, string> = {
+  research: "memo",
+  build_static_site: "project",
+  edit_project: "project",
+  send_outreach: "email_draft",
+  design_mockup: "mockup_file",
+  meeting_admin: "calendar_event",
+};
+
+// Tools each work order type requires for preflight checks.
+// Composio app names are lowercase (matches Composio API).
+const REQUIRED_INTEGRATIONS: Record<WorkOrderType, string[]> = {
+  research: [],
+  build_static_site: ["github"],
+  edit_project: ["github"],
+  send_outreach: ["gmail"],
+  design_mockup: [],
+  meeting_admin: ["googlecalendar"],
+};
+
+interface WorkOrderProposal {
+  type: WorkOrderType;
+  agent: string;
+  title: string;
+  description: string;
+  estimated_cost_usd: number;
+  estimated_minutes: number;
+  output_target: string;
+  preflight: { tool: string; status: "ready" | "missing" | "unknown"; note?: string }[];
+}
 
 function checkRateLimit(companyId: string): boolean {
   const now = Date.now();
@@ -27,31 +120,39 @@ const ROUTING_ADDENDUM = `
 
 ## How to respond
 
-You're Sal's AI colleague. Talk naturally like a smart teammate — not a chatbot, not a dispatcher.
+You're Sal's AI colleague. Talk naturally like a smart teammate.
 
-**Default: answer in this message.** You have tools to help you answer directly. Only delegate when the work genuinely can't fit in a short chat turn.
+**Default: answer in this message.** You have tools (\`fetch_url\`, \`query_state\`) to help you answer directly. Only propose a work order when the request genuinely needs minutes of agent execution and tools you don't have access to in chat.
 
-**Answer directly** (no delegation):
-- Questions, opinions, ideas, status checks, pushback, clarifications
-- Quick reviews — use \`fetch_url\` to grab a page and tell Sal what you think
-- "What's running / what did we do / what are our goals" — use \`query_state\` to check
-- Summaries, recaps, brainstorms — your own knowledge is usually enough
+**Answer directly** for:
+- Questions, opinions, ideas, status checks, clarifications, pushback
+- Quick reviews of a URL — use \`fetch_url\` and reply
+- Looking up tasks / memories / goals — use \`query_state\`
+- Summaries, recaps, brainstorms — your own knowledge is enough
 - Anything conversational
 
-**Delegate with [NEEDS_DELEGATION]** only when the work requires:
-- Multi-step execution across external services (sending emails, building/deploying software, creating Monday boards)
-- Deep research that needs multiple scraping rounds (not just reading one URL)
-- Producing a substantial deliverable (a report, a designed mockup, a campaign)
-- Actions that change the world (outreach, posting, scheduling meetings)
+**Propose a work order** when the user clearly wants something done that needs:
+- Building or editing a deployed website / app (engineering)
+- Deep research with multiple scraping rounds and a written report (research)
+- Sending email outreach or running a campaign (growth)
+- Creating a UI mockup or design spec (designer)
+- Calendar / Monday / email management actions (executive-assistant)
 
-If you're unsure, **just answer**. Sal can always explicitly ask you to delegate.
+**Format for work order proposals — NOTHING else.** Output a one-line acknowledgment, then on a new line the literal marker \`[PROPOSE_WORK_ORDER]\`, then a JSON object on the following lines:
 
-When delegating, format:
-[NEEDS_DELEGATION]
-Task title
-What specifically needs to be done.
+\`\`\`
+Got it — I'll set this up for your approval.
+[PROPOSE_WORK_ORDER]
+{
+  "type": "research" | "build_static_site" | "edit_project" | "send_outreach" | "design_mockup" | "meeting_admin",
+  "title": "Short imperative title (under 60 chars)",
+  "description": "Specifically what the agent will do, step by step. Be concrete."
+}
+\`\`\`
 
-Don't delegate to "make sure the task is tracked" or "analyze this." If you can answer it, answer it.`;
+Pick the SINGLE best type. The system fills in agent, cost estimate, time estimate, and output target from the type. Sal will see a card and click Approve before anything runs. Don't propose multiple at once — pick the most important and propose it. Sal can ask for more.
+
+If the request is ambiguous, just ask Sal what he means — don't guess and propose.`;
 
 type ToolResultBlock = { type: "tool_result"; tool_use_id: string; content: string };
 type ToolUseBlock = { type: "tool_use"; id: string; name: string; input: Record<string, unknown> };
@@ -201,6 +302,58 @@ async function runChatTool(
   if (name === "fetch_url") return runFetchUrl(input);
   if (name === "query_state") return runQueryState(supabase, companyId, input);
   return JSON.stringify({ error: `Unknown tool: ${name}` });
+}
+
+// ── Work order proposal: parse + preflight ──────────────────────────────────
+
+async function checkComposioConnected(appName: string): Promise<"ready" | "missing" | "unknown"> {
+  const composioKey = process.env.COMPOSIO_API_KEY;
+  if (!composioKey) return "unknown";
+  try {
+    const r = await fetch("https://backend.composio.dev/api/v1/connectedAccounts?showActiveOnly=true", {
+      headers: { "x-api-key": composioKey },
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!r.ok) return "unknown";
+    const data = await r.json();
+    const items = (data.items || data || []) as Array<{ appName: string; status: string }>;
+    const connected = items.some(
+      a => a.appName?.toLowerCase() === appName.toLowerCase() && a.status === "ACTIVE"
+    );
+    return connected ? "ready" : "missing";
+  } catch {
+    return "unknown";
+  }
+}
+
+async function buildPreflight(type: WorkOrderType): Promise<WorkOrderProposal["preflight"]> {
+  const required = REQUIRED_INTEGRATIONS[type] || [];
+  const checks: WorkOrderProposal["preflight"] = [];
+  for (const tool of required) {
+    const status = await checkComposioConnected(tool);
+    const note =
+      status === "missing"
+        ? `Connect ${tool} in Integrations before approving.`
+        : status === "unknown"
+        ? `Could not verify ${tool} connection.`
+        : undefined;
+    checks.push({ tool, status, note });
+  }
+  return checks;
+}
+
+function tryParseWorkOrderJson(rawJson: string): Partial<WorkOrderProposal> | null {
+  try {
+    return JSON.parse(rawJson);
+  } catch {
+    // Try to recover: strip code-fence backticks and surrounding text
+    const cleaned = rawJson.replace(/```(json)?/g, "").trim();
+    try {
+      return JSON.parse(cleaned);
+    } catch {
+      return null;
+    }
+  }
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
@@ -456,53 +609,108 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       toolTurns++;
     }
 
-    // ── Delegation detection ────────────────────────────────────────────────
-    const delegationMatch = reply.match(DELEGATION_RE);
+    // ── Work order proposal detection ───────────────────────────────────────
+    const woMatch = extractJsonAfterMarker(reply);
 
-    if (delegationMatch) {
-      const markerIdx = reply.indexOf(delegationMatch[0]);
-      const afterMarker = reply.slice(markerIdx + delegationMatch[0].length);
-      const afterLines = afterMarker.split("\n").filter(Boolean);
-      const taskTitle = afterLines[0]?.trim() || "Respond to user message";
-      const taskDescription =
-        afterLines.slice(1).join("\n").trim() || message;
+    if (woMatch) {
+      const { preamble, rawJson } = woMatch;
 
-      const preamble = reply.slice(0, markerIdx).trim();
-      const ackContent = preamble
-        ? preamble
-        : "I've queued that as a proposed task. You can review and approve it in the task pipeline.";
+      const parsed = tryParseWorkOrderJson(rawJson);
+
+      // If the LLM emitted the marker but bad JSON, fail clearly.
+      if (!parsed || !parsed.type || !WORK_ORDER_TYPES.includes(parsed.type as WorkOrderType)) {
+        await supabase.from("chat_messages").insert({
+          conversation_id,
+          role: "system",
+          content:
+            "Work order proposal was malformed — couldn't parse type. Try rephrasing your request, or ask me to clarify.",
+          timestamp: new Date().toISOString(),
+          metadata: { kind: "error", source: "quick-reply", original_error: rawJson.slice(0, 500) },
+        });
+        return res.status(200).json({ mode: "malformed_proposal" });
+      }
+
+      // Fill in canonical fields from type registry. The LLM only chooses type +
+      // title + description; everything else is determined by the system so it
+      // can't propose its way around our cost / agent constraints.
+      const type = parsed.type as WorkOrderType;
+      const proposal: WorkOrderProposal = {
+        type,
+        agent: AGENT_FOR_TYPE[type],
+        title: (parsed.title || "Work order").slice(0, 60),
+        description: (parsed.description || message).slice(0, 2000),
+        estimated_cost_usd: COST_CAP_USD[type],
+        estimated_minutes: TIME_CAP_MIN[type],
+        output_target: OUTPUT_TARGET[type],
+        preflight: await buildPreflight(type),
+      };
+
+      // Resolve agent_definition_id for the chosen agent
+      const { data: agentDef } = await supabase
+        .from("agent_definitions")
+        .select("id")
+        .eq("slug", proposal.agent)
+        .eq("company_id", company_id)
+        .maybeSingle();
 
       const taskInput: Record<string, unknown> = {
-        instruction: taskDescription,
+        instruction: proposal.description,
         context: message,
       };
       if (attachmentList.length > 0) {
         taskInput.attachments = attachmentList;
       }
 
-      const taskInsert = await supabase
+      // Insert proposed task with work_order metadata. Status stays 'proposed'
+      // until the user approves via /api/approve-work-order.
+      const { data: taskRow } = await supabase
         .from("tasks")
         .insert({
           conversation_id,
-          agent_definition_id: orchestrator?.id || null,
+          agent_definition_id: agentDef?.id || null,
           company_id,
           status: "proposed",
-          title: taskTitle,
-          description: taskDescription,
+          title: proposal.title,
+          description: proposal.description,
           input_data: taskInput,
           source: "chat",
+          metadata: {
+            work_order: {
+              type: proposal.type,
+              agent: proposal.agent,
+              estimated_cost_usd: proposal.estimated_cost_usd,
+              estimated_minutes: proposal.estimated_minutes,
+              output_target: proposal.output_target,
+              preflight: proposal.preflight,
+            },
+          },
         })
         .select("id")
         .single();
+
+      // Render-friendly chat message: the UI looks at metadata.kind to render
+      // the work-order card with Approve / Cancel buttons.
+      const ackContent =
+        preamble ||
+        `Proposed: ${proposal.title}. Click Approve below to run, or Cancel to skip.`;
 
       await supabase.from("chat_messages").insert({
         conversation_id,
         role: "assistant",
         content: ackContent,
         timestamp: new Date().toISOString(),
+        metadata: {
+          kind: "work_order_proposal",
+          task_id: taskRow?.id,
+          proposal,
+        },
       });
 
-      return res.status(200).json({ mode: "proposed", task_id: taskInsert.data?.id });
+      return res.status(200).json({
+        mode: "work_order_proposed",
+        task_id: taskRow?.id,
+        proposal,
+      });
     }
 
     await supabase.from("chat_messages").insert({
@@ -510,6 +718,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       role: "assistant",
       content: reply,
       timestamp: new Date().toISOString(),
+      metadata: { kind: "reply" },
     });
 
     return res.status(200).json({ mode: "direct", tool_turns: toolTurns });

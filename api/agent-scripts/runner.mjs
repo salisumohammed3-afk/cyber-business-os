@@ -40,8 +40,9 @@ const tokenUsage = {
 };
 
 // Cost ceiling per task (USD). Auto-cancels task if exceeded.
-// Override with MAX_TASK_COST_USD env var. Default: $2.
-const MAX_TASK_COST_USD = parseFloat(process.env.MAX_TASK_COST_USD || "2.0");
+// Override hierarchy: task.metadata.work_order.estimated_cost_usd  >  env  >  $2 default.
+// (Work-order override is applied in main() after the task is loaded.)
+let MAX_TASK_COST_USD = parseFloat(process.env.MAX_TASK_COST_USD || "2.0");
 
 // Rough Claude Sonnet pricing (USD per 1M tokens) — covers the most-used model.
 // Haiku is cheaper but we use the Sonnet rate as a safe ceiling estimator.
@@ -2010,6 +2011,16 @@ async function main() {
   if (!task) throw new Error("Task not found: " + TASK_ID);
   companyId = task.company_id;
 
+  // Apply work-order cost cap if present (Stage 2: per-type budget enforcement)
+  const woCost = task.metadata?.work_order?.estimated_cost_usd;
+  if (typeof woCost === "number" && woCost > 0) {
+    MAX_TASK_COST_USD = woCost;
+    await log("Work order cost cap set to $" + MAX_TASK_COST_USD, "work_order_cost_cap");
+  }
+  // Apply work-order time budget if present
+  const woMins = task.metadata?.work_order?.estimated_minutes;
+  // (timeBudgetMs is set later — we'll honor woMins there)
+
   // 2. Load agent definition (default to orchestrator if none assigned)
   let systemPrompt = "";
   let model = "claude-sonnet-4-20250514";
@@ -2035,6 +2046,10 @@ async function main() {
         timeBudgetMs = def.time_budget_seconds * 1000;
       } else if (def.max_turns) {
         timeBudgetMs = Math.max(def.max_turns * 30 * 1000, DEFAULT_TIME_BUDGET_MS);
+      }
+      // Work-order time cap takes precedence — predictable budgets per type
+      if (typeof woMins === "number" && woMins > 0) {
+        timeBudgetMs = woMins * 60 * 1000;
       }
       agentDefId = def.id;
       agentSlug = def.slug || "unknown";
@@ -2210,6 +2225,54 @@ async function main() {
     if (agentSlug === "engineering") tools.push(...ENGINEERING_TOOLS);
     if (agentSlug === "designer") tools.push(...DESIGNER_TOOLS);
     if (composioApps.length > 0) tools.push(...COMPOSIO_TOOLS);
+  }
+
+  // 6b. WORK ORDER TOOL LOCKDOWN
+  // If this task carries a work_order, restrict tools to the type's allowlist.
+  // This is the critical constraint: a build_static_site work order CANNOT
+  // randomly call Apollo or send emails. Engineering can't pick from 22 tools.
+  // Stage 3 moves this registry to its own file with cost/time caps too.
+  const WORK_ORDER_TOOL_ALLOWLIST = {
+    research: new Set(["web_search", "test_url", "store_memory", "recall_memories", "fail_task", "fetch_url"]),
+    build_static_site: new Set([
+      "test_url", "store_memory", "recall_memories", "fail_task",
+      "github_create_repo", "github_push_file",
+      "sandbox_bash", "sandbox_read_file", "sandbox_write_file", "sandbox_list_files",
+      "deploy_static_site", "register_project",
+    ]),
+    edit_project: new Set([
+      "test_url", "store_memory", "recall_memories", "fail_task",
+      "github_push_file",
+      "sandbox_bash", "sandbox_read_file", "sandbox_write_file", "sandbox_list_files",
+      "deploy_static_site", "project_query",
+    ]),
+    send_outreach: new Set([
+      "test_url", "store_memory", "recall_memories", "fail_task",
+      "composio_find_actions", "composio_execute",
+    ]),
+    design_mockup: new Set([
+      "test_url", "store_memory", "recall_memories", "fail_task",
+      "design_system_search",
+      "sandbox_write_file", "sandbox_read_file",
+      "github_create_repo", "github_push_file",
+      "deploy_static_site",
+    ]),
+    meeting_admin: new Set([
+      "test_url", "store_memory", "recall_memories", "fail_task",
+      "composio_find_actions", "composio_execute",
+    ]),
+  };
+
+  const workOrder = task.metadata?.work_order;
+  if (workOrder?.type && WORK_ORDER_TOOL_ALLOWLIST[workOrder.type]) {
+    const allow = WORK_ORDER_TOOL_ALLOWLIST[workOrder.type];
+    const before = tools.length;
+    tools = tools.filter(t => allow.has(t.name));
+    await log(
+      "Work order '" + workOrder.type + "' locked tools: " + before + " -> " + tools.length +
+      " (" + tools.map(t => t.name).join(", ") + ")",
+      "work_order_tools_locked"
+    );
   }
 
   // 7. Build conversation
@@ -2528,18 +2591,38 @@ async function main() {
     await log("Deliverables: " + deliverables.map(d => d.type + (d.url ? " " + d.url : "")).join(", "), "deliverables");
   }
 
+  // Build a status message. If this task came from a work order, tag it with
+  // kind=work_order_status so the UI renders it as a clean completion card.
+  const isWorkOrder = !!task.metadata?.work_order;
+  const cost = (typeof estimatedCostUsd === "function") ? estimatedCostUsd() : 0;
+  const elapsedMin = task.started_at
+    ? Math.round((Date.now() - new Date(task.started_at).getTime()) / 60000)
+    : null;
+
   if (!isDelegated) {
     await sbInsert("chat_messages", {
       conversation_id: CONVERSATION_ID,
       role: "orchestrator",
       content: finalText,
       timestamp: new Date().toISOString(),
-      metadata: {
-        model, turns: result.turns,
-        tools_used: [...new Set(finalToolCalls.map(t => t.tool))],
-        agent_slug: agentSlug,
-        deliverables: deliverables.length > 0 ? deliverables : undefined,
-      },
+      metadata: isWorkOrder
+        ? {
+            kind: "work_order_status",
+            status: finalStatus,
+            task_id: TASK_ID,
+            work_order_type: task.metadata.work_order.type,
+            agent_slug: agentSlug,
+            cost_usd: Number(cost.toFixed(4)),
+            duration_min: elapsedMin,
+            tools_used: [...new Set(finalToolCalls.map(t => t.tool))],
+            deliverables: deliverables.length > 0 ? deliverables : undefined,
+          }
+        : {
+            model, turns: result.turns,
+            tools_used: [...new Set(finalToolCalls.map(t => t.tool))],
+            agent_slug: agentSlug,
+            deliverables: deliverables.length > 0 ? deliverables : undefined,
+          },
     });
   } else {
     const notificationContent = finalStatus === "completed"

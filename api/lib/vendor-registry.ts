@@ -10,7 +10,7 @@
 // rows are created without a registry match; the user provides the action
 // shape via the UI directly. (Future Tier 2 form lives in this same module.)
 
-export type AuthType = "api_key" | "bearer" | "basic" | "none";
+export type AuthType = "api_key" | "bearer" | "basic" | "none" | "jwt_es256";
 
 export interface CredentialField {
   name: string;            // key in the credentials object, e.g. "api_key"
@@ -318,6 +318,134 @@ export const VENDOR_REGISTRY: VendorDef[] = [
             num: { type: "number", description: "Number of results (default 10)" },
           },
           required: ["q"],
+        },
+      },
+    ],
+  },
+  {
+    vendor: "appstoreconnect",
+    display_name: "App Store Connect",
+    category: "data",
+    description:
+      "Apple App Store Connect API. Read app analytics, builds, customer reviews, " +
+      "TestFlight, App Store versions. Authentication is JWT ES256 signed per request.",
+    docs_url: "https://appstoreconnect.apple.com/access/integrations/api",
+    auth_type: "jwt_es256",
+    base_url: "https://api.appstoreconnect.apple.com/v1",
+    // For JWT auth, the runner signs a fresh token each call — header_template is
+    // a placeholder that the runtime fills with the signed JWT.
+    auth_header_name: "Authorization",
+    auth_header_template: "Bearer {{__jwt__}}",
+    credentials: [
+      {
+        name: "key_id",
+        label: "Key ID",
+        description: "From appstoreconnect.apple.com → Users and Access → Integrations → Keys (e.g. ABC123XYZ)",
+        placeholder: "ABCDEF1234",
+        is_secret: false,
+        required: true,
+      },
+      {
+        name: "issuer_id",
+        label: "Issuer ID",
+        description: "UUID at the top of the Keys page (every key under one team shares this)",
+        placeholder: "00000000-0000-0000-0000-000000000000",
+        is_secret: false,
+        required: true,
+      },
+      {
+        name: "private_key",
+        label: "Private Key (.p8 file contents)",
+        description:
+          "Paste the FULL contents of the .p8 file including the -----BEGIN PRIVATE KEY----- " +
+          "and -----END PRIVATE KEY----- lines. Apple only lets you download this once — keep a backup.",
+        placeholder: "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----",
+        is_secret: true,
+        required: true,
+      },
+    ],
+    config: [],
+    test: { method: "GET", path: "/apps?limit=1" },
+    actions: [
+      {
+        name: "list_apps",
+        description: "List all apps in this team's App Store Connect account.",
+        method: "GET",
+        path: "/apps",
+        input_schema: {
+          type: "object",
+          properties: {
+            limit: { type: "number", description: "Max apps (default 200, max 200)" },
+          },
+        },
+      },
+      {
+        name: "get_app",
+        description: "Fetch one app by App Store Connect id.",
+        method: "GET",
+        path: "/apps/{{app_id}}",
+        input_schema: {
+          type: "object",
+          properties: { app_id: { type: "string", description: "App Store Connect app id (numeric string)" } },
+          required: ["app_id"],
+        },
+      },
+      {
+        name: "list_builds",
+        description: "List recent builds across all apps for this team.",
+        method: "GET",
+        path: "/builds?sort=-uploadedDate&limit={{limit}}",
+        input_schema: {
+          type: "object",
+          properties: { limit: { type: "number", description: "Default 20, max 200" } },
+        },
+      },
+      {
+        name: "list_app_store_versions",
+        description: "List App Store versions for one app (live + in-progress).",
+        method: "GET",
+        path: "/apps/{{app_id}}/appStoreVersions",
+        input_schema: {
+          type: "object",
+          properties: { app_id: { type: "string" } },
+          required: ["app_id"],
+        },
+      },
+      {
+        name: "list_customer_reviews",
+        description: "List customer reviews for one app, newest first.",
+        method: "GET",
+        path: "/apps/{{app_id}}/customerReviews?sort=-createdDate&limit={{limit}}",
+        input_schema: {
+          type: "object",
+          properties: {
+            app_id: { type: "string" },
+            limit: { type: "number", description: "Default 50, max 200" },
+          },
+          required: ["app_id"],
+        },
+      },
+      {
+        name: "list_beta_app_review_submissions",
+        description: "TestFlight: list pending / approved beta review submissions.",
+        method: "GET",
+        path: "/betaAppReviewSubmissions?limit={{limit}}",
+        input_schema: {
+          type: "object",
+          properties: { limit: { type: "number" } },
+        },
+      },
+      {
+        name: "get_path",
+        description:
+          "Escape hatch: GET an arbitrary App Store Connect API path (must start with /). " +
+          "Use for endpoints not in the catalog above. Example: '/users'.",
+        method: "GET",
+        path: "{{path}}",
+        input_schema: {
+          type: "object",
+          properties: { path: { type: "string", description: "Path starting with / e.g. '/users'" } },
+          required: ["path"],
         },
       },
     ],

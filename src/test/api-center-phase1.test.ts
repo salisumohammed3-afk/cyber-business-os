@@ -103,7 +103,10 @@ describe("API Center Phase 1: vendor registry shape", () => {
       expect(v.actions.length).toBeGreaterThan(0);
       for (const a of v.actions) {
         expect(a.input_schema.type).toBe("object");
-        expect(a.path).toMatch(/^\//);
+        // Most action paths start with a literal '/'. "Escape hatch" actions
+        // like appstoreconnect.get_path use '{{path}}' as the entire path so
+        // the agent can target arbitrary endpoints.
+        expect(a.path).toMatch(/^(\/|\{\{)/);
       }
     }
   });

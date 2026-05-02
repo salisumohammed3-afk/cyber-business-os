@@ -801,7 +801,18 @@ async function toolCallIntegration(input) {
   const url = baseUrl + path;
 
   const headers = { "Content-Type": "application/json" };
-  if (cfg.auth_header_name && cfg.auth_header_template) {
+
+  // jwt_es256 vendors (Apple App Store Connect): sign a fresh JWT per call.
+  // Static-key vendors: substitute creds into the auth header template.
+  if (row.auth_type === "jwt_es256" && cfg.auth_header_name) {
+    try {
+      const { signAppStoreConnectJwt } = await import("../lib/jwt-es256.mjs");
+      const jwt = signAppStoreConnectJwt(creds.key_id, creds.issuer_id, creds.private_key);
+      headers[cfg.auth_header_name] = "Bearer " + jwt;
+    } catch (e) {
+      return JSON.stringify({ error: "Could not sign JWT for " + vendor + ": " + (e.message || e) });
+    }
+  } else if (cfg.auth_header_name && cfg.auth_header_template) {
     let authValue = String(cfg.auth_header_template);
     for (const [k, v] of Object.entries(creds)) {
       authValue = authValue.replaceAll("{{" + k + "}}", String(v));

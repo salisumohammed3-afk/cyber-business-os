@@ -7,6 +7,7 @@ import {
   type EncryptedBlob,
 } from "./lib/crypto.js";
 import { getVendor, listVendors } from "./lib/vendor-registry.js";
+import { signAppStoreConnectJwt } from "./lib/jwt-es256.mjs";
 
 // API Center backend.
 //
@@ -66,10 +67,25 @@ async function buildAuthHeaders(row: IntegrationRow): Promise<Record<string, str
   if (!row.encrypted_credentials) return {};
   const def = getVendor(row.vendor);
   if (!def) return {};
-  const creds = decryptCredentials(row.encrypted_credentials);
+  const creds = decryptCredentials(row.encrypted_credentials) as Record<string, string>;
   const headers: Record<string, string> = { "Content-Type": "application/json" };
+
+  // jwt_es256: sign a fresh token per request. Currently App Store Connect
+  // is the only known consumer; if we add more we can switch on vendor.
+  if (def.auth_type === "jwt_es256") {
+    if (def.vendor !== "appstoreconnect") {
+      throw new Error(`jwt_es256 not yet wired for vendor: ${def.vendor}`);
+    }
+    const jwt = signAppStoreConnectJwt(creds.key_id, creds.issuer_id, creds.private_key);
+    if (def.auth_header_name) {
+      headers[def.auth_header_name] = `Bearer ${jwt}`;
+    }
+    return headers;
+  }
+
+  // Static auth (api_key / bearer / basic): substitute creds into the template.
   if (def.auth_header_name && def.auth_header_template) {
-    let value = def.auth_header_template;
+    let value: string = def.auth_header_template;
     for (const [k, v] of Object.entries(creds)) {
       value = value.replaceAll(`{{${k}}}`, String(v));
     }
@@ -211,8 +227,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       }
 
       const encrypted = encryptCredentials(creds);
-      const previewSrc = String(creds.key || creds.token || creds.password || "");
-      const preview = previewSrc ? maskCredential(previewSrc) : null;
+      // For static-key vendors, mask the secret. For App Store Connect (jwt_es256),
+      // show the (non-secret) Key ID as the preview — the .p8 isn't useful as a label.
+      const previewSrc = String(
+        creds.key || creds.token || creds.password || creds.key_id || ""
+      );
+      const preview = previewSrc
+        ? (def.auth_type === "jwt_es256" ? `Key ID: ${previewSrc}` : maskCredential(previewSrc))
+        : null;
 
       // Upsert by (company_id, vendor).
       // Persist auth_header_name + auth_header_template into config so the
@@ -254,12 +276,22 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       if (body.config) updates.config = body.config;
       if (body.display_name) updates.display_name = body.display_name;
       if (body.credentials && typeof body.credentials === "object") {
+        // Look up the existing row to preserve auth_type (for preview style)
+        const { data: existing } = await supabase
+          .from("integrations")
+          .select("auth_type")
+          .eq("id", id)
+          .maybeSingle();
         const encrypted = encryptCredentials(body.credentials);
         updates.encrypted_credentials = encrypted;
         const previewSrc = String(
-          body.credentials.key || body.credentials.token || body.credentials.password || ""
+          body.credentials.key || body.credentials.token || body.credentials.password || body.credentials.key_id || ""
         );
-        if (previewSrc) updates.credential_preview = maskCredential(previewSrc);
+        if (previewSrc) {
+          updates.credential_preview = existing?.auth_type === "jwt_es256"
+            ? `Key ID: ${previewSrc}`
+            : maskCredential(previewSrc);
+        }
         // New credentials -> reset status until re-tested
         updates.status = "unverified";
         updates.last_tested_at = null;

@@ -180,7 +180,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const context = await getBusinessContext(supabase, comp.id, comp.name);
 
       const response = await anthropic.messages.create({
-        model: "claude-sonnet-4-20250514",
+        model: "claude-opus-4-7",
         max_tokens: 2048,
         temperature: 0.8,
         system: PLANNER_SYSTEM_PROMPT,

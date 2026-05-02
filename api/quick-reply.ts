@@ -1176,10 +1176,37 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
 
     // ── Tool-use loop ───────────────────────────────────────────────────────
-    // Chat orchestrator uses Sonnet by default — Opus 4.6 was 3x slower with no
-    // material quality difference for chat reasoning + tool routing.
-    // Override per-company by setting agent_definitions.model on the orchestrator row.
-    const model = orchestrator?.model || "claude-sonnet-4-20250514";
+    // Chat orchestrator model strategy (decoupled from agent_definitions.model
+    // so DB changes for runner/agent quality don't drift chat back to Opus on
+    // every keystroke):
+    //
+    //   default        → Sonnet 4.6 (fast, plenty smart for tool routing + admin)
+    //   "/think ..."   → Opus 4.7   (deep reasoning when Sal explicitly asks)
+    //
+    // Specialist agents running as work orders use Opus 4.7 from
+    // agent_definitions.model — the heavy thinking happens THERE, not in the
+    // tight chat loop.
+    const SONNET_DEFAULT = "claude-sonnet-4-6";
+    const OPUS_DEEP = "claude-opus-4-7";
+    const wantsDeep = /^\s*\/think\s+/i.test(message);
+    const model = wantsDeep ? OPUS_DEEP : SONNET_DEFAULT;
+    if (wantsDeep) {
+      // Strip the /think prefix from the user's message that the LLM sees so it
+      // doesn't try to interpret it as a literal command.
+      const stripped = message.replace(/^\s*\/think\s+/i, "").trim();
+      // Replace the message in the messages array we already built
+      const last = messages[messages.length - 1];
+      if (last && last.role === "user") {
+        if (typeof last.content === "string") last.content = stripped;
+        else if (Array.isArray(last.content)) {
+          for (const block of last.content) {
+            if ((block as { type?: string }).type === "text" && (block as { text?: string }).text?.includes("/think")) {
+              (block as { text: string }).text = (block as { text: string }).text.replace(/^\s*\/think\s+/i, "").trim();
+            }
+          }
+        }
+      }
+    }
     let reply = "";
     let toolTurns = 0;
 
@@ -1548,10 +1575,15 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       kind: "reply",
       content: reply,
       timestamp: new Date().toISOString(),
-      metadata: { kind: "reply" },
+      metadata: {
+        kind: "reply",
+        model,
+        deep_think: wantsDeep || undefined,
+        tool_turns: toolTurns,
+      },
     });
 
-    return res.status(200).json({ mode: "direct", tool_turns: toolTurns });
+    return res.status(200).json({ mode: "direct", tool_turns: toolTurns, model });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error("quick-reply error:", msg);

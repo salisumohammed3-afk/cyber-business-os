@@ -791,7 +791,7 @@ async function toolCallIntegration(input) {
       chat:     { model: "gpt-4o", max_tokens: 2048, temperature: 0.7 },
     },
     anthropic: {
-      messages: { model: "claude-sonnet-4-20250514", max_tokens: 2048 },
+      messages: { model: "claude-opus-4-7", max_tokens: 2048 },
     },
   };
   const defaults = VENDOR_PARAM_DEFAULTS[vendor]?.[action] || {};
@@ -2199,9 +2199,12 @@ async function main() {
   const woMins = task.metadata?.work_order?.estimated_minutes;
   // (timeBudgetMs is set later — we'll honor woMins there)
 
-  // 2. Load agent definition (default to orchestrator if none assigned)
+  // 2. Load agent definition (default to orchestrator if none assigned).
+  // Specialist agents run on Opus 4.7 by default — quality > cost for actual work.
+  // DB value (agent_definitions.model) overrides this; this is just the fallback
+  // when an agent has no row.
   let systemPrompt = "";
-  let model = "claude-sonnet-4-20250514";
+  let model = "claude-opus-4-7";
   let temperature = 0.7;
   const DEFAULT_TIME_BUDGET_MS = 5 * 60 * 1000; // 5 minutes
   let timeBudgetMs = DEFAULT_TIME_BUDGET_MS;

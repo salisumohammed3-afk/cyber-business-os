@@ -139,8 +139,12 @@ async function callClaude(model, system, messages, tools, maxTokens = 4096, temp
       "content-type": "application/json",
     };
 
+    // Opus 4.7+ deprecated `temperature` — omit it for those models.
+    // Older models (Sonnet, Opus 4.6 and earlier) still accept + need it.
+    const supportsTemperature = !(model.includes("opus-4-7") || model.includes("opus-4-8"));
     const body = {
-      model, max_tokens: maxTokens, temperature, system, messages,
+      model, max_tokens: maxTokens, system, messages,
+      ...(supportsTemperature ? { temperature } : {}),
       ...(tools.length > 0 ? { tools } : {}),
     };
 

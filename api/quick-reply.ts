@@ -1218,10 +1218,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           "anthropic-version": "2023-06-01",
           "content-type": "application/json",
         },
+        // Opus 4.7 deprecated `temperature` — only set it for older models.
+        // Same pattern will apply to other 4.7+ models when they ship.
         body: JSON.stringify({
           model,
           max_tokens: 1024,
-          temperature: 0.3,
+          ...(model.includes("opus-4-7") || model.includes("opus-4-8") ? {} : { temperature: 0.3 }),
           system: systemPrompt,
           tools: CHAT_TOOLS,
           messages,

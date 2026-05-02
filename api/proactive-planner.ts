@@ -179,10 +179,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
       const context = await getBusinessContext(supabase, comp.id, comp.name);
 
+      // Opus 4.7 deprecated temperature — omit it for that model
       const response = await anthropic.messages.create({
         model: "claude-opus-4-7",
         max_tokens: 2048,
-        temperature: 0.8,
         system: PLANNER_SYSTEM_PROMPT,
         messages: [
           {

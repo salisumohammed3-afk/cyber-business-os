@@ -223,7 +223,7 @@ function downloadMarkdown(filename: string, content: string) {
 
 export default function Outputs() {
   const navigate = useNavigate();
-  const { company } = useCompany();
+  const { company, loading: companyLoading } = useCompany();
   const [search, setSearch] = useState("");
   const [projects, setProjects] = useState<Project[]>([]);
   const [documents, setDocuments] = useState<Document[]>([]);
@@ -306,6 +306,14 @@ export default function Outputs() {
   const filteredDocs = q
     ? documents.filter(d => d.task_title.toLowerCase().includes(q) || d.summary.toLowerCase().includes(q) || d.agent_name.toLowerCase().includes(q))
     : documents;
+
+  if (companyLoading) {
+    return (
+      <div className="flex items-center justify-center h-screen">
+        <p className="text-sm text-muted-foreground">Loading…</p>
+      </div>
+    );
+  }
 
   if (!company) {
     return (

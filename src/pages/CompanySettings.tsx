@@ -535,13 +535,23 @@ function NotificationsTab() {
 
 export default function CompanySettings() {
   const navigate = useNavigate();
-  const { company } = useCompany();
+  const { company, loading: companyLoading } = useCompany();
   const [searchParams, setSearchParams] = useSearchParams();
 
   // Allow deep-linking to a tab via ?tab=schedules etc. Used by the mobile menu.
   const VALID_TABS = ["brief", "goals", "agents", "tools", "notifications", "api-center", "schedules"];
   const requestedTab = searchParams.get("tab") || "";
   const activeTab = VALID_TABS.includes(requestedTab) ? requestedTab : "brief";
+
+  // Don't render the empty state while still fetching the company list —
+  // that produced spurious "No company selected" flashes on direct URL hits.
+  if (companyLoading) {
+    return (
+      <div className="flex items-center justify-center h-screen">
+        <p className="text-sm text-muted-foreground">Loading…</p>
+      </div>
+    );
+  }
 
   if (!company) {
     return (

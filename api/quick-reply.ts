@@ -149,14 +149,21 @@ const ROUTING_ADDENDUM = `
 
 You're Sal's AI colleague. Talk naturally like a smart teammate.
 
-**Default: answer in this message.** You have tools (\`fetch_url\`, \`query_state\`) to help you answer directly. Only propose a work order when the request genuinely needs minutes of agent execution and tools you don't have access to in chat.
+**Default: answer in this message.** You have tools to read state (\`fetch_url\`, \`query_state\`) AND to do trivial admin (\`cancel_tasks\`, \`manage_schedule\`, \`store_memory\`). Only propose a work order when the request genuinely needs minutes of agent execution and tools you don't have access to in chat.
 
 **Answer directly** for:
 - Questions, opinions, ideas, status checks, clarifications, pushback
 - Quick reviews of a URL — use \`fetch_url\` and reply
-- Looking up tasks / memories / goals — use \`query_state\`
+- Looking up tasks / memories / goals / schedules — use \`query_state\`
 - Summaries, recaps, brainstorms — your own knowledge is enough
 - Anything conversational
+
+**Just do it** (no work order, no approval card) for trivial admin Sal asks for in chat:
+- "Clear the list" / "cancel those proposals" / "kill what's running" → \`cancel_tasks\` with the right status filter. If unclear which list, default to status="proposed" (un-approved drafts) and tell him what you cancelled.
+- "Pause the daily briefing" / "stop that schedule" / "delete the morning recap" → \`manage_schedule\` with action=pause/resume/delete and either schedule_id or a name_match substring.
+- "Remember that..." / "note that..." / "we now use X" → \`store_memory\` with the fact in your own words. Pick a sensible category from the enum.
+
+Don't ask for confirmation on these admin actions unless the operation is genuinely destructive and irreversible (e.g. deleting many things at once). For "clear my proposed task list" — just do it and report back the count + titles.
 
 **Propose a work order** when the user clearly wants something done that needs:
 - Building or editing a deployed website / app (engineering)
@@ -255,13 +262,13 @@ const CHAT_TOOLS = [
   },
   {
     name: "query_state",
-    description: "Look up current business state (tasks, memories, or goals) when the user asks about status, history, or what's happening. Returns JSON.",
+    description: "Look up current business state (tasks, memories, goals, or schedules) when the user asks about status, history, or what's happening. Returns JSON.",
     input_schema: {
       type: "object",
       properties: {
         type: {
           type: "string",
-          enum: ["tasks", "memories", "goals"],
+          enum: ["tasks", "memories", "goals", "schedules"],
           description: "What to query",
         },
         status: {
@@ -275,6 +282,76 @@ const CHAT_TOOLS = [
         limit: { type: "number", description: "Max rows, default 10" },
       },
       required: ["type"],
+    },
+  },
+  // ── Admin write tools — bounded, reversible, don't burn money ─────────────
+  // These are for trivial state management Sal asks for in chat ("clear the
+  // list", "pause that schedule", "remember X"). They affect ONLY this
+  // company's own state — never external services. Use them freely; you don't
+  // need a work-order proposal for any of these.
+  {
+    name: "cancel_tasks",
+    description:
+      "Cancel tasks. Use when Sal says 'clear the list', 'cancel those proposals', 'kill what's running', etc. " +
+      "REQUIRES either status (filters by status) or task_ids (specific tasks). Hard cap of 50 per call. " +
+      "Reports back how many were cancelled.",
+    input_schema: {
+      type: "object",
+      properties: {
+        status: {
+          type: "string",
+          enum: ["proposed", "pending", "running", "failed"],
+          description: "Cancel all tasks in this status (most common: 'proposed' to clear un-approved drafts)",
+        },
+        task_ids: {
+          type: "array",
+          items: { type: "string" },
+          description: "Cancel specific tasks by id. Overrides status filter.",
+        },
+        max: {
+          type: "number",
+          description: "Safety cap on number to cancel. Default 50, max 50.",
+        },
+      },
+    },
+  },
+  {
+    name: "manage_schedule",
+    description:
+      "Pause, resume, or delete a recurring schedule. Use when Sal says 'pause the daily briefing', " +
+      "'stop that schedule', 'delete the morning recap', etc. Match by schedule_id (preferred) or " +
+      "name_match (case-insensitive substring of the schedule's name).",
+    input_schema: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["pause", "resume", "delete"] },
+        schedule_id: { type: "string" },
+        name_match: { type: "string", description: "Substring of the schedule's name (case-insensitive)" },
+      },
+      required: ["action"],
+    },
+  },
+  {
+    name: "store_memory",
+    description:
+      "Save a fact for future reference. Use when Sal says 'remember that...', 'note that...', 'we now use X', " +
+      "or any time he tells you a durable piece of context. Categories help organisation: " +
+      "business_context | user_preference | market_intel | decision | contact | metric | technical_finding | process_learning.",
+    input_schema: {
+      type: "object",
+      properties: {
+        content: { type: "string", description: "The fact to remember, in your own words" },
+        category: {
+          type: "string",
+          enum: [
+            "business_context", "user_preference", "market_intel", "decision",
+            "contact", "metric", "technical_finding", "process_learning",
+          ],
+          description: "Default 'business_context' if unsure",
+        },
+        importance: { type: "number", description: "1-10, default 5" },
+      },
+      required: ["content"],
     },
   },
 ];
@@ -364,11 +441,164 @@ async function runQueryState(
       if (error) return JSON.stringify({ error: error.message });
       return JSON.stringify({ goals: data || [] });
     }
+    if (type === "schedules") {
+      const { data, error } = await supabase
+        .from("scheduled_tasks")
+        .select("id,name,cadence_type,cadence_spec,is_active,next_run_at,last_run_at,total_fires,total_failures")
+        .eq("company_id", companyId)
+        .order("created_at", { ascending: false })
+        .limit(limit);
+      if (error) return JSON.stringify({ error: error.message });
+      return JSON.stringify({ schedules: data || [] });
+    }
     return JSON.stringify({ error: `Unknown type: ${type}` });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     return JSON.stringify({ error: msg });
   }
+}
+
+// ── Admin write tools ──────────────────────────────────────────────────────
+
+async function runCancelTasks(
+  supabase: SupabaseClient,
+  companyId: string,
+  input: Record<string, unknown>
+): Promise<string> {
+  const status = typeof input.status === "string" ? input.status : null;
+  const taskIds = Array.isArray(input.task_ids) ? (input.task_ids as string[]).filter(s => typeof s === "string") : null;
+  const cap = Math.min(Number(input.max) || 50, 50);
+
+  if (!status && (!taskIds || taskIds.length === 0)) {
+    return JSON.stringify({
+      error: "Provide either status (e.g. 'proposed') or task_ids — refusing to cancel without a filter.",
+    });
+  }
+
+  const validStatuses = ["proposed", "pending", "running", "failed"];
+  if (status && !validStatuses.includes(status)) {
+    return JSON.stringify({ error: `status must be one of: ${validStatuses.join(", ")}` });
+  }
+
+  // Find the rows we'd cancel (so we can report titles)
+  let q = supabase
+    .from("tasks")
+    .select("id, title, status")
+    .eq("company_id", companyId)
+    .limit(cap);
+  if (taskIds && taskIds.length > 0) q = q.in("id", taskIds);
+  else if (status) q = q.eq("status", status);
+
+  const { data: targets, error: selErr } = await q;
+  if (selErr) return JSON.stringify({ error: selErr.message });
+  if (!targets?.length) return JSON.stringify({ cancelled: 0, message: "Nothing to cancel" });
+
+  const ids = targets.map((t: { id: string }) => t.id);
+  const nowIso = new Date().toISOString();
+  const { error: updErr } = await supabase
+    .from("tasks")
+    .update({
+      status: "cancelled",
+      completed_at: nowIso,
+      error_message: "Cancelled by orchestrator at user request",
+    })
+    .in("id", ids);
+  if (updErr) return JSON.stringify({ error: updErr.message });
+
+  // Log so the chat-mode action shows up in terminal_logs for traceability
+  const logs = targets.slice(0, cap).map((t: { id: string; status: string }) => ({
+    task_id: t.id,
+    message: `Task cancelled by orchestrator chat command (was ${t.status})`,
+    source: "orchestrator-chat",
+    log_type: "task_cancelled",
+    company_id: companyId,
+  }));
+  if (logs.length) await supabase.from("terminal_logs").insert(logs).then(() => {}, () => {});
+
+  return JSON.stringify({
+    cancelled: targets.length,
+    titles: targets.map((t: { title: string }) => t.title).slice(0, 10),
+  });
+}
+
+async function runManageSchedule(
+  supabase: SupabaseClient,
+  companyId: string,
+  input: Record<string, unknown>
+): Promise<string> {
+  const action = String(input.action || "");
+  if (!["pause", "resume", "delete"].includes(action)) {
+    return JSON.stringify({ error: "action must be pause | resume | delete" });
+  }
+  const id = typeof input.schedule_id === "string" ? input.schedule_id : null;
+  const nameMatch = typeof input.name_match === "string" ? input.name_match : null;
+
+  if (!id && !nameMatch) {
+    return JSON.stringify({ error: "Provide schedule_id or name_match" });
+  }
+
+  // Find target schedule(s)
+  let q = supabase
+    .from("scheduled_tasks")
+    .select("id, name, is_active")
+    .eq("company_id", companyId);
+  if (id) q = q.eq("id", id);
+  else if (nameMatch) q = q.ilike("name", `%${nameMatch}%`);
+
+  const { data: rows, error: selErr } = await q;
+  if (selErr) return JSON.stringify({ error: selErr.message });
+  if (!rows?.length) return JSON.stringify({ error: "No schedule matched" });
+  if (rows.length > 1) {
+    return JSON.stringify({
+      error: `${rows.length} schedules matched "${nameMatch}". Be more specific or pass schedule_id.`,
+      candidates: rows.map((r: { id: string; name: string }) => ({ id: r.id, name: r.name })),
+    });
+  }
+
+  const target = rows[0];
+  if (action === "delete") {
+    const { error } = await supabase.from("scheduled_tasks").delete().eq("id", target.id);
+    if (error) return JSON.stringify({ error: error.message });
+    return JSON.stringify({ ok: true, action, schedule: target.name });
+  }
+  const { error } = await supabase
+    .from("scheduled_tasks")
+    .update({ is_active: action === "resume" })
+    .eq("id", target.id);
+  if (error) return JSON.stringify({ error: error.message });
+  return JSON.stringify({ ok: true, action, schedule: target.name });
+}
+
+async function runStoreMemory(
+  supabase: SupabaseClient,
+  companyId: string,
+  input: Record<string, unknown>
+): Promise<string> {
+  const content = typeof input.content === "string" ? input.content.trim() : "";
+  if (!content) return JSON.stringify({ error: "content is required" });
+  if (content.length < 3) return JSON.stringify({ error: "content too short" });
+
+  const validCats = [
+    "business_context", "user_preference", "market_intel", "decision",
+    "contact", "metric", "technical_finding", "process_learning",
+  ];
+  const category = validCats.includes(String(input.category)) ? String(input.category) : "business_context";
+  const importance = Math.min(Math.max(Number(input.importance) || 5, 1), 10);
+
+  const { data, error } = await supabase
+    .from("memories")
+    .insert({
+      company_id: companyId,
+      content: content.slice(0, 2000),
+      category,
+      importance,
+      user_id: "00000000-0000-0000-0000-000000000000",
+      metadata: { source: "orchestrator_chat" },
+    })
+    .select("id")
+    .single();
+  if (error) return JSON.stringify({ error: error.message });
+  return JSON.stringify({ ok: true, memory_id: data?.id, category, importance });
 }
 
 async function runChatTool(
@@ -379,6 +609,9 @@ async function runChatTool(
 ): Promise<string> {
   if (name === "fetch_url") return runFetchUrl(input);
   if (name === "query_state") return runQueryState(supabase, companyId, input);
+  if (name === "cancel_tasks") return runCancelTasks(supabase, companyId, input);
+  if (name === "manage_schedule") return runManageSchedule(supabase, companyId, input);
+  if (name === "store_memory") return runStoreMemory(supabase, companyId, input);
   return JSON.stringify({ error: `Unknown tool: ${name}` });
 }
 

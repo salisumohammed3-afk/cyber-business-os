@@ -11,19 +11,24 @@ import {
   User,
   Globe,
   Pencil,
+  MessageSquare,
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { useProjectChat } from "@/hooks/useProjectChat";
+import { useIsMobile } from "@/hooks/use-mobile";
 import ReactMarkdown from "react-markdown";
 
 export default function ProjectEditor() {
   const { projectId } = useParams<{ projectId: string }>();
   const navigate = useNavigate();
+  const isMobile = useIsMobile();
   const { project, messages, activeTask, loading, sending, sendFeedback } =
     useProjectChat(projectId);
 
   const [input, setInput] = useState("");
   const [iframeKey, setIframeKey] = useState(0);
+  // On mobile, tab between feedback and preview. Default to feedback (input).
+  const [mobileTab, setMobileTab] = useState<"feedback" | "preview">("feedback");
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const prevTaskRef = useRef<string | null>(null);
 
@@ -121,10 +126,42 @@ export default function ProjectEditor() {
         )}
       </div>
 
-      {/* Split pane */}
+      {/* Mobile-only tab strip: feedback | preview */}
+      {isMobile && (
+        <div className="flex border-b shrink-0">
+          <button
+            onClick={() => setMobileTab("feedback")}
+            className={`flex-1 flex items-center justify-center gap-1.5 py-2 text-sm font-medium border-b-2 transition-colors ${
+              mobileTab === "feedback"
+                ? "border-foreground text-foreground"
+                : "border-transparent text-muted-foreground"
+            }`}
+          >
+            <MessageSquare size={14} />
+            Feedback
+          </button>
+          <button
+            onClick={() => setMobileTab("preview")}
+            className={`flex-1 flex items-center justify-center gap-1.5 py-2 text-sm font-medium border-b-2 transition-colors ${
+              mobileTab === "preview"
+                ? "border-foreground text-foreground"
+                : "border-transparent text-muted-foreground"
+            }`}
+          >
+            <Globe size={14} />
+            Preview
+          </button>
+        </div>
+      )}
+
+      {/* Split pane (desktop) or single pane (mobile) */}
       <div className="flex-1 flex overflow-hidden">
-        {/* Left: Chat panel */}
-        <div className="w-[38%] min-w-[320px] max-w-[500px] border-r flex flex-col">
+        {/* Left: Chat panel — full width on mobile, 38% on desktop */}
+        <div className={`${
+          isMobile
+            ? mobileTab === "feedback" ? "w-full flex" : "hidden"
+            : "w-[38%] min-w-[320px] max-w-[500px] flex border-r"
+        } flex-col`}>
           {/* Chat header */}
           <div className="px-4 py-2.5 border-b flex items-center gap-2">
             <Bot size={13} className="text-violet-400" />
@@ -211,8 +248,10 @@ export default function ProjectEditor() {
           </div>
         </div>
 
-        {/* Right: Preview panel */}
-        <div className="flex-1 flex flex-col bg-secondary/30">
+        {/* Right: Preview panel — hidden on mobile when feedback tab active */}
+        <div className={`${
+          isMobile && mobileTab !== "preview" ? "hidden" : "flex-1 flex"
+        } flex-col bg-secondary/30`}>
           {/* Preview header */}
           <div className="px-4 py-2 border-b flex items-center gap-2 bg-background">
             <Globe size={13} className="text-blue-500" />

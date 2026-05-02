@@ -34,10 +34,13 @@ export interface VendorAction {
   description: string;
   method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
   path: string;                          // appended to base_url. May contain {{var}} placeholders.
-  body_template?: Record<string, unknown>; // JSON template; {{var}} substitution from input
+  body_template?: Record<string, unknown>; // JSON template; {{var}} substitution from input.
+  // Substitution rules (handled in runner):
+  //   - If a string value is exactly "{{var}}", replace with raw params.var (preserves type).
+  //   - Otherwise do plain string substitution within the value.
   input_schema: {
     type: "object";
-    properties: Record<string, { type: string; description?: string; enum?: string[] }>;
+    properties: Record<string, { type: string; description?: string; enum?: string[]; items?: unknown }>;
     required?: string[];
   };
 }
@@ -100,7 +103,7 @@ export const VENDOR_REGISTRY: VendorDef[] = [
     actions: [
       {
         name: "chat",
-        description: "Send a chat completion request to OpenAI. Returns the assistant's response text.",
+        description: "Send a chat completion request to OpenAI. Returns the model's response.",
         method: "POST",
         path: "/chat/completions",
         body_template: {
@@ -112,10 +115,14 @@ export const VENDOR_REGISTRY: VendorDef[] = [
         input_schema: {
           type: "object",
           properties: {
-            model: { type: "string", description: "e.g. gpt-4o, gpt-4-turbo" },
-            messages: { type: "string", description: "JSON array of {role, content} objects" },
-            max_tokens: { type: "string", description: "Max output tokens (e.g. 2048)" },
-            temperature: { type: "string", description: "0.0 - 2.0" },
+            model: { type: "string", description: "e.g. gpt-4o, gpt-4-turbo, o1-preview" },
+            messages: {
+              type: "array",
+              description: "Array of {role, content} objects. Roles: system, user, assistant.",
+              items: { type: "object" },
+            },
+            max_tokens: { type: "number", description: "Max output tokens (e.g. 2048)" },
+            temperature: { type: "number", description: "0.0 - 2.0" },
           },
           required: ["model", "messages"],
         },
@@ -166,9 +173,13 @@ export const VENDOR_REGISTRY: VendorDef[] = [
         input_schema: {
           type: "object",
           properties: {
-            model: { type: "string" },
-            messages: { type: "string", description: "JSON array of {role, content}" },
-            max_tokens: { type: "string", description: "default 1024" },
+            model: { type: "string", description: "e.g. claude-sonnet-4-20250514" },
+            messages: {
+              type: "array",
+              description: "Array of {role, content} objects.",
+              items: { type: "object" },
+            },
+            max_tokens: { type: "number", description: "Default 1024" },
           },
           required: ["model", "messages"],
         },
@@ -214,7 +225,7 @@ export const VENDOR_REGISTRY: VendorDef[] = [
           properties: {
             name: { type: "string", description: "Repo name (lowercase, hyphens)" },
             description: { type: "string" },
-            private: { type: "string", description: "true or false (default false)" },
+            private: { type: "boolean", description: "true to create private (default false)" },
           },
           required: ["name"],
         },
@@ -307,7 +318,7 @@ export const VENDOR_REGISTRY: VendorDef[] = [
           type: "object",
           properties: {
             q: { type: "string", description: "Search query" },
-            num: { type: "string", description: "Number of results (default 10)" },
+            num: { type: "number", description: "Number of results (default 10)" },
           },
           required: ["q"],
         },
@@ -347,7 +358,7 @@ export const VENDOR_REGISTRY: VendorDef[] = [
           type: "object",
           properties: {
             query: { type: "string" },
-            numResults: { type: "string", description: "default 10" },
+            numResults: { type: "number", description: "Default 10" },
           },
           required: ["query"],
         },

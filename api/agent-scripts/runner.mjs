@@ -398,6 +398,22 @@ const BASE_TOOLS = [
       required: ["reason", "tools_tried"],
     },
   },
+  {
+    name: "call_integration",
+    description:
+      "Call an external service connected via the API Center (OpenAI, GitHub, Resend, etc.). " +
+      "Available vendors and their actions are listed in the 'Available Integrations' block of your system prompt. " +
+      "Pick exactly one vendor + one action; pass the action's required params.",
+    input_schema: {
+      type: "object",
+      properties: {
+        vendor: { type: "string", description: "Vendor slug, e.g. 'openai', 'github', 'resend'" },
+        action: { type: "string", description: "Action name within the vendor, e.g. 'chat', 'send', 'search'" },
+        params: { type: "object", description: "Action-specific parameters (see Available Integrations for the schema)" },
+      },
+      required: ["vendor", "action", "params"],
+    },
+  },
 ];
 
 const ENGINEERING_TOOLS = [
@@ -616,6 +632,7 @@ async function executeTool(name, input) {
       case "deploy_static_site": return await toolDeployStaticSite(input);
       case "test_url":           return await toolTestUrl(input);
       case "fail_task":          return JSON.stringify({ acknowledged: true, reason: input.reason });
+      case "call_integration":   return await toolCallIntegration(input);
       default:                   return JSON.stringify({ error: "Unknown tool: " + name });
     }
   } catch (e) {
@@ -655,6 +672,186 @@ async function toolTestUrl(input) {
     return JSON.stringify({ error: "Failed to reach " + url + ": " + (e.message || "timeout") });
   }
 }
+
+// ── call_integration: dispatch to user-connected APIs (API Center) ──────────
+//
+// Reads from the integrations table (loaded once per task into _activeIntegrations).
+// Decrypts credentials, substitutes {{var}} into the action's body_template,
+// builds auth headers from the row's persisted config, fires the request.
+// Self-healing: on 401/403, marks the integration as 'broken' so the user is
+// alerted (Phase 4 surfaces this in chat).
+
+import { createDecipheriv as _createDecipheriv } from "node:crypto";
+
+function decryptIntegrationBlob(blob) {
+  if (!blob || blob.v !== 1) throw new Error("Unsupported encrypted blob version");
+  const rawKey = process.env.INTEGRATIONS_ENCRYPTION_KEY;
+  if (!rawKey) throw new Error("INTEGRATIONS_ENCRYPTION_KEY not set in runner env");
+  const key = Buffer.from(rawKey, "base64");
+  if (key.length !== 32) throw new Error("INTEGRATIONS_ENCRYPTION_KEY must decode to 32 bytes");
+  const iv = Buffer.from(blob.iv, "base64");
+  const tag = Buffer.from(blob.tag, "base64");
+  const ct = Buffer.from(blob.ciphertext, "base64");
+  const dec = _createDecipheriv("aes-256-gcm", key, iv);
+  dec.setAuthTag(tag);
+  const pt = Buffer.concat([dec.update(ct), dec.final()]).toString("utf8");
+  return JSON.parse(pt);
+}
+
+// Recursively substitute {{var}} placeholders in a template using params.
+// If the entire string is "{{var}}", returns params.var with original type
+// (so arrays stay arrays, numbers stay numbers). Otherwise does string replace.
+function substituteTemplate(template, params) {
+  if (typeof template === "string") {
+    const m = template.match(/^\{\{(\w+)\}\}$/);
+    if (m) return params[m[1]];
+    return template.replace(/\{\{(\w+)\}\}/g, (_, k) => String(params[k] ?? ""));
+  }
+  if (Array.isArray(template)) return template.map(v => substituteTemplate(v, params));
+  if (template && typeof template === "object") {
+    const out = {};
+    for (const [k, v] of Object.entries(template)) out[k] = substituteTemplate(v, params);
+    return out;
+  }
+  return template;
+}
+
+// Cache of active integrations for this task's company. Loaded once at task
+// start (in main()) and read by toolCallIntegration.
+let _activeIntegrations = [];
+
+async function loadActiveIntegrations(forCompanyId) {
+  if (!forCompanyId) return [];
+  const params = new URLSearchParams({
+    select: "id,vendor,display_name,auth_type,encrypted_credentials,config,actions,status",
+    company_id: "eq." + forCompanyId,
+    status: "in.(active,unverified)",  // try unverified too — first call will reveal if it works
+  });
+  const r = await fetch(SUPABASE_URL + "/rest/v1/integrations?" + params, { headers: SB_HEADERS });
+  if (!r.ok) return [];
+  return await r.json();
+}
+
+async function markIntegrationBroken(integrationId, message) {
+  await sbPatch("integrations", {
+    status: "broken",
+    last_tested_at: new Date().toISOString(),
+    last_test_error: message,
+  }, { id: "eq." + integrationId });
+}
+
+async function toolCallIntegration(input) {
+  const vendor = String(input.vendor || "").toLowerCase();
+  const action = String(input.action || "");
+  const params = (input.params && typeof input.params === "object") ? input.params : {};
+
+  if (!vendor || !action) {
+    return JSON.stringify({ error: "vendor and action are required" });
+  }
+
+  // Re-check the work-order vendor allowlist (defence in depth — the runner
+  // also filters tools by work order, but the LLM might still try).
+  if (_workOrderVendorAllow && !_workOrderVendorAllow.has(vendor)) {
+    return JSON.stringify({
+      error: `vendor '${vendor}' is not allowed for this work order. Allowed: ${[..._workOrderVendorAllow].join(", ") || "(none)"}`,
+    });
+  }
+
+  const row = _activeIntegrations.find(i => i.vendor === vendor);
+  if (!row) {
+    return JSON.stringify({
+      error: `Integration '${vendor}' is not connected for this company. Ask Sal to add it via the API Center.`,
+    });
+  }
+
+  const actionDef = (row.actions || []).find(a => a.name === action);
+  if (!actionDef) {
+    const available = (row.actions || []).map(a => a.name).join(", ");
+    return JSON.stringify({
+      error: `Action '${action}' not found for vendor '${vendor}'. Available: ${available}`,
+    });
+  }
+
+  // Decrypt credentials and build headers
+  let creds;
+  try {
+    creds = row.encrypted_credentials ? decryptIntegrationBlob(row.encrypted_credentials) : {};
+  } catch (e) {
+    return JSON.stringify({ error: "Could not decrypt credentials: " + (e.message || e) });
+  }
+
+  const cfg = row.config || {};
+  const baseUrl = String(cfg.base_url || "").replace(/\/$/, "");
+  const path = substituteTemplate(actionDef.path, params);
+  const url = baseUrl + path;
+
+  const headers = { "Content-Type": "application/json" };
+  if (cfg.auth_header_name && cfg.auth_header_template) {
+    let authValue = String(cfg.auth_header_template);
+    for (const [k, v] of Object.entries(creds)) {
+      authValue = authValue.replaceAll("{{" + k + "}}", String(v));
+    }
+    headers[cfg.auth_header_name] = authValue;
+  }
+
+  // Build body
+  let body;
+  if (actionDef.method !== "GET" && actionDef.body_template) {
+    const filled = substituteTemplate(actionDef.body_template, params);
+    body = JSON.stringify(filled);
+  } else if (actionDef.method !== "GET") {
+    body = JSON.stringify(params);
+  }
+
+  await log(
+    "Calling integration: " + vendor + "." + action + " " + actionDef.method + " " + url,
+    "integration_call"
+  );
+
+  let r;
+  try {
+    r = await fetch(url, {
+      method: actionDef.method,
+      headers,
+      body,
+      signal: AbortSignal.timeout(45_000),
+    });
+  } catch (e) {
+    return JSON.stringify({ error: "Network error calling " + vendor + ": " + (e.message || e) });
+  }
+
+  // Self-healing: if auth failed, mark broken so the user is told
+  if (r.status === 401 || r.status === 403) {
+    const errText = await r.text().catch(() => "");
+    await markIntegrationBroken(row.id, "Auth failed (" + r.status + ") on " + action);
+    return JSON.stringify({
+      error: `Authentication failed (${r.status}) calling ${vendor}.${action}. The integration has been marked broken — Sal needs to update the credentials in the API Center. Detail: ${errText.slice(0, 200)}`,
+    });
+  }
+
+  const respText = await r.text();
+  let respJson = null;
+  try { respJson = JSON.parse(respText); } catch { respJson = null; }
+
+  if (!r.ok) {
+    return JSON.stringify({
+      error: `${vendor}.${action} returned ${r.status}: ${respText.slice(0, 500)}`,
+      status: r.status,
+    });
+  }
+
+  // Truncate large responses so we don't blow the agent's context
+  const responseSummary = respJson ?? respText.slice(0, 8000);
+  return JSON.stringify({
+    success: true,
+    status: r.status,
+    response: responseSummary,
+  });
+}
+
+// Per-work-order vendor allowlist for call_integration (defence in depth on
+// top of the tool-name allowlist). Set by main() based on task.metadata.work_order.type.
+let _workOrderVendorAllow = null;
 
 async function toolWebSearch(input) {
   if (!SERPER_KEY) return JSON.stringify({ error: "Web search not configured (SERPER_API_KEY missing)" });
@@ -2167,24 +2364,32 @@ async function main() {
   // If this task carries a work_order, restrict tools to the type's allowlist.
   // This is the critical constraint: a build_static_site work order CANNOT
   // randomly call Apollo or send emails. Engineering can't pick from 22 tools.
-  // Stage 3 moves this registry to its own file with cost/time caps too.
+  // Two layers:
+  //   - Tool-name allowlist (which built-in tools)
+  //   - Vendor allowlist (which API Center integrations call_integration may dispatch to)
   const WORK_ORDER_TOOL_ALLOWLIST = {
-    research: new Set(["web_search", "test_url", "store_memory", "recall_memories", "fail_task", "fetch_url"]),
+    research: new Set([
+      "web_search", "test_url", "store_memory", "recall_memories", "fail_task", "fetch_url",
+      "call_integration",
+    ]),
     build_static_site: new Set([
       "test_url", "store_memory", "recall_memories", "fail_task",
       "github_create_repo", "github_push_file",
       "sandbox_bash", "sandbox_read_file", "sandbox_write_file", "sandbox_list_files",
       "deploy_static_site", "register_project",
+      "call_integration",
     ]),
     edit_project: new Set([
       "test_url", "store_memory", "recall_memories", "fail_task",
       "github_push_file",
       "sandbox_bash", "sandbox_read_file", "sandbox_write_file", "sandbox_list_files",
       "deploy_static_site", "project_query",
+      "call_integration",
     ]),
     send_outreach: new Set([
       "test_url", "store_memory", "recall_memories", "fail_task",
       "composio_find_actions", "composio_execute",
+      "call_integration",
     ]),
     design_mockup: new Set([
       "test_url", "store_memory", "recall_memories", "fail_task",
@@ -2192,11 +2397,24 @@ async function main() {
       "sandbox_write_file", "sandbox_read_file",
       "github_create_repo", "github_push_file",
       "deploy_static_site",
+      "call_integration",
     ]),
     meeting_admin: new Set([
       "test_url", "store_memory", "recall_memories", "fail_task",
       "composio_find_actions", "composio_execute",
+      "call_integration",
     ]),
+  };
+
+  // Vendor allowlist per work-order type. call_integration enforces this at
+  // execution time too, but limiting in the prompt helps the model not even try.
+  const WORK_ORDER_VENDOR_ALLOWLIST = {
+    research: new Set(["openai", "anthropic", "exa", "serper"]),
+    build_static_site: new Set(["github", "openai", "anthropic"]),
+    edit_project: new Set(["github", "openai", "anthropic"]),
+    send_outreach: new Set(["resend", "openai", "anthropic"]),
+    design_mockup: new Set(["openai", "anthropic"]),
+    meeting_admin: new Set(["openai", "anthropic"]),
   };
 
   const workOrder = task.metadata?.work_order;
@@ -2204,11 +2422,52 @@ async function main() {
     const allow = WORK_ORDER_TOOL_ALLOWLIST[workOrder.type];
     const before = tools.length;
     tools = tools.filter(t => allow.has(t.name));
+    _workOrderVendorAllow = WORK_ORDER_VENDOR_ALLOWLIST[workOrder.type] || new Set();
     await log(
       "Work order '" + workOrder.type + "' locked tools: " + before + " -> " + tools.length +
-      " (" + tools.map(t => t.name).join(", ") + ")",
+      " (" + tools.map(t => t.name).join(", ") + ") | integration vendors allowed: " +
+      [..._workOrderVendorAllow].join(", "),
       "work_order_tools_locked"
     );
+  }
+
+  // 6c. Load API Center integrations for this company. Filter by the
+  // work-order's vendor allowlist so the agent only sees what it can use.
+  if (companyId) {
+    const allRows = await loadActiveIntegrations(companyId);
+    if (workOrder?.type && _workOrderVendorAllow) {
+      _activeIntegrations = allRows.filter(i => _workOrderVendorAllow.has(i.vendor));
+    } else {
+      _activeIntegrations = allRows;
+    }
+    if (_activeIntegrations.length > 0) {
+      await log(
+        "Loaded " + _activeIntegrations.length + " active integration(s): " +
+        _activeIntegrations.map(i => i.vendor).join(", "),
+        "integrations_loaded"
+      );
+      // Inject the integration catalog into the system prompt so the agent
+      // knows what call_integration() can dispatch to and with what params.
+      let intBlock = "\n\n## Available Integrations\n" +
+        "Use `call_integration({ vendor, action, params })` to invoke these. " +
+        "Pass params matching the action's input_schema below — strings as strings, arrays as arrays.\n";
+      for (const i of _activeIntegrations) {
+        intBlock += "\n### " + (i.display_name || i.vendor) + "  (vendor: `" + i.vendor + "`)\n";
+        for (const a of (i.actions || [])) {
+          intBlock += "- **" + a.name + "** — " + a.description + "\n";
+          intBlock += "  - method: `" + a.method + "`, path: `" + a.path + "`\n";
+          const props = a.input_schema?.properties || {};
+          const required = a.input_schema?.required || [];
+          intBlock += "  - params: ";
+          intBlock += Object.entries(props).map(([pname, pspec]) => {
+            const star = required.includes(pname) ? "*" : "";
+            return "`" + pname + star + ": " + pspec.type + "`";
+          }).join(", ") + "\n";
+        }
+      }
+      intBlock += "\n*denotes required. If a vendor or action you need isn't here, ask Sal to connect it via the API Center.*";
+      systemBlocks.push({ type: "text", text: intBlock });
+    }
   }
 
   // 7. Build conversation

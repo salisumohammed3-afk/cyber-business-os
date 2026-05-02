@@ -214,7 +214,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const previewSrc = String(creds.key || creds.token || creds.password || "");
       const preview = previewSrc ? maskCredential(previewSrc) : null;
 
-      // Upsert by (company_id, vendor)
+      // Upsert by (company_id, vendor).
+      // Persist auth_header_name + auth_header_template into config so the
+      // runner can build outbound request headers without re-reading the
+      // TypeScript vendor registry. This makes integration rows self-describing.
       const upsertRow = {
         company_id,
         vendor,
@@ -223,7 +226,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         auth_type: def.auth_type,
         encrypted_credentials: encrypted,
         credential_preview: preview,
-        config: { base_url: def.base_url, ...(config || {}) },
+        config: {
+          base_url: def.base_url,
+          auth_header_name: def.auth_header_name,
+          auth_header_template: def.auth_header_template,
+          ...(config || {}),
+        },
         actions: def.actions,
         status: "unverified" as const,
       };

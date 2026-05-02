@@ -135,37 +135,50 @@ const TopBar = () => {
           </span>
         </div>
 
-        {/* Right side: hamburger on mobile, inline buttons on desktop */}
-        <div className="ml-auto flex items-center gap-2 sm:gap-3">
+        {/* Right side: pinned icons + hamburger on mobile, inline buttons on desktop */}
+        <div className="ml-auto flex items-center gap-1 sm:gap-3">
           {isMobile ? (
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild>
-                <button
-                  className="flex items-center gap-1 px-2 py-1.5 rounded-sm border border-border text-xs font-medium text-foreground hover:bg-secondary transition-colors"
-                  aria-label="Menu"
-                >
-                  <Menu size={16} />
-                </button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="end" className="w-52">
-                <DropdownMenuItem onClick={() => navigate("/agents")}>
-                  <Bot size={14} className="mr-2" /> Agents
-                </DropdownMenuItem>
-                <DropdownMenuItem onClick={() => navigate("/outputs")}>
-                  <FolderOpen size={14} className="mr-2" /> Outputs
-                </DropdownMenuItem>
-                <DropdownMenuSeparator />
-                <DropdownMenuItem onClick={() => navigate("/company-settings")}>
-                  <Settings size={14} className="mr-2" /> Settings
-                </DropdownMenuItem>
-                <DropdownMenuItem onClick={() => navigate("/company-settings?tab=schedules")}>
-                  <CalendarClock size={14} className="mr-2" /> Schedules
-                </DropdownMenuItem>
-                <DropdownMenuItem onClick={() => navigate("/company-settings?tab=api-center")}>
-                  <Plug size={14} className="mr-2" /> API Center
-                </DropdownMenuItem>
-              </DropdownMenuContent>
-            </DropdownMenu>
+            <>
+              {/* Pinned: Outputs + Agents (most-frequent destinations get one tap) */}
+              <button
+                onClick={() => navigate("/outputs")}
+                className="p-2 rounded-sm hover:bg-secondary transition-colors"
+                aria-label="Outputs"
+                title="Outputs"
+              >
+                <FolderOpen size={16} className="text-muted-foreground" />
+              </button>
+              <button
+                onClick={() => navigate("/agents")}
+                className="p-2 rounded-sm hover:bg-secondary transition-colors"
+                aria-label="Agents"
+                title="Agents"
+              >
+                <Bot size={16} className="text-muted-foreground" />
+              </button>
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <button
+                    className="p-2 rounded-sm hover:bg-secondary transition-colors"
+                    aria-label="Menu"
+                    title="Settings, Schedules, API Center"
+                  >
+                    <Menu size={16} className="text-muted-foreground" />
+                  </button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end" className="w-52">
+                  <DropdownMenuItem onClick={() => navigate("/company-settings")}>
+                    <Settings size={14} className="mr-2" /> Settings
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => navigate("/company-settings?tab=schedules")}>
+                    <CalendarClock size={14} className="mr-2" /> Schedules
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => navigate("/company-settings?tab=api-center")}>
+                    <Plug size={14} className="mr-2" /> API Center
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+            </>
           ) : (
             <>
               <button

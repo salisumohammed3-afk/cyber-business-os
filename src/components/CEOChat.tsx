@@ -291,6 +291,36 @@ export function CEOChat() {
               )
             }
 
+            // Render kind=error messages as a clear, actionable error card with the
+            // real diagnostic visible. Replaces the old "Something went wrong" pattern.
+            if (meta?.kind === 'error' || meta?.error === true) {
+              const source = (meta?.source as string) || 'system'
+              const original = (meta?.original_error as string) || ''
+              return (
+                <div key={msg.id} className="flex justify-start">
+                  <div className="rounded-md border border-red-300 bg-red-50 px-3 py-2 max-w-[90%] text-sm text-red-800">
+                    <div className="flex items-center gap-1.5 font-semibold">
+                      <X size={14} />
+                      <span>Error from {source}</span>
+                    </div>
+                    <div className="mt-1 whitespace-pre-wrap font-mono text-xs">
+                      {msg.content}
+                    </div>
+                    {original && original !== msg.content && (
+                      <details className="mt-1.5">
+                        <summary className="cursor-pointer text-xs opacity-70 hover:opacity-100">
+                          Full diagnostic
+                        </summary>
+                        <pre className="mt-1 text-xs whitespace-pre-wrap bg-red-100 p-2 rounded">
+                          {original}
+                        </pre>
+                      </details>
+                    )}
+                  </div>
+                </div>
+              )
+            }
+
             // Render notification messages as compact cards
             if (meta?.notification === true && meta?.event_type) {
               const eventIcon = meta.event_type === 'task_completed' ? '\u2705'

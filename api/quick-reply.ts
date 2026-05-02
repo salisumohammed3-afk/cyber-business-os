@@ -405,9 +405,15 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
       if (!anthropicRes.ok) {
         const errBody = await anthropicRes.text().catch(() => "");
-        return res.status(502).json({
-          error: `Anthropic ${anthropicRes.status}: ${errBody.slice(0, 300)}`,
-        });
+        const errMsg = `Anthropic ${anthropicRes.status}: ${errBody.slice(0, 300)}`;
+        await supabase.from("chat_messages").insert({
+          conversation_id,
+          role: "system",
+          content: `Chat error: ${errMsg.slice(0, 500)}`,
+          timestamp: new Date().toISOString(),
+          metadata: { kind: "error", source: "anthropic", original_error: errMsg },
+        }).then(() => {}, () => {});
+        return res.status(502).json({ error: errMsg });
       }
 
       const anthropicData = await anthropicRes.json();
@@ -510,6 +516,19 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error("quick-reply error:", msg);
+    // Persist the actual error in the conversation so the user sees what failed,
+    // not "Something went wrong." The UI renders kind=error distinctly.
+    try {
+      await supabase.from("chat_messages").insert({
+        conversation_id,
+        role: "system",
+        content: `Chat error: ${msg.slice(0, 500)}`,
+        timestamp: new Date().toISOString(),
+        metadata: { kind: "error", source: "quick-reply", original_error: msg },
+      });
+    } catch {
+      // If we can't even write the error, surface via the response and console
+    }
     return res.status(500).json({ error: msg });
   }
 }

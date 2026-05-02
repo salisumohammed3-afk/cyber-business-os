@@ -14,16 +14,8 @@
   ],
   "crons": [
     {
-      "path": "/api/proactive-planner",
-      "schedule": "0 8 * * *"
-    },
-    {
       "path": "/api/daily-digest",
       "schedule": "5 8 * * *"
-    },
-    {
-      "path": "/api/skill-recommender",
-      "schedule": "10 8 * * *"
     }
   ]
 }

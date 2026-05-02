@@ -2753,7 +2753,8 @@ async function main() {
 // ── Entry point ─────────────────────────────────────────────────────────────
 
 main().catch(async (err) => {
-  const msg = (err.message || String(err)).slice(0, 500);
+  const msg = (err.message || String(err)).slice(0, 1000);
+  const stack = (err.stack || "").slice(0, 1500);
   await log("FATAL: " + msg, "error");
 
   await sbPatch("tasks", {
@@ -2762,12 +2763,21 @@ main().catch(async (err) => {
     completed_at: new Date().toISOString(),
   }, { id: "eq." + TASK_ID });
 
+  // Surface the REAL error so we can see what broke. No more "Something went wrong".
+  // UI renders kind=error distinctively.
   await sbInsert("chat_messages", {
     conversation_id: CONVERSATION_ID,
-    role: "orchestrator",
-    content: "Something went wrong while processing your request. Please try again.",
+    role: "system",
+    content: "Task failed: " + msg,
     timestamp: new Date().toISOString(),
-    metadata: { error: true, original_error: msg },
+    metadata: {
+      kind: "error",
+      source: "runner",
+      task_id: TASK_ID,
+      agent_slug: agentSlug,
+      original_error: msg,
+      stack: stack,
+    },
   });
 
   process.exit(1);

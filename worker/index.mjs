@@ -458,11 +458,17 @@ let running = true;
 let pollCount = 0;
 
 async function poll() {
-  // Recover stuck tasks every 10th poll
+  // Recover stuck tasks every 10th poll.
+  // Auto-approve and recurring task processing are DISABLED — they were silent
+  // background spawners. Re-enable per-feature once we have explicit user controls.
   if (pollCount % 10 === 0) {
     await recoverStuckTasks();
-    await autoApproveProposed();
-    await processRecurringTasks();
+    if (process.env.WORKER_AUTO_APPROVE === "true") {
+      await autoApproveProposed();
+    }
+    if (process.env.WORKER_RECURRING === "true") {
+      await processRecurringTasks();
+    }
   }
   pollCount++;
 

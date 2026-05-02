@@ -200,6 +200,9 @@ export function useLiveChat(companyId: string | null) {
         ? '\n\n[Attachments: ' + attachments.map((a) => `${a.name} (${a.type}) — ${a.url}`).join(', ') + ']'
         : ''
 
+      // Chat is chat. No fallback path. If quick-reply fails, the user sees a real error
+      // in the conversation (quick-reply persists an error message on its end).
+      // We do NOT silently spawn a task — that's how runaways start.
       try {
         const qr = await fetch('/api/quick-reply', {
           method: 'POST',
@@ -212,54 +215,19 @@ export function useLiveChat(companyId: string | null) {
           }),
         })
 
-        if (qr.ok) {
-          return
+        if (!qr.ok) {
+          const body = await qr.json().catch(() => ({ error: qr.statusText }))
+          const errMsg = typeof body?.error === 'string' ? body.error : qr.statusText
+          // quick-reply tries to persist its own error message; if it can't, we surface here.
+          setError(new Error(`Chat error (${qr.status}): ${errMsg}`))
+          setWaitingForReply(false)
         }
       } catch (qrError) {
-        console.error('Quick-reply failed, falling back to full pipeline:', qrError)
+        const m = qrError instanceof Error ? qrError.message : String(qrError)
+        console.error('Quick-reply network error:', m)
+        setError(new Error(`Network error reaching chat: ${m}`))
+        setWaitingForReply(false)
       }
-
-      const { data: orchestrator } = await supabase
-        .from('agent_definitions')
-        .select('id')
-        .eq('slug', 'orchestrator')
-        .eq('company_id', companyId)
-        .single()
-
-      if (!orchestrator?.id) {
-        console.error('Orchestrator agent not found — cannot send message')
-        return
-      }
-
-      const { data: existingTask } = await supabase
-        .from('tasks')
-        .select('id, status')
-        .eq('conversation_id', convId)
-        .in('status', ['pending', 'running'])
-        .eq('title', 'Respond to user message')
-        .limit(1)
-        .maybeSingle()
-
-      if (existingTask) return
-
-      const { data: newTask, error: taskError } = await supabase.from('tasks').insert({
-        conversation_id: convId,
-        agent_definition_id: orchestrator.id,
-        company_id: companyId,
-        status: 'pending',
-        title: 'Respond to user message',
-        description: text + attachmentContext,
-        source: 'internal',
-      }).select('id').single()
-      if (taskError) throw new Error(taskError.message)
-
-      fetch('/api/run-agent', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ task_id: newTask.id, conversation_id: convId }),
-      }).catch((fnError) => {
-        console.error('Agent runner error:', fnError)
-      })
     },
     [companyId]
   )

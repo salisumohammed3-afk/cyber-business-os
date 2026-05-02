@@ -3,27 +3,36 @@ import type { VercelRequest, VercelResponse } from "@vercel/node";
 
 export const maxDuration = 60;
 
-// Work order proposals are emitted by the orchestrator in this format:
-// [PROPOSE_WORK_ORDER]
-// { ...JSON conforming to WorkOrderProposal... }
-// We match the marker then capture the JSON object that follows. The regex is
-// permissive (handles single-line JSON, multi-line JSON, JSON wrapped in code
-// fences) — extractJsonAfterMarker() does the heavy lifting.
+// Markers the orchestrator emits to trigger structured cards in chat:
+//   [PROPOSE_WORK_ORDER]   -> work-order proposal (Stage 2)
+//   [PROPOSE_INTEGRATION]  -> integration setup card (API Center Phase 2)
 const WORK_ORDER_MARKER = "[PROPOSE_WORK_ORDER]";
+const INTEGRATION_MARKER = "[PROPOSE_INTEGRATION]";
 
-function extractJsonAfterMarker(text: string): { preamble: string; rawJson: string } | null {
-  const idx = text.indexOf(WORK_ORDER_MARKER);
+// Generic marker-then-JSON extractor. Handles multi-line JSON, single-line JSON,
+// JSON wrapped in code fences. Used for both work orders and integrations.
+function extractJsonAfterAnyMarker(
+  text: string,
+  marker: string
+): { preamble: string; rawJson: string } | null {
+  const idx = text.indexOf(marker);
   if (idx < 0) return null;
   const preamble = text.slice(0, idx).trim();
-  const after = text.slice(idx + WORK_ORDER_MARKER.length);
-  // Find the first '{' and the matching last '}' (greedy — assumes proposal is
-  // the only top-level object after the marker, which the prompt enforces).
+  const after = text.slice(idx + marker.length);
   const firstBrace = after.indexOf("{");
   if (firstBrace < 0) return null;
   const lastBrace = after.lastIndexOf("}");
   if (lastBrace <= firstBrace) return null;
   const rawJson = after.slice(firstBrace, lastBrace + 1);
   return { preamble, rawJson };
+}
+
+function extractJsonAfterMarker(text: string) {
+  return extractJsonAfterAnyMarker(text, WORK_ORDER_MARKER);
+}
+
+function extractIntegrationProposal(text: string) {
+  return extractJsonAfterAnyMarker(text, INTEGRATION_MARKER);
 }
 
 // In-memory rate limiter (resets on cold start / redeploy)
@@ -152,7 +161,23 @@ Got it — I'll set this up for your approval.
 
 Pick the SINGLE best type. The system fills in agent, cost estimate, time estimate, and output target from the type. Sal will see a card and click Approve before anything runs. Don't propose multiple at once — pick the most important and propose it. Sal can ask for more.
 
-If the request is ambiguous, just ask Sal what he means — don't guess and propose.`;
+If the request is ambiguous, just ask Sal what he means — don't guess and propose.
+
+## Adding integrations (API Center)
+
+If Sal asks to "add", "connect", "hook up", or "set up" an external service (OpenAI/ChatGPT, GitHub, Resend, Apollo, Anthropic, Serper, Exa — anything in the known-vendors list), DO NOT propose a work order. Instead, propose an integration setup. Output a one-line acknowledgment, then \`[PROPOSE_INTEGRATION]\`, then JSON:
+
+\`\`\`
+Sure — let's get OpenAI connected. Paste your API key and I'll wire it up.
+[PROPOSE_INTEGRATION]
+{
+  "vendor": "openai"
+}
+\`\`\`
+
+The system looks up the vendor in the registry, fills in the form fields (which credentials are needed, where to get them, what the test endpoint is), and shows Sal a card. Sal pastes the key, the system saves it encrypted, runs a connection test, and confirms. **Pick exactly one vendor per proposal.** Known vendors: openai, anthropic, github, resend, serper, exa.
+
+If Sal asks for a vendor that's NOT in this list (e.g., Twilio, Klaviyo), don't propose — say you can't add it via the API Center yet and tell him a custom integration needs a code change. Don't pretend.`;
 
 type ToolResultBlock = { type: "tool_result"; tool_use_id: string; content: string };
 type ToolUseBlock = { type: "tool_use"; id: string; name: string; input: Record<string, unknown> };
@@ -608,6 +633,89 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
       messages.push({ role: "user", content: toolResults });
       toolTurns++;
+    }
+
+    // ── Integration proposal detection (API Center conversational add) ──────
+    const intMatch = extractIntegrationProposal(reply);
+    if (intMatch) {
+      const { preamble, rawJson } = intMatch;
+      let parsedInt: { vendor?: string } | null = null;
+      try {
+        parsedInt = JSON.parse(rawJson);
+      } catch {
+        parsedInt = null;
+      }
+
+      // Look up the vendor in the registry — same source of truth as the API Center
+      const { getVendor } = await import("./lib/vendor-registry");
+      const vendorDef = parsedInt?.vendor ? getVendor(parsedInt.vendor) : null;
+
+      if (!vendorDef) {
+        await supabase.from("chat_messages").insert({
+          conversation_id,
+          role: "system",
+          kind: "error",
+          content:
+            `I can't add "${parsedInt?.vendor || "that"}" via the API Center — it's not in the known-vendors list. ` +
+            `Currently supported: openai, anthropic, github, resend, serper, exa. ` +
+            `For a vendor not in this list, a custom integration needs a code change.`,
+          timestamp: new Date().toISOString(),
+          metadata: {
+            kind: "error",
+            source: "quick-reply",
+            original_error: `Unknown vendor: ${parsedInt?.vendor}`,
+          },
+        });
+        return res.status(200).json({ mode: "unknown_integration_vendor" });
+      }
+
+      // Check whether it's already connected — useful for the UI to render "edit" mode
+      const { data: existingInt } = await supabase
+        .from("integrations")
+        .select("id, status, credential_preview")
+        .eq("company_id", company_id)
+        .eq("vendor", vendorDef.vendor)
+        .maybeSingle();
+
+      const ackContent =
+        preamble ||
+        (existingInt
+          ? `Updating ${vendorDef.display_name} — paste a new key (or leave blank to keep current).`
+          : `Let's get ${vendorDef.display_name} connected. Paste your key below.`);
+
+      await supabase.from("chat_messages").insert({
+        conversation_id,
+        role: "assistant",
+        kind: "integration_proposal",
+        content: ackContent,
+        timestamp: new Date().toISOString(),
+        metadata: {
+          kind: "integration_proposal",
+          vendor: vendorDef.vendor,
+          // Trim the registry entry down to what the UI needs to render the form
+          vendor_def: {
+            vendor: vendorDef.vendor,
+            display_name: vendorDef.display_name,
+            description: vendorDef.description,
+            docs_url: vendorDef.docs_url,
+            credentials: vendorDef.credentials,
+            config: vendorDef.config,
+          },
+          existing: existingInt
+            ? {
+                id: existingInt.id,
+                status: existingInt.status,
+                credential_preview: existingInt.credential_preview,
+              }
+            : null,
+        },
+      });
+
+      return res.status(200).json({
+        mode: "integration_proposed",
+        vendor: vendorDef.vendor,
+        existing: !!existingInt,
+      });
     }
 
     // ── Work order proposal detection ───────────────────────────────────────

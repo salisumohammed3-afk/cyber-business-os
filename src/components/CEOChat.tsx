@@ -8,6 +8,28 @@ import { Link } from 'react-router-dom'
 
 interface ProjectRef { id: string; deploy_url: string }
 
+interface IntegrationVendorDef {
+  vendor: string
+  display_name: string
+  description: string
+  docs_url: string
+  credentials: Array<{
+    name: string
+    label: string
+    description?: string
+    placeholder?: string
+    is_secret: boolean
+    required: boolean
+  }>
+  config: Array<{
+    name: string
+    label: string
+    description?: string
+    default?: string
+    required?: boolean
+  }>
+}
+
 interface WorkOrderProposal {
   type: string
   agent: string
@@ -343,6 +365,21 @@ export function CEOChat() {
                     <Loader2 size={10} className="animate-spin" />
                     {msg.content}
                   </div>
+                </div>
+              )
+            }
+
+            // Render kind=integration_proposal as an inline form for adding/updating an integration.
+            // Same backend (/api/integrations) as Settings -> API Center; both flows write to the same row.
+            if (kind === 'integration_proposal' && meta?.vendor_def) {
+              return (
+                <div key={msg.id} className="flex justify-start">
+                  <IntegrationProposalCard
+                    vendorDef={meta.vendor_def as IntegrationVendorDef}
+                    existing={(meta.existing as { id: string; status: string; credential_preview: string | null } | null) || null}
+                    companyId={company?.id || ''}
+                    preamble={msg.content || undefined}
+                  />
                 </div>
               )
             }
@@ -740,3 +777,169 @@ export function CEOChat() {
 }
 
 export default CEOChat
+
+// ── Integration proposal card ───────────────────────────────────────────────
+// Inline component to keep the rendering loop tight. Renders the form for
+// adding/updating an integration via chat. Submits to the same /api/integrations
+// endpoint the API Center uses, and automatically runs a connection test
+// after save so the user immediately sees green/red status.
+
+interface IntegrationCardProps {
+  vendorDef: IntegrationVendorDef
+  existing: { id: string; status: string; credential_preview: string | null } | null
+  companyId: string
+  preamble?: string
+}
+
+function IntegrationProposalCard({ vendorDef, existing, companyId, preamble }: IntegrationCardProps) {
+  const [creds, setCreds] = useState<Record<string, string>>({})
+  const [config, setConfig] = useState<Record<string, string>>(() => {
+    const init: Record<string, string> = {}
+    for (const f of vendorDef.config) {
+      init[f.name] = f.default || ''
+    }
+    return init
+  })
+  const [saving, setSaving] = useState(false)
+  const [done, setDone] = useState<null | { ok: boolean; message: string }>(null)
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (!companyId) return
+    setSaving(true)
+    setDone(null)
+    try {
+      const r = await fetch('/api/integrations', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          company_id: companyId,
+          vendor: vendorDef.vendor,
+          credentials: creds,
+          config,
+        }),
+      })
+      if (!r.ok) {
+        const body = await r.json().catch(() => ({}))
+        setDone({ ok: false, message: 'Save failed: ' + (body.error || r.statusText) })
+        return
+      }
+      const { integration } = await r.json()
+      // Auto-test
+      const tr = await fetch(`/api/integrations?id=${integration.id}&action=test`, { method: 'POST' })
+      const tb = await tr.json().catch(() => ({}))
+      if (tb.ok) {
+        setDone({
+          ok: true,
+          message: `${vendorDef.display_name} connected and verified.`,
+        })
+      } else {
+        setDone({
+          ok: false,
+          message:
+            `${vendorDef.display_name} saved, but the test failed: ` +
+            (tb.message || 'unknown error'),
+        })
+      }
+    } catch (err) {
+      setDone({
+        ok: false,
+        message: 'Save failed: ' + (err instanceof Error ? err.message : String(err)),
+      })
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const isEditing = !!existing
+
+  if (done?.ok) {
+    return (
+      <div className="rounded-md border border-green-300 bg-green-50 px-3 py-2 max-w-[85%]">
+        <div className="flex items-center gap-2 text-sm text-green-800">
+          <CheckCircle2 size={14} />
+          <span className="font-semibold">{done.message}</span>
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="rounded-md border border-blue-300 bg-blue-50 px-3 py-2 max-w-[85%] text-sm">
+      {preamble && (
+        <div className="text-foreground/80 whitespace-pre-wrap mb-2">{preamble}</div>
+      )}
+      <div className="rounded bg-white border border-blue-200 px-3 py-2">
+        <div className="text-xs uppercase tracking-wide font-semibold text-blue-700 mb-1">
+          API Center · {isEditing ? 'Update' : 'Add'} integration
+        </div>
+        <div className="font-medium mb-1">{vendorDef.display_name}</div>
+        <div className="text-xs text-gray-600 mb-2">{vendorDef.description}</div>
+        {vendorDef.docs_url && (
+          <a
+            href={vendorDef.docs_url}
+            target="_blank"
+            rel="noreferrer"
+            className="text-xs text-blue-600 hover:underline inline-flex items-center gap-1 mb-2"
+          >
+            Get your key <ExternalLink size={10} />
+          </a>
+        )}
+        <form onSubmit={submit} className="space-y-2 mt-2">
+          {vendorDef.credentials.map(f => (
+            <div key={f.name}>
+              <label className="text-xs font-medium block mb-0.5">
+                {f.label} {f.required && <span className="text-red-600">*</span>}
+              </label>
+              {isEditing && f.is_secret && (
+                <p className="text-xs text-muted-foreground mb-0.5">
+                  Current: <code>{existing.credential_preview}</code> — leave blank to keep, or paste new value to replace.
+                </p>
+              )}
+              <input
+                type={f.is_secret ? 'password' : 'text'}
+                placeholder={f.placeholder}
+                onChange={e => setCreds({ ...creds, [f.name]: e.target.value })}
+                className="w-full rounded border border-border px-2 py-1 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                autoComplete="off"
+              />
+              {f.description && (
+                <p className="text-xs text-muted-foreground mt-0.5">{f.description}</p>
+              )}
+            </div>
+          ))}
+          {vendorDef.config.map(f => (
+            <div key={f.name}>
+              <label className="text-xs font-medium block mb-0.5">{f.label}</label>
+              <input
+                type="text"
+                value={config[f.name] || ''}
+                onChange={e => setConfig({ ...config, [f.name]: e.target.value })}
+                placeholder={f.default}
+                className="w-full rounded border border-border px-2 py-1 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+              />
+              {f.description && (
+                <p className="text-xs text-muted-foreground mt-0.5">{f.description}</p>
+              )}
+            </div>
+          ))}
+          {done && !done.ok && (
+            <div className="text-xs text-red-700 rounded bg-red-50 border border-red-200 px-2 py-1">
+              {done.message}
+            </div>
+          )}
+          <button
+            type="submit"
+            disabled={saving}
+            className="inline-flex items-center justify-center gap-1.5 rounded bg-blue-600 text-white text-xs px-3 py-1 hover:bg-blue-700 disabled:bg-gray-300 disabled:cursor-not-allowed"
+          >
+            {saving ? <Loader2 size={12} className="animate-spin" /> : <CheckCircle2 size={12} />}
+            {isEditing ? 'Update & test' : 'Save & test'}
+          </button>
+        </form>
+      </div>
+    </div>
+  )
+}
+
+export { IntegrationProposalCard }

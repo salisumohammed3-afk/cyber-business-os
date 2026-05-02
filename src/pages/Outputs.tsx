@@ -144,6 +144,71 @@ function DocumentCard({ doc, onClick }: { doc: Document; onClick: () => void }) 
   );
 }
 
+// Mobile body: switches between Documents and Projects tabs. Each list is
+// full-width on mobile so cards have proper room to breathe.
+function MobileOutputsTabs({
+  docCount, projCount, loadingD, loadingP, docs, projects, search, onDocClick,
+}: {
+  docCount: number;
+  projCount: number;
+  loadingD: boolean;
+  loadingP: boolean;
+  docs: Document[];
+  projects: Project[];
+  search: string;
+  onDocClick: (d: Document) => void;
+}) {
+  const [tab, setTab] = useState<"docs" | "projects">("docs");
+  const tabClass = (active: boolean) =>
+    `flex-1 flex items-center justify-center gap-1.5 py-2.5 text-sm font-medium border-b-2 transition-colors ${
+      active ? "border-foreground text-foreground" : "border-transparent text-muted-foreground"
+    }`;
+
+  return (
+    <>
+      <div className="flex border-b shrink-0">
+        <button onClick={() => setTab("docs")} className={tabClass(tab === "docs")}>
+          <FileText size={14} className="text-orange-500" />
+          Documents
+          <Badge variant="secondary" className="text-[10px]">{docCount}</Badge>
+        </button>
+        <button onClick={() => setTab("projects")} className={tabClass(tab === "projects")}>
+          <FolderOpen size={14} className="text-blue-500" />
+          Projects
+          <Badge variant="secondary" className="text-[10px]">{projCount}</Badge>
+        </button>
+      </div>
+      <div className="flex-1 overflow-y-auto p-3 space-y-3">
+        {tab === "docs" ? (
+          loadingD ? (
+            <p className="text-xs text-muted-foreground text-center pt-8">Loading documents...</p>
+          ) : docs.length === 0 ? (
+            <div className="text-center pt-12 space-y-2">
+              <FileText size={28} className="mx-auto text-muted-foreground/40" />
+              <p className="text-xs text-muted-foreground">
+                {search ? "No documents match your search" : "No documents yet. Completed tasks will appear here."}
+              </p>
+            </div>
+          ) : (
+            docs.map((doc) => <DocumentCard key={doc.id} doc={doc} onClick={() => onDocClick(doc)} />)
+          )
+        ) : loadingP ? (
+          <p className="text-xs text-muted-foreground text-center pt-8">Loading projects...</p>
+        ) : projects.length === 0 ? (
+          <div className="text-center pt-12 space-y-2">
+            <FolderOpen size={28} className="mx-auto text-muted-foreground/40" />
+            <p className="text-xs text-muted-foreground">
+              {search ? "No projects match your search" : "No projects yet. When agents build apps, they'll appear here."}
+            </p>
+          </div>
+        ) : (
+          projects.map((p) => <ProjectCard key={p.id} project={p} />)
+        )}
+      </div>
+    </>
+  );
+}
+
 function downloadMarkdown(filename: string, content: string) {
   const blob = new Blob([content], { type: "text/markdown;charset=utf-8" });
   const url = URL.createObjectURL(blob);
@@ -252,24 +317,54 @@ export default function Outputs() {
 
   return (
     <div className="h-screen flex flex-col bg-background">
-      <div className="h-12 border-b flex items-center px-4 gap-3">
-        <button onClick={() => navigate("/")} className="p-1 rounded hover:bg-secondary">
-          <ArrowLeft size={18} />
-        </button>
-        <h1 className="font-semibold text-sm">{company.name} — Outputs</h1>
-        <div className="ml-auto relative">
-          <Search size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-muted-foreground" />
+      {/* Header — mobile: title row, then search row. Desktop: inline. */}
+      <div className="border-b shrink-0">
+        <div className="h-12 flex items-center px-3 sm:px-4 gap-3">
+          <button onClick={() => navigate("/")} className="p-1 rounded hover:bg-secondary shrink-0">
+            <ArrowLeft size={18} />
+          </button>
+          <h1 className="font-semibold text-sm truncate">{company.name} — Outputs</h1>
+          <div className="ml-auto relative hidden sm:block">
+            <Search size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-muted-foreground" />
+            <input
+              type="text"
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder="Search outputs..."
+              className="pl-8 pr-3 py-1.5 w-64 rounded-lg border text-xs focus:outline-none focus:ring-2 focus:ring-blue-500"
+            />
+          </div>
+        </div>
+        {/* Mobile-only second row: full-width search */}
+        <div className="sm:hidden px-3 pb-2 relative">
+          <Search size={14} className="absolute left-5 top-1/2 -translate-y-1/2 text-muted-foreground" />
           <input
             type="text"
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             placeholder="Search outputs..."
-            className="pl-8 pr-3 py-1.5 w-64 rounded-lg border text-xs focus:outline-none focus:ring-2 focus:ring-blue-500"
+            className="pl-8 pr-3 py-2 w-full rounded-lg border text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
           />
         </div>
       </div>
 
-      <div className="flex-1 overflow-hidden grid grid-cols-2 divide-x">
+      {/* Body — mobile: tabs. Desktop: 2-column grid. */}
+      {/* Mobile tabs */}
+      <div className="sm:hidden flex-1 flex flex-col overflow-hidden">
+        <MobileOutputsTabs
+          docCount={filteredDocs.length}
+          projCount={filteredProjects.length}
+          loadingD={loadingD}
+          loadingP={loadingP}
+          docs={filteredDocs}
+          projects={filteredProjects}
+          search={search}
+          onDocClick={setPreviewDoc}
+        />
+      </div>
+
+      {/* Desktop grid */}
+      <div className="hidden sm:grid flex-1 overflow-hidden grid-cols-2 divide-x">
         {/* Documents — left */}
         <div className="flex flex-col overflow-hidden">
           <div className="px-4 py-3 border-b flex items-center gap-2">
@@ -323,9 +418,9 @@ export default function Outputs() {
         </div>
       </div>
 
-      {/* Document preview sheet */}
+      {/* Document preview sheet — full-width on mobile, 600px on desktop */}
       <Sheet open={!!previewDoc} onOpenChange={(open) => { if (!open) setPreviewDoc(null); }}>
-        <SheetContent side="right" className="w-[600px] sm:max-w-[600px] flex flex-col p-0">
+        <SheetContent side="right" className="w-full sm:w-[600px] sm:max-w-[600px] flex flex-col p-0">
           <SheetHeader className="px-6 pt-5 pb-3 border-b shrink-0">
             <div className="flex items-start justify-between gap-3">
               <div className="min-w-0 flex-1">

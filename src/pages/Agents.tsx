@@ -202,19 +202,19 @@ function OrgChart({
   const orchTools = buildToolList("orchestrator", orchestrator?.id, externalTools);
 
   return (
-    <div className="flex flex-col items-center gap-0 py-8 px-4">
-      <p className="text-sm text-muted-foreground mb-8 text-center max-w-lg">
+    <div className="flex flex-col items-center gap-0 py-6 sm:py-8 px-3 sm:px-4">
+      <p className="text-sm text-muted-foreground mb-6 sm:mb-8 text-center max-w-lg">
         The Orchestrator receives Sal's directives and coordinates specialist agents as needed. Each agent has its own system prompt, tools, and expertise.
       </p>
 
-      <Card className="w-80 border-emerald-500/30 bg-emerald-500/5">
+      <Card className="w-full max-w-sm border-emerald-500/30 bg-emerald-500/5">
         <CardHeader className="pb-2">
           <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-lg bg-emerald-500/10 flex items-center justify-center">
+            <div className="w-10 h-10 rounded-lg bg-emerald-500/10 flex items-center justify-center shrink-0">
               <Brain size={20} className="text-emerald-400" />
             </div>
-            <div className="text-left">
-              <CardTitle className="text-sm">{orchestrator?.name || "Orchestrator"}</CardTitle>
+            <div className="text-left min-w-0">
+              <CardTitle className="text-sm truncate">{orchestrator?.name || "Orchestrator"}</CardTitle>
               <CardDescription className="text-xs">Sal's right-hand AI</CardDescription>
             </div>
           </div>
@@ -228,7 +228,9 @@ function OrgChart({
         </CardContent>
       </Card>
 
-      <svg width="100%" height="60" className="max-w-3xl" viewBox="0 0 800 60" preserveAspectRatio="xMidYMid meet">
+      {/* Connector lines: only meaningful when specialists are in a single row.
+          Hidden on mobile because the 2-col grid below doesn't align with the trunk. */}
+      <svg width="100%" height="60" className="max-w-3xl hidden lg:block" viewBox="0 0 800 60" preserveAspectRatio="xMidYMid meet">
         <line x1="400" y1="0" x2="400" y2="30" stroke="currentColor" strokeOpacity="0.2" strokeWidth="2" />
         <line x1="80" y1="30" x2="720" y2="30" stroke="currentColor" strokeOpacity="0.2" strokeWidth="2" />
         {specialists.map((_, i) => {
@@ -236,6 +238,9 @@ function OrgChart({
           return <line key={i} x1={x} y1="30" x2={x} y2="60" stroke="currentColor" strokeOpacity="0.2" strokeWidth="2" />;
         })}
       </svg>
+
+      {/* Spacer below orchestrator on mobile (replaces hidden SVG connectors) */}
+      <div className="h-6 lg:hidden" />
 
       <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-3 w-full max-w-4xl">
         {specialists.map((agent) => {
@@ -462,19 +467,22 @@ function AgentDetail({
   const agentRecs = recommendations.filter((r) => r.agent_definition_id === agent.id);
 
   return (
-    <div className="py-6 px-4">
-      <div className="flex items-center gap-4 mb-6">
-        <div className="w-12 h-12 rounded-lg bg-secondary flex items-center justify-center">
-          <Icon size={24} className={config.color} />
+    <div className="py-4 sm:py-6 px-3 sm:px-4">
+      {/* Header: stacks on mobile (icon+name on row 1, badges wrap on row 2). */}
+      <div className="flex flex-col sm:flex-row sm:items-center gap-3 sm:gap-4 mb-6">
+        <div className="flex items-center gap-3 sm:gap-4 min-w-0 flex-1">
+          <div className="w-12 h-12 rounded-lg bg-secondary flex items-center justify-center shrink-0">
+            <Icon size={24} className={config.color} />
+          </div>
+          <div className="min-w-0">
+            <h2 className="text-lg font-medium truncate">{agent.name}</h2>
+            <p className="text-sm text-muted-foreground line-clamp-2">{agent.description}</p>
+          </div>
         </div>
-        <div>
-          <h2 className="text-lg font-medium">{agent.name}</h2>
-          <p className="text-sm text-muted-foreground">{agent.description}</p>
-        </div>
-        <div className="ml-auto flex gap-2">
-          <Badge variant="outline" className="font-mono text-xs">{agent.model}</Badge>
-          <Badge variant="secondary" className="text-xs">temp: {agent.temperature}</Badge>
-          <Badge variant="secondary" className="text-xs">max turns: {agent.max_turns}</Badge>
+        <div className="flex flex-wrap gap-1.5 sm:gap-2 sm:ml-auto sm:shrink-0">
+          <Badge variant="outline" className="font-mono text-[10px] sm:text-xs">{agent.model}</Badge>
+          <Badge variant="secondary" className="text-[10px] sm:text-xs">temp: {agent.temperature}</Badge>
+          <Badge variant="secondary" className="text-[10px] sm:text-xs">max turns: {agent.max_turns}</Badge>
         </div>
       </div>
 
@@ -676,16 +684,16 @@ const Agents = () => {
           </div>
         ) : (
           <Tabs defaultValue="overview" className="w-full">
-            <div className="border-b border-border bg-secondary/30 px-4">
-              <TabsList className="bg-transparent h-10 gap-0">
-                <TabsTrigger value="overview" className="font-mono text-xs data-[state=active]:bg-background rounded-b-none">
+            <div className="border-b border-border bg-secondary/30 px-2 sm:px-4 overflow-x-auto">
+              <TabsList className="bg-transparent h-10 gap-0 flex-nowrap w-max min-w-full">
+                <TabsTrigger value="overview" className="font-mono text-xs data-[state=active]:bg-background rounded-b-none whitespace-nowrap">
                   Overview
                 </TabsTrigger>
                 {tabAgents.map((agent) => {
                   const config = agentConfigs[agent.slug];
                   const Icon = config?.icon || Bot;
                   return (
-                    <TabsTrigger key={agent.slug} value={agent.slug} className="font-mono text-xs data-[state=active]:bg-background rounded-b-none gap-1.5">
+                    <TabsTrigger key={agent.slug} value={agent.slug} className="font-mono text-xs data-[state=active]:bg-background rounded-b-none gap-1.5 whitespace-nowrap">
                       <Icon size={12} className={config?.color || "text-muted-foreground"} />
                       {agent.name}
                     </TabsTrigger>

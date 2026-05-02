@@ -92,18 +92,18 @@ export const VENDOR_REGISTRY: VendorDef[] = [
         required: true,
       },
     ],
-    config: [
-      {
-        name: "default_model",
-        label: "Default model",
-        default: "gpt-4o",
-      },
-    ],
+    // No user-facing config knobs — system picks the best model per call.
+    // Agents using `call_integration` should default to gpt-4o unless there's
+    // a specific reason for o1 / o1-mini.
+    config: [],
     test: { method: "GET", path: "/models" },
     actions: [
       {
         name: "chat",
-        description: "Send a chat completion request to OpenAI. Returns the model's response.",
+        description:
+          "Send a chat completion request to OpenAI. Returns the model's response. " +
+          "Just pass `messages` — model defaults to gpt-4o, max_tokens to 2048, temperature to 0.7. " +
+          "Override only if you specifically need o1 reasoning or custom limits.",
         method: "POST",
         path: "/chat/completions",
         body_template: {
@@ -115,16 +115,16 @@ export const VENDOR_REGISTRY: VendorDef[] = [
         input_schema: {
           type: "object",
           properties: {
-            model: { type: "string", description: "e.g. gpt-4o, gpt-4-turbo, o1-preview" },
             messages: {
               type: "array",
               description: "Array of {role, content} objects. Roles: system, user, assistant.",
               items: { type: "object" },
             },
-            max_tokens: { type: "number", description: "Max output tokens (e.g. 2048)" },
-            temperature: { type: "number", description: "0.0 - 2.0" },
+            model: { type: "string", description: "Optional. Default gpt-4o. Use o1-preview for hard reasoning." },
+            max_tokens: { type: "number", description: "Optional. Default 2048." },
+            temperature: { type: "number", description: "Optional. Default 0.7. Range 0.0 - 2.0." },
           },
-          required: ["model", "messages"],
+          required: ["messages"],
         },
       },
     ],
@@ -149,20 +149,17 @@ export const VENDOR_REGISTRY: VendorDef[] = [
         required: true,
       },
     ],
-    config: [
-      {
-        name: "default_model",
-        label: "Default model",
-        default: "claude-sonnet-4-20250514",
-      },
-    ],
+    // No user-facing config knobs — system picks the latest Sonnet by default.
+    config: [],
     test: { method: "POST", path: "/messages", expect_status: 400 },
     // ^ /messages requires a body; an empty POST returns 400 if the key is valid,
     //   401/403 if it isn't. We treat 400 as "auth ok" for the probe.
     actions: [
       {
         name: "messages",
-        description: "Call Claude's messages API directly.",
+        description:
+          "Call Claude's messages API directly. Just pass `messages` — model defaults to " +
+          "claude-sonnet-4-20250514, max_tokens to 2048. Override only if you need Opus or different limits.",
         method: "POST",
         path: "/messages",
         body_template: {
@@ -173,15 +170,15 @@ export const VENDOR_REGISTRY: VendorDef[] = [
         input_schema: {
           type: "object",
           properties: {
-            model: { type: "string", description: "e.g. claude-sonnet-4-20250514" },
             messages: {
               type: "array",
               description: "Array of {role, content} objects.",
               items: { type: "object" },
             },
-            max_tokens: { type: "number", description: "Default 1024" },
+            model: { type: "string", description: "Optional. Default claude-sonnet-4-20250514." },
+            max_tokens: { type: "number", description: "Optional. Default 2048." },
           },
-          required: ["model", "messages"],
+          required: ["messages"],
         },
       },
     ],

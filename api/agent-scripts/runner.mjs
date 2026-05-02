@@ -782,7 +782,22 @@ async function toolCallIntegration(input) {
 
   const cfg = row.config || {};
   const baseUrl = String(cfg.base_url || "").replace(/\/$/, "");
-  const path = substituteTemplate(actionDef.path, params);
+
+  // Vendor/action defaults — "always use the best" without making the agent specify.
+  // Agent's params override these. If you add a new known vendor here, also drop the
+  // user-facing config knobs in api/lib/vendor-registry.ts so the form stays simple.
+  const VENDOR_PARAM_DEFAULTS = {
+    openai: {
+      chat:     { model: "gpt-4o", max_tokens: 2048, temperature: 0.7 },
+    },
+    anthropic: {
+      messages: { model: "claude-sonnet-4-20250514", max_tokens: 2048 },
+    },
+  };
+  const defaults = VENDOR_PARAM_DEFAULTS[vendor]?.[action] || {};
+  const filledParams = { ...defaults, ...params };
+
+  const path = substituteTemplate(actionDef.path, filledParams);
   const url = baseUrl + path;
 
   const headers = { "Content-Type": "application/json" };
@@ -797,10 +812,10 @@ async function toolCallIntegration(input) {
   // Build body
   let body;
   if (actionDef.method !== "GET" && actionDef.body_template) {
-    const filled = substituteTemplate(actionDef.body_template, params);
+    const filled = substituteTemplate(actionDef.body_template, filledParams);
     body = JSON.stringify(filled);
   } else if (actionDef.method !== "GET") {
-    body = JSON.stringify(params);
+    body = JSON.stringify(filledParams);
   }
 
   await log(

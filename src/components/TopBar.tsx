@@ -1,7 +1,8 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { Building2, ChevronDown, Plus, Settings, FolderOpen } from "lucide-react";
+import { Building2, ChevronDown, Plus, Settings, FolderOpen, Menu, Bot, CalendarClock, Plug } from "lucide-react";
 import { useCompany } from "@/contexts/CompanyContext";
+import { useIsMobile } from "@/hooks/use-mobile";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -89,18 +90,20 @@ const TopBar = () => {
   const { company, companies, switchCompany } = useCompany();
   const [showCreate, setShowCreate] = useState(false);
   const navigate = useNavigate();
+  const isMobile = useIsMobile();
 
   return (
     <>
-      <div className="h-12 border-b border-border bg-background flex items-center px-4 gap-4">
+      <div className="h-12 border-b border-border bg-background flex items-center px-3 sm:px-4 gap-2 sm:gap-4">
+        {/* Company switcher — slimmer on mobile */}
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
-            <button className="flex items-center gap-2 px-3 py-1.5 rounded-md hover:bg-secondary transition-colors">
-              <Building2 size={16} className="text-blue-500" />
-              <span className="text-sm font-semibold tracking-tight text-foreground">
+            <button className="flex items-center gap-1.5 sm:gap-2 px-2 sm:px-3 py-1.5 rounded-md hover:bg-secondary transition-colors min-w-0 flex-shrink">
+              <Building2 size={16} className="text-blue-500 flex-shrink-0" />
+              <span className="text-sm font-semibold tracking-tight text-foreground truncate">
                 {company?.name || "Select Company"}
               </span>
-              <ChevronDown size={14} className="text-muted-foreground" />
+              <ChevronDown size={14} className="text-muted-foreground flex-shrink-0" />
             </button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="start" className="w-56">
@@ -122,35 +125,71 @@ const TopBar = () => {
           </DropdownMenuContent>
         </DropdownMenu>
 
-        <div className="h-4 w-px bg-border" />
+        {/* Stage indicator — hidden on mobile (fits if you tap company name) */}
+        <div className="hidden sm:flex items-center gap-4">
+          <div className="h-4 w-px bg-border" />
+          <span className="text-xs text-muted-foreground">
+            {company?.brief?.stage
+              ? company.brief.stage.replace("-", " ")
+              : "no brief set"}
+          </span>
+        </div>
 
-        <span className="text-xs text-muted-foreground">
-          {company?.brief?.stage
-            ? company.brief.stage.replace("-", " ")
-            : "no brief set"}
-        </span>
-
-        <div className="ml-auto flex items-center gap-3">
-          <button
-            onClick={() => navigate("/company-settings")}
-            className="flex items-center gap-1.5 px-3 py-1 rounded-sm border border-border text-xs font-medium text-foreground hover:bg-secondary transition-colors"
-          >
-            <Settings size={12} />
-            Settings
-          </button>
-          <button
-            onClick={() => navigate("/outputs")}
-            className="flex items-center gap-1.5 px-3 py-1 rounded-sm border border-border text-xs font-medium text-foreground hover:bg-secondary transition-colors"
-          >
-            <FolderOpen size={12} />
-            Outputs
-          </button>
-          <button
-            onClick={() => navigate("/agents")}
-            className="px-3 py-1 rounded-sm border border-border text-xs font-medium text-foreground hover:bg-secondary transition-colors"
-          >
-            Agents
-          </button>
+        {/* Right side: hamburger on mobile, inline buttons on desktop */}
+        <div className="ml-auto flex items-center gap-2 sm:gap-3">
+          {isMobile ? (
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <button
+                  className="flex items-center gap-1 px-2 py-1.5 rounded-sm border border-border text-xs font-medium text-foreground hover:bg-secondary transition-colors"
+                  aria-label="Menu"
+                >
+                  <Menu size={16} />
+                </button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="w-52">
+                <DropdownMenuItem onClick={() => navigate("/agents")}>
+                  <Bot size={14} className="mr-2" /> Agents
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={() => navigate("/outputs")}>
+                  <FolderOpen size={14} className="mr-2" /> Outputs
+                </DropdownMenuItem>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem onClick={() => navigate("/company-settings")}>
+                  <Settings size={14} className="mr-2" /> Settings
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={() => navigate("/company-settings?tab=schedules")}>
+                  <CalendarClock size={14} className="mr-2" /> Schedules
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={() => navigate("/company-settings?tab=api-center")}>
+                  <Plug size={14} className="mr-2" /> API Center
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          ) : (
+            <>
+              <button
+                onClick={() => navigate("/company-settings")}
+                className="flex items-center gap-1.5 px-3 py-1 rounded-sm border border-border text-xs font-medium text-foreground hover:bg-secondary transition-colors"
+              >
+                <Settings size={12} />
+                Settings
+              </button>
+              <button
+                onClick={() => navigate("/outputs")}
+                className="flex items-center gap-1.5 px-3 py-1 rounded-sm border border-border text-xs font-medium text-foreground hover:bg-secondary transition-colors"
+              >
+                <FolderOpen size={12} />
+                Outputs
+              </button>
+              <button
+                onClick={() => navigate("/agents")}
+                className="px-3 py-1 rounded-sm border border-border text-xs font-medium text-foreground hover:bg-secondary transition-colors"
+              >
+                Agents
+              </button>
+            </>
+          )}
         </div>
       </div>
       <CreateCompanyDialog

@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { ArrowLeft, Save, Plus, Trash2, Target, Bot, Wrench, FileText, Bell, Plug, CalendarClock } from "lucide-react";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { ApiCenterTab } from "@/components/ApiCenterTab";
@@ -536,6 +536,12 @@ function NotificationsTab() {
 export default function CompanySettings() {
   const navigate = useNavigate();
   const { company } = useCompany();
+  const [searchParams, setSearchParams] = useSearchParams();
+
+  // Allow deep-linking to a tab via ?tab=schedules etc. Used by the mobile menu.
+  const VALID_TABS = ["brief", "goals", "agents", "tools", "notifications", "api-center", "schedules"];
+  const requestedTab = searchParams.get("tab") || "";
+  const activeTab = VALID_TABS.includes(requestedTab) ? requestedTab : "brief";
 
   if (!company) {
     return (
@@ -553,9 +559,18 @@ export default function CompanySettings() {
         </button>
         <h1 className="font-semibold text-sm">{company.name} — Settings</h1>
       </div>
-      <div className="flex-1 overflow-y-auto p-6">
-        <Tabs defaultValue="brief" className="w-full">
-          <TabsList className="mb-6">
+      <div className="flex-1 overflow-y-auto p-4 sm:p-6">
+        <Tabs
+          value={activeTab}
+          onValueChange={(v) => {
+            const next = new URLSearchParams(searchParams);
+            if (v === "brief") next.delete("tab");
+            else next.set("tab", v);
+            setSearchParams(next, { replace: true });
+          }}
+          className="w-full"
+        >
+          <TabsList className="mb-6 flex flex-wrap h-auto gap-1">
             <TabsTrigger value="brief" className="flex items-center gap-1.5">
               <FileText size={14} /> Brief
             </TabsTrigger>

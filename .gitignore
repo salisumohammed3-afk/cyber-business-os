@@ -26,3 +26,7 @@ dist-ssr
 supabase/.temp/
 .env
 .env*.local
+
+# Local screenshots accumulated during testing
+screenshot-*.png
+screenshot-*.jpg

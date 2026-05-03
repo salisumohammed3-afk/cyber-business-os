@@ -132,11 +132,23 @@ async function probeResend(credentials: Record<string, string>): Promise<Suggest
       headers: { Authorization: `Bearer ${key}` },
       signal: AbortSignal.timeout(8_000),
     });
-    if (r.status === 401 || r.status === 403) {
-      return { ok: false, error: "Resend rejected the key (401). Check it's still active in your dashboard." };
-    }
     if (!r.ok) {
-      return { ok: false, error: `Resend returned ${r.status} when listing domains.` };
+      // Resend uses 401/403 (standard) and 400 (their own "invalid api key" code).
+      // Try to surface their message body if available.
+      let serverMessage = "";
+      try {
+        const errBody = await r.json() as { message?: string; name?: string };
+        serverMessage = errBody.message || errBody.name || "";
+      } catch { /* fall through with status only */ }
+      if (r.status === 400 || r.status === 401 || r.status === 403) {
+        return {
+          ok: false,
+          error: serverMessage
+            ? `Resend rejected the key: ${serverMessage}. Check resend.com/api-keys.`
+            : `Resend rejected the key (${r.status}). Check it's still active at resend.com/api-keys.`,
+        };
+      }
+      return { ok: false, error: `Resend returned ${r.status} when listing domains${serverMessage ? `: ${serverMessage}` : ""}.` };
     }
     const json = (await r.json()) as { data?: Array<{ name: string; status: string }> };
     const verified = (json.data || []).filter(d => d.status === "verified");

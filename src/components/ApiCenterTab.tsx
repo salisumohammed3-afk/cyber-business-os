@@ -355,7 +355,10 @@ function IntegrationWizard({
           const slugs = new Set(((data as AgentRow[]) || []).filter(a => ids.has(a.id)).map(a => a.slug));
           if (!cancelled) setAssignedAgents(slugs);
         } else if (suggested.length) {
-          setAssignedAgents(new Set(suggested));
+          // Intersect suggestions with agents that actually exist in this company —
+          // otherwise the Done step lists slugs we never wrote.
+          const existingSlugs = new Set(((data as AgentRow[]) || []).map(a => a.slug));
+          setAssignedAgents(new Set(suggested.filter(s => existingSlugs.has(s))));
         }
       }
     })();

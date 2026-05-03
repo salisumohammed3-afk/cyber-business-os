@@ -94,6 +94,77 @@ async function buildAuthHeaders(row: IntegrationRow): Promise<Record<string, str
   return headers;
 }
 
+// ── Pre-probe: vendor-specific suggestions during setup ───────────────────
+//
+// When the user pastes credentials into the Add-Integration modal, we call
+// the vendor with those creds and ask "what's actually available?" — e.g.
+// Resend's verified domains, GitHub's accessible repos, etc. The modal
+// renders the response as clickable pills above the relevant config field
+// so the user picks a valid value instead of guessing.
+
+type SuggestionResult = {
+  ok: boolean;
+  error?: string;
+  // Per config-field suggestions — keyed by field name, value is array of strings.
+  suggestions?: Record<string, string[]>;
+  // Optional human-readable note shown above the suggestions.
+  note?: string;
+};
+
+async function fetchVendorSuggestions(
+  vendor: string,
+  credentials: Record<string, string>,
+): Promise<SuggestionResult> {
+  if (vendor === "resend") return probeResend(credentials);
+  // No suggestions registered for this vendor — the modal will just show the
+  // plain config fields. Not an error.
+  return { ok: true, suggestions: {} };
+}
+
+async function probeResend(credentials: Record<string, string>): Promise<SuggestionResult> {
+  const key = (credentials.key || "").trim();
+  if (!key) return { ok: false, error: "Paste your Resend API key first." };
+  if (!key.startsWith("re_")) return { ok: false, error: "Resend keys start with re_ — double-check what you pasted." };
+
+  try {
+    const r = await fetch("https://api.resend.com/domains", {
+      method: "GET",
+      headers: { Authorization: `Bearer ${key}` },
+      signal: AbortSignal.timeout(8_000),
+    });
+    if (r.status === 401 || r.status === 403) {
+      return { ok: false, error: "Resend rejected the key (401). Check it's still active in your dashboard." };
+    }
+    if (!r.ok) {
+      return { ok: false, error: `Resend returned ${r.status} when listing domains.` };
+    }
+    const json = (await r.json()) as { data?: Array<{ name: string; status: string }> };
+    const verified = (json.data || []).filter(d => d.status === "verified");
+    if (verified.length === 0) {
+      return {
+        ok: true,
+        suggestions: {},
+        note:
+          "No verified domains found on this Resend account yet. Verify a domain in Resend (Domains tab) before saving — otherwise sends will fail. You can still save with `onboarding@resend.dev` for testing only.",
+      };
+    }
+    // Build sensible from-address suggestions from each verified domain.
+    const fromCandidates = verified.flatMap(d => [
+      `digest@${d.name}`,
+      `hello@${d.name}`,
+      `noreply@${d.name}`,
+    ]);
+    return {
+      ok: true,
+      note: `Verified domains on this account: ${verified.map(d => d.name).join(", ")}. Pick a from-address or type your own.`,
+      suggestions: { from_email: fromCandidates },
+    };
+  } catch (err: unknown) {
+    const m = err instanceof Error ? err.message : String(err);
+    return { ok: false, error: `Could not reach Resend: ${m}` };
+  }
+}
+
 async function probeIntegration(row: IntegrationRow): Promise<{
   ok: boolean;
   status: number;
@@ -180,6 +251,20 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(200).json({
         integrations: (data || []).map((r: IntegrationRow) => publicShape(r)),
       });
+    }
+
+    // ── Pre-probe (smart onboarding suggestions, before save) ───────────────
+    // Lets the Add-Integration modal call the vendor with the user's pasted
+    // credentials and ask "what valid choices exist?" — e.g. for Resend, the
+    // verified domains. Returns suggestions per config field so the UI can
+    // show clickable pills instead of a vague text input.
+    if (req.method === "POST" && req.query.action === "pre_probe") {
+      const body = (req.body || {}) as { vendor?: string; credentials?: Record<string, string> };
+      const vendor = String(body.vendor || "");
+      const credentials = body.credentials || {};
+      if (!vendor) return res.status(400).json({ error: "vendor is required" });
+      const result = await fetchVendorSuggestions(vendor, credentials);
+      return res.status(200).json(result);
     }
 
     // ── Probe (test connection) ─────────────────────────────────────────────

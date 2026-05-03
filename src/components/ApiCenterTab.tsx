@@ -315,6 +315,51 @@ function AddIntegrationModal({ vendor, existing, onClose, onSubmit, saving }: Ad
     return init;
   });
 
+  // Smart onboarding: when credentials are entered, ask the vendor for valid
+  // options for each config field (e.g. Resend's verified domains → from-address
+  // suggestions). Debounced so we don't probe on every keystroke.
+  const [suggestions, setSuggestions] = useState<Record<string, string[]>>({});
+  const [suggestNote, setSuggestNote] = useState<string>("");
+  const [probing, setProbing] = useState(false);
+  const [probeError, setProbeError] = useState<string>("");
+  const credSignature = JSON.stringify(creds);
+
+  useEffect(() => {
+    // Only probe if we have at least one non-empty credential value
+    const hasAny = Object.values(creds).some(v => v && v.trim().length > 4);
+    if (!hasAny) return;
+
+    let cancelled = false;
+    const handle = setTimeout(async () => {
+      setProbing(true);
+      setProbeError("");
+      try {
+        const res = await fetch("/api/integrations?action=pre_probe", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ vendor: vendor.vendor, credentials: creds }),
+        });
+        const body = await res.json();
+        if (cancelled) return;
+        if (!body.ok) {
+          setProbeError(body.error || "Could not reach vendor");
+          setSuggestions({});
+          setSuggestNote("");
+        } else {
+          setSuggestions(body.suggestions || {});
+          setSuggestNote(body.note || "");
+          setProbeError("");
+        }
+      } catch (e) {
+        if (!cancelled) setProbeError(e instanceof Error ? e.message : "Probe failed");
+      } finally {
+        if (!cancelled) setProbing(false);
+      }
+    }, 600);
+    return () => { cancelled = true; clearTimeout(handle); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [credSignature, vendor.vendor]);
+
   const submit = (e: React.FormEvent) => {
     e.preventDefault();
     onSubmit(vendor.vendor, creds, config);
@@ -370,21 +415,61 @@ function AddIntegrationModal({ vendor, existing, onClose, onSubmit, saving }: Ad
             </div>
           ))}
 
-          {vendor.config.map(f => (
-            <div key={f.name}>
-              <label className="text-xs font-medium block mb-1">{f.label}</label>
-              <input
-                type="text"
-                value={config[f.name] || ""}
-                onChange={e => setConfig({ ...config, [f.name]: e.target.value })}
-                placeholder={f.default}
-                className="w-full rounded border border-border px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-              />
-              {f.description && (
-                <p className="text-xs text-muted-foreground mt-1">{f.description}</p>
+          {/* Live suggestions banner — shown above all config fields when probe returns useful data */}
+          {(probing || probeError || suggestNote) && (
+            <div className="rounded-md border border-blue-200 bg-blue-50/60 px-3 py-2 text-xs space-y-1">
+              {probing && (
+                <div className="flex items-center gap-1.5 text-blue-700">
+                  <Loader2 size={12} className="animate-spin" />
+                  Checking your account…
+                </div>
+              )}
+              {!probing && probeError && (
+                <div className="text-red-700">{probeError}</div>
+              )}
+              {!probing && !probeError && suggestNote && (
+                <div className="text-blue-900">{suggestNote}</div>
               )}
             </div>
-          ))}
+          )}
+
+          {vendor.config.map(f => {
+            const fieldSuggestions = suggestions[f.name] || [];
+            return (
+              <div key={f.name}>
+                <label className="text-xs font-medium block mb-1">{f.label}</label>
+                <input
+                  type="text"
+                  value={config[f.name] || ""}
+                  onChange={e => setConfig({ ...config, [f.name]: e.target.value })}
+                  placeholder={f.default}
+                  className="w-full rounded border border-border px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                />
+                {fieldSuggestions.length > 0 && (
+                  <div className="mt-1.5 flex flex-wrap gap-1">
+                    {fieldSuggestions.map(s => (
+                      <button
+                        key={s}
+                        type="button"
+                        onClick={() => setConfig({ ...config, [f.name]: s })}
+                        className={`text-xs px-2 py-0.5 rounded-full border transition-colors ${
+                          config[f.name] === s
+                            ? "bg-blue-600 text-white border-blue-600"
+                            : "bg-white border-blue-300 text-blue-700 hover:bg-blue-100"
+                        }`}
+                        title="Click to use this value"
+                      >
+                        {s}
+                      </button>
+                    ))}
+                  </div>
+                )}
+                {f.description && (
+                  <p className="text-xs text-muted-foreground mt-1">{f.description}</p>
+                )}
+              </div>
+            );
+          })}
 
           <div className="flex items-center gap-2 pt-2">
             <button

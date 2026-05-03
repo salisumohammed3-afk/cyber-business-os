@@ -172,6 +172,7 @@ You're Sal's AI colleague and the master agent for this company. You have full r
 - \`run_schedule_now\` (manual fire of an existing schedule)
 - \`update_goal\` (current_value, target_value, status by title_match)
 - \`store_memory\` (fact + category)
+- \`update_agent\` / \`revert_agent\` (iterate teammates' system prompts/models when you spot a *pattern* — not a one-off mistake. Versioned and reversible. Only works on agents Sal has opted in via \`is_safe_auto_modify\`. Always provide a clear \`reason\`. ONE-OFF mistakes are NOT a reason; the signal must be a pattern across 2+ tasks. Use \`dry_run: true\` first if the change is non-trivial.)
 
 **Work-order proposals (\`[PROPOSE_WORK_ORDER]\`) — only for things with real-world side-effects:**
 - Building/editing deployed code or sites (engineering)
@@ -395,6 +396,41 @@ const CHAT_TOOLS = [
           description: "Agent slug (e.g. 'research', 'engineering') — returns latest completed task by that agent",
         },
       },
+    },
+  },
+  {
+    name: "update_agent",
+    description:
+      "Modify another agent's system_prompt, model, or description. Use when you spot a pattern — an agent " +
+      "consistently misses a step, needs sharper context, or could benefit from a tweaked instruction. " +
+      "Versioned and reversible. REQUIRES the target to have is_safe_auto_modify=true (Sal opts in per agent). " +
+      "Cannot modify the orchestrator. Always include a clear `reason` — it's permanently logged.",
+    input_schema: {
+      type: "object",
+      properties: {
+        agent_slug: { type: "string", description: "Target agent slug" },
+        system_prompt: { type: "string", description: "New system prompt (replaces existing)" },
+        model: { type: "string", description: "New model (e.g. claude-opus-4-7, claude-sonnet-4-6)" },
+        description: { type: "string", description: "New short description shown in /agents" },
+        reason: { type: "string", description: "Why this change — what pattern did you spot, what should improve" },
+        dry_run: { type: "boolean", description: "If true, return what WOULD change without writing. Default false." },
+      },
+      required: ["agent_slug", "reason"],
+    },
+  },
+  {
+    name: "revert_agent",
+    description:
+      "Roll an agent back to a previous version. Use when a recent update_agent didn't help or made things " +
+      "worse. Pass version_number to target a specific version, or omit to revert to the immediately-prior one.",
+    input_schema: {
+      type: "object",
+      properties: {
+        agent_slug: { type: "string" },
+        version_number: { type: "number", description: "Specific version to restore. Omit for the immediately-prior one." },
+        reason: { type: "string", description: "Why you're reverting" },
+      },
+      required: ["agent_slug", "reason"],
     },
   },
 ];
@@ -870,6 +906,220 @@ async function runReadAgentOutput(
   });
 }
 
+// ── Self-modification (chat orchestrator) ──────────────────────────────────
+//
+// Mirror of toolUpdateAgent / toolRevertAgent in runner.mjs. The chat
+// orchestrator runs in this Vercel function, runner.mjs runs on Railway —
+// both need the same surface for Sal to be able to ask "make growth more
+// careful with subject lines" from the chat.
+
+const ALLOWED_AGENT_MODELS = new Set([
+  "claude-opus-4-7",
+  "claude-opus-4-8",
+  "claude-sonnet-4-6",
+  "claude-sonnet-4-20250514",
+  "claude-sonnet-4-7",
+  "claude-haiku-4-5",
+  "claude-haiku-4-20250514",
+]);
+
+type AgentDefRow = {
+  id: string;
+  name: string;
+  slug: string;
+  system_prompt: string | null;
+  model: string | null;
+  description: string | null;
+  is_orchestrator: boolean | null;
+  is_safe_auto_modify: boolean | null;
+};
+
+async function loadModifiableAgent(
+  supabase: SupabaseClient,
+  companyId: string,
+  slug: string
+): Promise<{ agent?: AgentDefRow; error?: string }> {
+  const { data } = await supabase
+    .from("agent_definitions")
+    .select("id,name,slug,system_prompt,model,description,is_orchestrator,is_safe_auto_modify")
+    .eq("slug", slug)
+    .eq("company_id", companyId)
+    .maybeSingle();
+  const agent = data as AgentDefRow | null;
+  if (!agent) return { error: `Agent '${slug}' not found in this company` };
+  if (agent.is_orchestrator) return { error: "Refusing to modify the orchestrator — it would let it disable its own safety checks" };
+  if (!agent.is_safe_auto_modify) {
+    return { error: `Agent '${slug}' is not opted in to auto-modify. Sal must enable 'Allow orchestrator to modify' in /company-settings?tab=agents first.` };
+  }
+  return { agent };
+}
+
+function summariseAgentDiff(before: AgentDefRow, patch: { system_prompt?: string; model?: string; description?: string }): string {
+  const changes: string[] = [];
+  if (patch.system_prompt && patch.system_prompt !== before.system_prompt) {
+    changes.push(`system_prompt: ${(before.system_prompt || "").length} → ${patch.system_prompt.length} chars`);
+  }
+  if (patch.model && patch.model !== before.model) changes.push(`model: ${before.model} → ${patch.model}`);
+  if (patch.description !== undefined && patch.description !== before.description) changes.push("description updated");
+  return changes.join("; ") || "no effective change";
+}
+
+async function runUpdateAgent(
+  supabase: SupabaseClient,
+  companyId: string,
+  input: Record<string, unknown>
+): Promise<string> {
+  const slug = typeof input.agent_slug === "string" ? input.agent_slug.trim() : "";
+  if (!slug) return JSON.stringify({ error: "agent_slug is required" });
+
+  const reason = typeof input.reason === "string" ? input.reason.trim() : "";
+  if (reason.length < 10) {
+    return JSON.stringify({ error: "reason is required and must explain WHY (10+ chars). The reason is permanently logged." });
+  }
+
+  const { agent: target, error } = await loadModifiableAgent(supabase, companyId, slug);
+  if (error || !target) return JSON.stringify({ error });
+
+  const patch: { system_prompt?: string; model?: string; description?: string } = {};
+  if (typeof input.system_prompt === "string" && input.system_prompt.trim()) patch.system_prompt = input.system_prompt;
+  if (typeof input.model === "string" && input.model.trim()) {
+    if (!ALLOWED_AGENT_MODELS.has(input.model)) {
+      return JSON.stringify({ error: `Model '${input.model}' is not in the allowlist. Allowed: ${[...ALLOWED_AGENT_MODELS].join(", ")}` });
+    }
+    patch.model = input.model;
+  }
+  if (typeof input.description === "string") patch.description = input.description;
+
+  if (Object.keys(patch).length === 0) {
+    return JSON.stringify({ error: "Provide at least one of: system_prompt, model, description" });
+  }
+
+  const diffSummary = summariseAgentDiff(target, patch);
+
+  if (input.dry_run) {
+    return JSON.stringify({ dry_run: true, would_change: diffSummary, agent: target.name });
+  }
+
+  // Compute next version_number
+  const { data: latestRows } = await supabase
+    .from("agent_definition_versions")
+    .select("version_number")
+    .eq("agent_definition_id", target.id)
+    .order("version_number", { ascending: false })
+    .limit(1);
+  const nextVersion = ((latestRows?.[0] as { version_number?: number } | undefined)?.version_number || 0) + 1;
+
+  const snapshot = {
+    system_prompt: patch.system_prompt ?? target.system_prompt,
+    model: patch.model ?? target.model,
+    description: patch.description ?? target.description,
+  };
+
+  const { error: versionErr } = await supabase.from("agent_definition_versions").insert({
+    agent_definition_id: target.id,
+    company_id: companyId,
+    version_number: nextVersion,
+    system_prompt: snapshot.system_prompt,
+    model: snapshot.model,
+    description: snapshot.description,
+    modified_by: "orchestrator",
+    change_reason: reason,
+    diff_summary: diffSummary,
+  });
+  if (versionErr) return JSON.stringify({ error: `Failed to write version row: ${versionErr.message}` });
+
+  await supabase
+    .from("agent_definitions")
+    .update({ ...patch, updated_at: new Date().toISOString() })
+    .eq("id", target.id);
+
+  return JSON.stringify({
+    success: true,
+    agent: target.name,
+    version_number: nextVersion,
+    diff_summary: diffSummary,
+    revert_with: `revert_agent({agent_slug: "${target.slug}", version_number: ${nextVersion - 1}, reason: "..."})`,
+  });
+}
+
+async function runRevertAgent(
+  supabase: SupabaseClient,
+  companyId: string,
+  input: Record<string, unknown>
+): Promise<string> {
+  const slug = typeof input.agent_slug === "string" ? input.agent_slug.trim() : "";
+  if (!slug) return JSON.stringify({ error: "agent_slug is required" });
+  const reason = typeof input.reason === "string" ? input.reason.trim() : "";
+  if (reason.length < 5) return JSON.stringify({ error: "reason is required (5+ chars)" });
+
+  const { agent: target, error } = await loadModifiableAgent(supabase, companyId, slug);
+  if (error || !target) return JSON.stringify({ error });
+
+  type VersionRow = {
+    version_number: number;
+    system_prompt: string | null;
+    model: string | null;
+    description: string | null;
+  };
+
+  let targetVersion: VersionRow | null = null;
+  if (typeof input.version_number === "number") {
+    const { data } = await supabase
+      .from("agent_definition_versions")
+      .select("version_number,system_prompt,model,description")
+      .eq("agent_definition_id", target.id)
+      .eq("version_number", input.version_number)
+      .maybeSingle();
+    targetVersion = data as VersionRow | null;
+  } else {
+    const { data } = await supabase
+      .from("agent_definition_versions")
+      .select("version_number,system_prompt,model,description")
+      .eq("agent_definition_id", target.id)
+      .order("version_number", { ascending: false })
+      .limit(2);
+    targetVersion = ((data as VersionRow[] | null) || [])[1] || null;
+  }
+  if (!targetVersion) return JSON.stringify({ error: "No version found to revert to" });
+
+  await supabase
+    .from("agent_definitions")
+    .update({
+      system_prompt: targetVersion.system_prompt,
+      model: targetVersion.model,
+      description: targetVersion.description,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", target.id);
+
+  const { data: latestRows } = await supabase
+    .from("agent_definition_versions")
+    .select("version_number")
+    .eq("agent_definition_id", target.id)
+    .order("version_number", { ascending: false })
+    .limit(1);
+  const nextVersion = ((latestRows?.[0] as { version_number?: number } | undefined)?.version_number || 0) + 1;
+
+  await supabase.from("agent_definition_versions").insert({
+    agent_definition_id: target.id,
+    company_id: companyId,
+    version_number: nextVersion,
+    system_prompt: targetVersion.system_prompt,
+    model: targetVersion.model,
+    description: targetVersion.description,
+    modified_by: "orchestrator",
+    change_reason: `Revert to v${targetVersion.version_number}: ${reason}`,
+    diff_summary: `Reverted to v${targetVersion.version_number}`,
+  });
+
+  return JSON.stringify({
+    success: true,
+    agent: target.name,
+    reverted_to_version: targetVersion.version_number,
+    new_version_row: nextVersion,
+  });
+}
+
 async function runStoreMemory(
   supabase: SupabaseClient,
   companyId: string,
@@ -917,6 +1167,8 @@ async function runChatTool(
   if (name === "update_goal") return runUpdateGoal(supabase, companyId, input);
   if (name === "run_schedule_now") return runRunScheduleNow(supabase, companyId, input);
   if (name === "read_agent_output") return runReadAgentOutput(supabase, companyId, input);
+  if (name === "update_agent") return runUpdateAgent(supabase, companyId, input);
+  if (name === "revert_agent") return runRevertAgent(supabase, companyId, input);
   return JSON.stringify({ error: `Unknown tool: ${name}` });
 }
 

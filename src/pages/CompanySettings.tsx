@@ -267,39 +267,193 @@ function GoalsTab() {
 
 // ── Agents Tab ─────────────────────────────────────────────────────────────
 
+type AgentRow = {
+  id: string; name: string; slug: string; model: string; description: string;
+  is_orchestrator: boolean; system_prompt: string;
+  max_turns: number; temperature: number;
+  is_safe_auto_modify: boolean;
+};
+
+type VersionRow = {
+  id: string; version_number: number; system_prompt: string | null;
+  model: string | null; description: string | null;
+  modified_by: string; change_reason: string | null;
+  diff_summary: string | null; created_at: string;
+};
+
+function AgentVersionHistory({ agentId, agentSlug, currentVersionNumber, onReverted }: { agentId: string; agentSlug: string; currentVersionNumber: number | null; onReverted: () => void }) {
+  const [versions, setVersions] = useState<VersionRow[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [reverting, setReverting] = useState<number | null>(null);
+
+  const fetch = useCallback(async () => {
+    setLoading(true);
+    const { data } = await supabase
+      .from("agent_definition_versions")
+      .select("id, version_number, system_prompt, model, description, modified_by, change_reason, diff_summary, created_at")
+      .eq("agent_definition_id", agentId)
+      .order("version_number", { ascending: false })
+      .limit(20);
+    setVersions((data as VersionRow[]) || []);
+    setLoading(false);
+  }, [agentId]);
+
+  useEffect(() => { fetch(); }, [fetch]);
+
+  const revertTo = async (v: VersionRow) => {
+    if (!confirm(`Roll ${agentSlug} back to v${v.version_number}? This is reversible — a new version row will be appended.`)) return;
+    setReverting(v.version_number);
+    try {
+      // Apply the snapshot to the live row
+      await supabase.from("agent_definitions").update({
+        system_prompt: v.system_prompt,
+        model: v.model,
+        description: v.description,
+        updated_at: new Date().toISOString(),
+      }).eq("id", agentId);
+      // Append a new version row recording the revert
+      const nextVersion = (versions[0]?.version_number || 0) + 1;
+      await supabase.from("agent_definition_versions").insert({
+        agent_definition_id: agentId,
+        company_id: (await supabase.from("agent_definitions").select("company_id").eq("id", agentId).single()).data?.company_id,
+        version_number: nextVersion,
+        system_prompt: v.system_prompt,
+        model: v.model,
+        description: v.description,
+        modified_by: "sal",
+        change_reason: `Manual revert to v${v.version_number} via UI`,
+        diff_summary: `Reverted to v${v.version_number}`,
+      });
+      await fetch();
+      onReverted();
+    } finally {
+      setReverting(null);
+    }
+  };
+
+  if (loading) return <p className="text-xs text-muted-foreground">Loading history…</p>;
+  if (!versions.length) return <p className="text-xs text-muted-foreground">No version history yet.</p>;
+
+  return (
+    <div className="space-y-2 mt-2">
+      <p className="text-[11px] text-muted-foreground">Most-recent first. Reverting appends a new version — nothing is destroyed.</p>
+      {versions.map((v) => {
+        const isCurrent = v.version_number === currentVersionNumber;
+        return (
+          <div key={v.id} className="text-xs border rounded p-2 space-y-1 bg-secondary/20">
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2 min-w-0 flex-wrap">
+                <Badge variant={isCurrent ? "default" : "outline"} className="text-[10px]">v{v.version_number}{isCurrent ? " (current)" : ""}</Badge>
+                <span className="text-muted-foreground">{v.modified_by}</span>
+                <span className="text-muted-foreground">·</span>
+                <span className="text-muted-foreground">{new Date(v.created_at).toLocaleString("en-GB", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}</span>
+              </div>
+              {!isCurrent && (
+                <button
+                  onClick={() => revertTo(v)}
+                  disabled={reverting === v.version_number}
+                  className="text-[11px] px-2 py-0.5 rounded border hover:bg-secondary disabled:opacity-50 shrink-0"
+                >
+                  {reverting === v.version_number ? "Reverting…" : "Revert here"}
+                </button>
+              )}
+            </div>
+            {v.diff_summary && <div className="text-muted-foreground text-[11px]">{v.diff_summary}</div>}
+            {v.change_reason && <div className="text-foreground text-[11px] italic">"{v.change_reason}"</div>}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function AgentsTab() {
   const { company } = useCompany();
-  const [agents, setAgents] = useState<Array<{ id: string; name: string; slug: string; model: string; description: string; is_orchestrator: boolean; system_prompt: string; max_turns: number; temperature: number }>>([]);
+  const [agents, setAgents] = useState<AgentRow[]>([]);
   const [editingId, setEditingId] = useState<string | null>(null);
+  const [historyId, setHistoryId] = useState<string | null>(null);
   const [editPrompt, setEditPrompt] = useState("");
   const [editModel, setEditModel] = useState("");
+  const [latestVersionByAgent, setLatestVersionByAgent] = useState<Record<string, number>>({});
 
   const fetchAgents = useCallback(async () => {
     if (!company) return;
     const { data } = await supabase
       .from("agent_definitions")
-      .select("id, name, slug, model, description, is_orchestrator, system_prompt, max_turns, temperature")
+      .select("id, name, slug, model, description, is_orchestrator, system_prompt, max_turns, temperature, is_safe_auto_modify")
       .eq("company_id", company.id)
       .order("name");
     if (data) {
-      setAgents(data as typeof agents);
+      setAgents(data as AgentRow[]);
+      // Pull each agent's latest version number for the badge
+      const ids = (data as AgentRow[]).map(a => a.id);
+      if (ids.length) {
+        const { data: vs } = await supabase
+          .from("agent_definition_versions")
+          .select("agent_definition_id, version_number")
+          .in("agent_definition_id", ids)
+          .order("version_number", { ascending: false });
+        const latest: Record<string, number> = {};
+        (vs || []).forEach((v: { agent_definition_id: string; version_number: number }) => {
+          if (!(v.agent_definition_id in latest)) latest[v.agent_definition_id] = v.version_number;
+        });
+        setLatestVersionByAgent(latest);
+      }
     }
   }, [company]);
 
   useEffect(() => { fetchAgents() }, [fetchAgents]);
 
   const saveAgent = async (id: string) => {
+    const before = agents.find(a => a.id === id);
+    const newPrompt = editPrompt;
+    const newModel = editModel;
+    const promptChanged = before && before.system_prompt !== newPrompt;
+    const modelChanged = before && before.model !== newModel;
+    if (!promptChanged && !modelChanged) {
+      setEditingId(null);
+      return;
+    }
+
+    // Append a version row first so history is intact even if the live update fails
+    const nextVersion = (latestVersionByAgent[id] || 0) + 1;
+    await supabase.from("agent_definition_versions").insert({
+      agent_definition_id: id,
+      company_id: company?.id,
+      version_number: nextVersion,
+      system_prompt: newPrompt,
+      model: newModel,
+      description: before?.description,
+      modified_by: "sal",
+      change_reason: "Manual edit via UI",
+      diff_summary: [
+        promptChanged ? `system_prompt: ${(before?.system_prompt || "").length} → ${newPrompt.length} chars` : null,
+        modelChanged ? `model: ${before?.model} → ${newModel}` : null,
+      ].filter(Boolean).join("; "),
+    });
+
     await supabase.from("agent_definitions").update({
-      system_prompt: editPrompt,
-      model: editModel,
+      system_prompt: newPrompt,
+      model: newModel,
       updated_at: new Date().toISOString(),
     }).eq("id", id);
+
     setEditingId(null);
     fetchAgents();
   };
 
+  const toggleAutoModify = async (id: string, next: boolean) => {
+    await supabase.from("agent_definitions").update({
+      is_safe_auto_modify: next, updated_at: new Date().toISOString(),
+    }).eq("id", id);
+    setAgents(prev => prev.map(a => a.id === id ? { ...a, is_safe_auto_modify: next } : a));
+  };
+
   return (
     <div className="space-y-3 max-w-3xl">
+      <div className="text-xs text-muted-foreground bg-secondary/40 border rounded-md px-3 py-2">
+        <strong className="text-foreground">Auto-modify (opt-in per agent).</strong> When enabled, the orchestrator can iterate this agent's system prompt or model when it spots a recurring pattern — every change is versioned and shown below, so you can revert any change in one click. Default off. The orchestrator can never modify itself.
+      </div>
       {agents.map((a) => (
         <Card key={a.id}>
           <CardHeader className="pb-2">
@@ -308,6 +462,8 @@ function AgentsTab() {
                 <CardTitle className="text-sm">{a.name}</CardTitle>
                 <Badge variant="outline" className="text-xs">{a.slug}</Badge>
                 {a.is_orchestrator && <Badge className="text-xs">orchestrator</Badge>}
+                {latestVersionByAgent[a.id] && <Badge variant="secondary" className="text-[10px]">v{latestVersionByAgent[a.id]}</Badge>}
+                {a.is_safe_auto_modify && <Badge className="text-[10px] bg-violet-500/15 text-violet-700 hover:bg-violet-500/20">auto-modify on</Badge>}
               </div>
               <div className="flex items-center gap-2 text-xs text-muted-foreground shrink-0 flex-wrap">
                 <span className="whitespace-nowrap">{a.model?.split("-").slice(0, 2).join("-")}</span>
@@ -315,25 +471,52 @@ function AgentsTab() {
                 <button
                   onClick={() => {
                     setEditingId(editingId === a.id ? null : a.id);
+                    setHistoryId(null);
                     setEditPrompt(a.system_prompt || "");
-                    setEditModel(a.model || "claude-sonnet-4-20250514");
+                    setEditModel(a.model || "claude-sonnet-4-6");
                   }}
                   className="px-2 py-1 rounded border hover:bg-secondary"
                 >
                   {editingId === a.id ? "Close" : "Edit"}
+                </button>
+                <button
+                  onClick={() => { setHistoryId(historyId === a.id ? null : a.id); setEditingId(null); }}
+                  className="px-2 py-1 rounded border hover:bg-secondary"
+                >
+                  {historyId === a.id ? "Hide history" : "History"}
                 </button>
               </div>
             </div>
           </CardHeader>
           <CardContent className="pt-0">
             <p className="text-xs text-muted-foreground">{a.description}</p>
+            {!a.is_orchestrator && (
+              <label className="mt-2 flex items-center gap-2 text-xs cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={a.is_safe_auto_modify}
+                  onChange={(e) => toggleAutoModify(a.id, e.target.checked)}
+                  className="rounded"
+                />
+                <span>Allow orchestrator to modify this agent's prompt/model when it spots a pattern</span>
+              </label>
+            )}
+            {historyId === a.id && (
+              <AgentVersionHistory
+                agentId={a.id}
+                agentSlug={a.slug}
+                currentVersionNumber={latestVersionByAgent[a.id] || null}
+                onReverted={fetchAgents}
+              />
+            )}
             {editingId === a.id && (
               <div className="mt-3 space-y-3 border-t pt-3">
                 <div>
                   <label className="text-xs font-medium">Model</label>
                   <select value={editModel} onChange={(e) => setEditModel(e.target.value)} className="mt-1 w-full rounded border px-2 py-1.5 text-sm">
-                    <option value="claude-sonnet-4-20250514">Claude Sonnet 4</option>
-                    <option value="claude-opus-4-20250514">Claude Opus 4</option>
+                    <option value="claude-sonnet-4-6">Claude Sonnet 4.6</option>
+                    <option value="claude-opus-4-7">Claude Opus 4.7</option>
+                    <option value="claude-haiku-4-5">Claude Haiku 4.5</option>
                   </select>
                 </div>
                 <div>

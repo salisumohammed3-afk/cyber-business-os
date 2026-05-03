@@ -357,6 +357,43 @@ const BASE_TOOLS = [
     },
   },
   {
+    name: "update_agent",
+    description:
+      "Modify another agent's system_prompt, model, or description. Use when you spot a pattern — an agent " +
+      "consistently misses a step, needs more context about the company, or could benefit from a sharper " +
+      "instruction. The change is versioned and reversible. REQUIRES the target agent to have " +
+      "is_safe_auto_modify=true (Sal opts in per-agent). Cannot modify the orchestrator. " +
+      "Always include a clear `reason` — it's permanently logged.",
+    input_schema: {
+      type: "object",
+      properties: {
+        agent_slug: { type: "string", description: "Target agent slug (research, engineering, designer, growth, etc.)" },
+        system_prompt: { type: "string", description: "New system prompt (replaces existing)" },
+        model: { type: "string", description: "New model (e.g. claude-opus-4-7, claude-sonnet-4-6)" },
+        description: { type: "string", description: "New short description shown in /agents" },
+        reason: { type: "string", description: "Why this change — what pattern did you spot, what should improve" },
+        dry_run: { type: "boolean", description: "If true, return what WOULD change without writing. Default false." },
+      },
+      required: ["agent_slug", "reason"],
+    },
+  },
+  {
+    name: "revert_agent",
+    description:
+      "Roll an agent back to a previous version. Use after a recent update_agent that didn't help, or " +
+      "if a specialist's behaviour got worse. Pass version_number to target a specific version, or omit " +
+      "to revert to the immediately-prior one.",
+    input_schema: {
+      type: "object",
+      properties: {
+        agent_slug: { type: "string" },
+        version_number: { type: "number", description: "Specific version to restore. Omit to use the immediately-prior version." },
+        reason: { type: "string", description: "Why you're reverting" },
+      },
+      required: ["agent_slug", "reason"],
+    },
+  },
+  {
     name: "project_query",
     description: "Query the Projects database (agent-built projects). Tables are prefixed with company slug.",
     input_schema: {
@@ -620,6 +657,8 @@ async function executeTool(name, input) {
       case "update_goal_progress": return await toolUpdateGoalProgress(input);
       case "read_agent_output":  return await toolReadAgentOutput(input);
       case "message_agent":      return await toolMessageAgent(input);
+      case "update_agent":       return await toolUpdateAgent(input);
+      case "revert_agent":       return await toolRevertAgent(input);
       case "delegate_task":      return await toolDelegateTask(input);
       case "project_query":      return await toolProjectQuery(input);
       case "database_admin":     return await toolDatabaseAdmin(input);
@@ -1185,6 +1224,202 @@ async function toolMessageAgent(input) {
   });
   if (!result) return JSON.stringify({ error: "Failed to send message" });
   return JSON.stringify({ success: true, sent_to: targetAgent.name, urgency: input.urgency || "fyi" });
+}
+
+// ── Self-modification tools (orchestrator) ─────────────────────────────────
+//
+// update_agent + revert_agent let the orchestrator improve teammates over time.
+// Every change is versioned in agent_definition_versions, so any mistake is one
+// click away from being undone. Three guards:
+//   1) Target agent must have is_safe_auto_modify = true (Sal opts in per agent)
+//   2) Cannot modify the orchestrator itself
+//   3) reason is required and logged forever
+
+const ALLOWED_AGENT_MODELS = new Set([
+  "claude-opus-4-7",
+  "claude-opus-4-8",
+  "claude-sonnet-4-6",
+  "claude-sonnet-4-20250514",
+  "claude-sonnet-4-7",
+  "claude-haiku-4-5",
+  "claude-haiku-4-20250514",
+]);
+
+async function loadModifiableAgent(slug) {
+  const target = await sbGet("agent_definitions", {
+    slug: "eq." + slug, company_id: "eq." + companyId,
+  }, { select: "id,name,slug,system_prompt,model,description,is_orchestrator,is_safe_auto_modify", single: true });
+  if (!target) return { error: `Agent '${slug}' not found in this company` };
+  if (target.is_orchestrator) return { error: "Refusing to modify the orchestrator — it would let it disable its own safety checks" };
+  if (!target.is_safe_auto_modify) return { error: `Agent '${slug}' is not opted in to auto-modify. Sal must enable 'Allow orchestrator to modify' in /company-settings?tab=agents first.` };
+  return { agent: target };
+}
+
+function summariseAgentDiff(before, patch) {
+  const changes = [];
+  if (patch.system_prompt && patch.system_prompt !== before.system_prompt) {
+    const beforeLen = (before.system_prompt || "").length;
+    const afterLen = patch.system_prompt.length;
+    changes.push(`system_prompt: ${beforeLen} → ${afterLen} chars`);
+  }
+  if (patch.model && patch.model !== before.model) changes.push(`model: ${before.model} → ${patch.model}`);
+  if (patch.description !== undefined && patch.description !== before.description) changes.push("description updated");
+  return changes.join("; ") || "no effective change";
+}
+
+async function toolUpdateAgent(input) {
+  if (!input.agent_slug) return JSON.stringify({ error: "agent_slug is required" });
+  if (!input.reason || String(input.reason).trim().length < 10) {
+    return JSON.stringify({ error: "reason is required and must explain WHY (10+ chars). The reason is permanently logged." });
+  }
+
+  const { agent: target, error } = await loadModifiableAgent(input.agent_slug);
+  if (error) return JSON.stringify({ error });
+
+  // Build patch — only fields actually provided
+  const patch = {};
+  if (typeof input.system_prompt === "string" && input.system_prompt.trim()) patch.system_prompt = input.system_prompt;
+  if (typeof input.model === "string" && input.model.trim()) {
+    if (!ALLOWED_AGENT_MODELS.has(input.model)) {
+      return JSON.stringify({ error: `Model '${input.model}' is not in the allowlist. Allowed: ${[...ALLOWED_AGENT_MODELS].join(", ")}` });
+    }
+    patch.model = input.model;
+  }
+  if (typeof input.description === "string") patch.description = input.description;
+
+  if (Object.keys(patch).length === 0) {
+    return JSON.stringify({ error: "Provide at least one of: system_prompt, model, description" });
+  }
+
+  const diffSummary = summariseAgentDiff(target, patch);
+
+  if (input.dry_run) {
+    return JSON.stringify({ dry_run: true, would_change: diffSummary, agent: target.name, current_version_will_be: "next version after writes" });
+  }
+
+  // Read latest version_number to compute next
+  const latestVersions = await sbGet("agent_definition_versions", {
+    agent_definition_id: "eq." + target.id,
+    select: "version_number",
+    order: "version_number.desc",
+    limit: "1",
+  });
+  const nextVersion = (latestVersions?.[0]?.version_number || 0) + 1;
+
+  // Compose post-patch snapshot for the version row
+  const snapshot = {
+    system_prompt: patch.system_prompt ?? target.system_prompt,
+    model: patch.model ?? target.model,
+    description: patch.description ?? target.description,
+  };
+
+  const versionRow = await sbInsert("agent_definition_versions", {
+    agent_definition_id: target.id,
+    company_id: companyId,
+    version_number: nextVersion,
+    system_prompt: snapshot.system_prompt,
+    model: snapshot.model,
+    description: snapshot.description,
+    modified_by: agentSlug === "orchestrator" ? "orchestrator" : `specialist:${agentSlug}`,
+    modified_by_task_id: TASK_ID,
+    change_reason: input.reason,
+    diff_summary: diffSummary,
+  });
+  if (!versionRow) return JSON.stringify({ error: "Failed to insert version row — aborted before mutating agent" });
+
+  // Apply the patch to the live agent
+  await sbPatch("agent_definitions", { ...patch, updated_at: new Date().toISOString() }, { id: "eq." + target.id });
+
+  await log(`update_agent: ${target.slug} → v${nextVersion} (${diffSummary}). Reason: ${input.reason}`, "agent_config_changed", {
+    target_agent_id: target.id,
+    target_slug: target.slug,
+    version_number: nextVersion,
+    diff_summary: diffSummary,
+  });
+
+  return JSON.stringify({
+    success: true,
+    agent: target.name,
+    version_number: nextVersion,
+    diff_summary: diffSummary,
+    revert_with: `revert_agent({agent_slug: "${target.slug}", version_number: ${nextVersion - 1}, reason: "..."})`,
+  });
+}
+
+async function toolRevertAgent(input) {
+  if (!input.agent_slug) return JSON.stringify({ error: "agent_slug is required" });
+  if (!input.reason || String(input.reason).trim().length < 5) {
+    return JSON.stringify({ error: "reason is required (5+ chars)" });
+  }
+
+  const { agent: target, error } = await loadModifiableAgent(input.agent_slug);
+  if (error) return JSON.stringify({ error });
+
+  // Find target version. If not specified, use the immediately-prior one.
+  let targetVersion;
+  if (typeof input.version_number === "number") {
+    const rows = await sbGet("agent_definition_versions", {
+      agent_definition_id: "eq." + target.id,
+      version_number: "eq." + input.version_number,
+      select: "*",
+      single: true,
+    });
+    targetVersion = rows;
+  } else {
+    const all = await sbGet("agent_definition_versions", {
+      agent_definition_id: "eq." + target.id,
+      select: "*",
+      order: "version_number.desc",
+      limit: "2",
+    });
+    targetVersion = all?.[1]; // [0] is current, [1] is prior
+  }
+  if (!targetVersion) return JSON.stringify({ error: "No version found to revert to" });
+
+  // Apply the version's snapshot back to live row
+  const restorePatch = {
+    system_prompt: targetVersion.system_prompt,
+    model: targetVersion.model,
+    description: targetVersion.description,
+    updated_at: new Date().toISOString(),
+  };
+  await sbPatch("agent_definitions", restorePatch, { id: "eq." + target.id });
+
+  // Log the revert as a NEW version row (history is append-only — no rewrites)
+  const latestVersions = await sbGet("agent_definition_versions", {
+    agent_definition_id: "eq." + target.id,
+    select: "version_number",
+    order: "version_number.desc",
+    limit: "1",
+  });
+  const nextVersion = (latestVersions?.[0]?.version_number || 0) + 1;
+
+  await sbInsert("agent_definition_versions", {
+    agent_definition_id: target.id,
+    company_id: companyId,
+    version_number: nextVersion,
+    system_prompt: targetVersion.system_prompt,
+    model: targetVersion.model,
+    description: targetVersion.description,
+    modified_by: agentSlug === "orchestrator" ? "orchestrator" : `specialist:${agentSlug}`,
+    modified_by_task_id: TASK_ID,
+    change_reason: `Revert to v${targetVersion.version_number}: ${input.reason}`,
+    diff_summary: `Reverted to v${targetVersion.version_number}`,
+  });
+
+  await log(`revert_agent: ${target.slug} → v${targetVersion.version_number} (logged as v${nextVersion}). Reason: ${input.reason}`, "agent_config_changed", {
+    target_agent_id: target.id,
+    target_slug: target.slug,
+    reverted_to_version: targetVersion.version_number,
+    new_version_row: nextVersion,
+  });
+
+  return JSON.stringify({
+    success: true,
+    agent: target.name,
+    reverted_to_version: targetVersion.version_number,
+    new_version_row: nextVersion,
+  });
 }
 
 const MAX_DELEGATION_DEPTH = 4;
@@ -2372,6 +2607,18 @@ async function main() {
       "Use `message_agent({target_agent, message, urgency})` to leave context for another agent's next run — " +
       "lighter than `delegate_task`, useful for FYIs and small handoffs. The message arrives as a memory the target sees on its next task.\n\n" +
       "Use `update_goal_progress({goal_title, new_value, note})` when concrete work moves a company goal's metric.\n\n" +
+      "## Iterating the team — `update_agent` / `revert_agent`\n" +
+      "You're allowed to improve other agents over time. When you notice a *pattern* — research keeps " +
+      "skipping citations, growth doesn't tag campaigns properly, designer ignores the brand colour palette — " +
+      "you can update that agent's system_prompt or model directly with `update_agent({agent_slug, system_prompt|model|description, reason})`.\n\n" +
+      "Rules of thumb:\n" +
+      "- ONE-OFF mistakes are NOT a reason to mutate a prompt. The signal must be a pattern across 2+ tasks, or a glaring oversight in the existing prompt.\n" +
+      "- ALWAYS pass `dry_run: true` first to see the diff, unless the change is trivial (e.g. fixing a typo).\n" +
+      "- ALWAYS write a `reason` that makes the next reader (Sal, future you) understand WHY. \"Improving prompt\" is not a reason. \"Research kept ignoring competitor pricing — added explicit instruction to extract pricing in dollars\" is a reason.\n" +
+      "- Only agents with `is_safe_auto_modify=true` are mutable. The tool will reject otherwise. Do not nag Sal to opt agents in — he'll do it when he's ready.\n" +
+      "- You CANNOT modify yourself. The orchestrator's identity is fixed by Sal.\n" +
+      "- If a change you made doesn't help — or makes things worse — call `revert_agent({agent_slug, reason})` to roll it back. Every change is logged in `agent_definition_versions`; nothing is destroyed.\n" +
+      "- After a meaningful change, store a memory describing what you tried and why, so you can iterate later instead of repeating yourself.\n\n" +
       "If a tool you expect to have is missing, that's a bug to flag — do not invent workarounds that fake the answer.";
   }
 
@@ -2425,6 +2672,10 @@ async function main() {
       // and pass messages between agents. Without these, every follow-up question forces
       // the user to re-paste content the system already has.
       "read_agent_output", "message_agent", "update_goal_progress",
+      // Self-modification: orchestrator can iterate other agents' prompts/models when it
+      // spots a recurring problem. Gated by agent_definitions.is_safe_auto_modify (opt-in)
+      // and protected by the version log so any change is one click away from rollback.
+      "update_agent", "revert_agent",
     ];
     tools = BASE_TOOLS.filter(t => ORCHESTRATOR_ONLY.includes(t.name));
     tools.push(MANAGE_INTEGRATIONS_TOOL);

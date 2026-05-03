@@ -363,12 +363,22 @@ const BASE_TOOLS = [
       "consistently misses a step, needs more context about the company, or could benefit from a sharper " +
       "instruction. The change is versioned and reversible. REQUIRES the target agent to have " +
       "is_safe_auto_modify=true (Sal opts in per-agent). Cannot modify the orchestrator. " +
-      "Always include a clear `reason` — it's permanently logged.",
+      "Always include a clear `reason` — it's permanently logged.\n\n" +
+      "system_prompt_mode controls how `system_prompt` is interpreted:\n" +
+      "  - 'replace' (default): becomes the entire prompt. Use for full rewrites.\n" +
+      "  - 'append': appended to existing prompt (with separator). Use for additive rules.\n" +
+      "  - 'prepend': prepended to existing prompt. Use for new top-level identity.\n" +
+      "For incremental tweaks, ALWAYS use 'append'.",
     input_schema: {
       type: "object",
       properties: {
         agent_slug: { type: "string", description: "Target agent slug (research, engineering, designer, growth, etc.)" },
-        system_prompt: { type: "string", description: "New system prompt (replaces existing)" },
+        system_prompt: { type: "string", description: "Prompt content (interpreted by system_prompt_mode)" },
+        system_prompt_mode: {
+          type: "string",
+          enum: ["replace", "append", "prepend"],
+          description: "How to apply system_prompt. Default 'replace'. Use 'append' for additive tweaks.",
+        },
         model: { type: "string", description: "New model (e.g. claude-opus-4-7, claude-sonnet-4-6)" },
         description: { type: "string", description: "New short description shown in /agents" },
         reason: { type: "string", description: "Why this change — what pattern did you spot, what should improve" },
@@ -1278,7 +1288,20 @@ async function toolUpdateAgent(input) {
 
   // Build patch — only fields actually provided
   const patch = {};
-  if (typeof input.system_prompt === "string" && input.system_prompt.trim()) patch.system_prompt = input.system_prompt;
+  if (typeof input.system_prompt === "string" && input.system_prompt.trim()) {
+    const incoming = input.system_prompt;
+    const mode = input.system_prompt_mode === "append" || input.system_prompt_mode === "prepend"
+      ? input.system_prompt_mode
+      : "replace";
+    const existing = target.system_prompt || "";
+    if (mode === "append") {
+      patch.system_prompt = existing ? `${existing}\n\n---\n\n${incoming}` : incoming;
+    } else if (mode === "prepend") {
+      patch.system_prompt = existing ? `${incoming}\n\n---\n\n${existing}` : incoming;
+    } else {
+      patch.system_prompt = incoming;
+    }
+  }
   if (typeof input.model === "string" && input.model.trim()) {
     if (!ALLOWED_AGENT_MODELS.has(input.model)) {
       return JSON.stringify({ error: `Model '${input.model}' is not in the allowlist. Allowed: ${[...ALLOWED_AGENT_MODELS].join(", ")}` });

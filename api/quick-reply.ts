@@ -216,7 +216,7 @@ You're Sal's AI colleague and the master agent for this company. You have full r
 - \`run_schedule_now\` (manual fire of an existing schedule)
 - \`update_goal\` (current_value, target_value, status by title_match)
 - \`store_memory\` (fact + category)
-- \`update_agent\` / \`revert_agent\` (iterate teammates' system prompts/models when you spot a *pattern* — not a one-off mistake. Versioned and reversible. Only works on agents Sal has opted in via \`is_safe_auto_modify\`. Always provide a clear \`reason\`. ONE-OFF mistakes are NOT a reason; the signal must be a pattern across 2+ tasks. Use \`dry_run: true\` first if the change is non-trivial.)
+- \`update_agent\` / \`revert_agent\` (iterate teammates' system prompts/models when you spot a *pattern* — not a one-off mistake. Versioned and reversible. Only works on agents Sal has opted in via \`is_safe_auto_modify\`. Always provide a clear \`reason\`. ONE-OFF mistakes are NOT a reason; the signal must be a pattern across 2+ tasks. Use \`dry_run: true\` first if the change is non-trivial. **For incremental tweaks always pass \`system_prompt_mode: "append"\`** — default 'replace' destroys the existing prompt. **Before any update_agent call, run \`query_state({type:"agents",search:"<slug>"})\` so you know the current state — never modify blind.**)
 
 **Work-order proposals (\`[PROPOSE_WORK_ORDER]\`) — only for things with real-world side-effects:**
 - Building/editing deployed code or sites (engineering)
@@ -281,13 +281,13 @@ const CHAT_TOOLS = [
   },
   {
     name: "query_state",
-    description: "Look up current business state (tasks, memories, goals, or schedules) when the user asks about status, history, or what's happening. Returns JSON.",
+    description: "Look up current business state (tasks, memories, goals, schedules, or agents) when the user asks about status, history, what's happening, or the team's current configuration. Returns JSON. For agents, returns each one's slug, system_prompt, model, description, and is_safe_auto_modify — read this BEFORE calling update_agent so you know what you're about to change.",
     input_schema: {
       type: "object",
       properties: {
         type: {
           type: "string",
-          enum: ["tasks", "memories", "goals", "schedules"],
+          enum: ["tasks", "memories", "goals", "schedules", "agents"],
           description: "What to query",
         },
         status: {
@@ -448,12 +448,22 @@ const CHAT_TOOLS = [
       "Modify another agent's system_prompt, model, or description. Use when you spot a pattern — an agent " +
       "consistently misses a step, needs sharper context, or could benefit from a tweaked instruction. " +
       "Versioned and reversible. REQUIRES the target to have is_safe_auto_modify=true (Sal opts in per agent). " +
-      "Cannot modify the orchestrator. Always include a clear `reason` — it's permanently logged.",
+      "Cannot modify the orchestrator. Always include a clear `reason` — it's permanently logged.\n\n" +
+      "system_prompt_mode controls how `system_prompt` is interpreted:\n" +
+      "  - 'replace' (default): your `system_prompt` becomes the entire prompt. Use for full rewrites.\n" +
+      "  - 'append': your `system_prompt` is appended to the existing one (with a newline + section divider). Use for additive rules.\n" +
+      "  - 'prepend': your `system_prompt` is prepended to the existing one. Use for new top-level identity.\n" +
+      "Default 'replace' is destructive — for incremental tweaks, ALWAYS use 'append'.",
     input_schema: {
       type: "object",
       properties: {
         agent_slug: { type: "string", description: "Target agent slug" },
-        system_prompt: { type: "string", description: "New system prompt (replaces existing)" },
+        system_prompt: { type: "string", description: "Prompt content (interpreted by system_prompt_mode)" },
+        system_prompt_mode: {
+          type: "string",
+          enum: ["replace", "append", "prepend"],
+          description: "How to apply system_prompt. Default 'replace'. Use 'append' for additive tweaks.",
+        },
         model: { type: "string", description: "New model (e.g. claude-opus-4-7, claude-sonnet-4-6)" },
         description: { type: "string", description: "New short description shown in /agents" },
         reason: { type: "string", description: "Why this change — what pattern did you spot, what should improve" },
@@ -573,6 +583,22 @@ async function runQueryState(
         .limit(limit);
       if (error) return JSON.stringify({ error: error.message });
       return JSON.stringify({ schedules: data || [] });
+    }
+    if (type === "agents") {
+      // Returns each specialist's current prompt + model + auto-modify flag.
+      // Read this BEFORE calling update_agent so you know what you're patching.
+      const { data, error } = await supabase
+        .from("agent_definitions")
+        .select("id,name,slug,description,model,system_prompt,is_orchestrator,is_safe_auto_modify")
+        .eq("company_id", companyId)
+        .order("name");
+      if (error) return JSON.stringify({ error: error.message });
+      // Filter by slug if requested (lets the orchestrator narrow to one agent without re-fetching all)
+      const slug = typeof input.search === "string" ? input.search.trim().toLowerCase() : "";
+      const rows = slug
+        ? (data || []).filter((a: { slug: string }) => a.slug === slug)
+        : (data || []);
+      return JSON.stringify({ agents: rows });
     }
     return JSON.stringify({ error: `Unknown type: ${type}` });
   } catch (err: unknown) {
@@ -1025,7 +1051,24 @@ async function runUpdateAgent(
   if (error || !target) return JSON.stringify({ error });
 
   const patch: { system_prompt?: string; model?: string; description?: string } = {};
-  if (typeof input.system_prompt === "string" && input.system_prompt.trim()) patch.system_prompt = input.system_prompt;
+  if (typeof input.system_prompt === "string" && input.system_prompt.trim()) {
+    const incoming = input.system_prompt;
+    const mode = input.system_prompt_mode === "append" || input.system_prompt_mode === "prepend"
+      ? input.system_prompt_mode
+      : "replace";
+    const existing = target.system_prompt || "";
+    if (mode === "append") {
+      patch.system_prompt = existing
+        ? `${existing}\n\n---\n\n${incoming}`
+        : incoming;
+    } else if (mode === "prepend") {
+      patch.system_prompt = existing
+        ? `${incoming}\n\n---\n\n${existing}`
+        : incoming;
+    } else {
+      patch.system_prompt = incoming;
+    }
+  }
   if (typeof input.model === "string" && input.model.trim()) {
     if (!ALLOWED_AGENT_MODELS.has(input.model)) {
       return JSON.stringify({ error: `Model '${input.model}' is not in the allowlist. Allowed: ${[...ALLOWED_AGENT_MODELS].join(", ")}` });

@@ -2361,6 +2361,20 @@ async function main() {
     "After completing significant work, store key findings, decisions, and learnings using `store_memory` — your future self and teammates will use them. " +
     "Scopes: mine (default, your own memories), team (all agents), agent:<slug> (specific teammate).";
 
+  if (agentSlug === "orchestrator") {
+    operationalRules +=
+      "\n\n## Cross-task awareness — you ARE the team lead\n" +
+      "When a specialist completes a task, the deliverable lives in `task_results`. " +
+      "Use `read_agent_output({task_id})` to fetch a specific task's output, or " +
+      "`read_agent_output({agent_slug: \"research\"})` for the most-recent completed task by that agent. " +
+      "NEVER tell Sal you can't see a result — look it up first. " +
+      "If Sal asks 'what did research find?', call `read_agent_output({agent_slug: \"research\"})` and summarise.\n\n" +
+      "Use `message_agent({target_agent, message, urgency})` to leave context for another agent's next run — " +
+      "lighter than `delegate_task`, useful for FYIs and small handoffs. The message arrives as a memory the target sees on its next task.\n\n" +
+      "Use `update_goal_progress({goal_title, new_value, note})` when concrete work moves a company goal's metric.\n\n" +
+      "If a tool you expect to have is missing, that's a bug to flag — do not invent workarounds that fake the answer.";
+  }
+
   if (agentSlug === "engineering") {
     // Prepend engineering identity to the first block
     systemBlocks[0] = { type: "text", text: "You are the Engineering Agent. You build things and deliver working products.\n\n" + systemBlocks[0].text, cache_control: CACHE };
@@ -2403,7 +2417,15 @@ async function main() {
   // 6. Select tools for this agent
   let tools;
   if (agentSlug === "orchestrator") {
-    const ORCHESTRATOR_ONLY = ["delegate_task", "create_task", "store_memory", "recall_memories", "database_query", "test_url", "fail_task"];
+    const ORCHESTRATOR_ONLY = [
+      "delegate_task", "create_task",
+      "store_memory", "recall_memories",
+      "database_query", "test_url", "fail_task",
+      // Cross-task awareness: orchestrator must be able to read what specialists delivered
+      // and pass messages between agents. Without these, every follow-up question forces
+      // the user to re-paste content the system already has.
+      "read_agent_output", "message_agent", "update_goal_progress",
+    ];
     tools = BASE_TOOLS.filter(t => ORCHESTRATOR_ONLY.includes(t.name));
     tools.push(MANAGE_INTEGRATIONS_TOOL);
   } else {
@@ -2468,12 +2490,14 @@ async function main() {
   // Vendor allowlist per work-order type. call_integration enforces this at
   // execution time too, but limiting in the prompt helps the model not even try.
   const WORK_ORDER_VENDOR_ALLOWLIST = {
-    research: new Set(["openai", "anthropic", "exa", "serper"]),
+    // Research can persist findings to docs/sheets/notion (read-write, scoped to company workspace).
+    // No money-moving or messaging — those stay locked out for this work order type.
+    research: new Set(["openai", "anthropic", "exa", "serper", "googledocs", "googlesheets", "notion"]),
     build_static_site: new Set(["github", "openai", "anthropic"]),
     edit_project: new Set(["github", "openai", "anthropic"]),
     send_outreach: new Set(["resend", "openai", "anthropic"]),
-    design_mockup: new Set(["openai", "anthropic"]),
-    meeting_admin: new Set(["openai", "anthropic"]),
+    design_mockup: new Set(["openai", "anthropic", "googledocs", "notion"]),
+    meeting_admin: new Set(["openai", "anthropic", "googledocs", "googlesheets", "notion"]),
   };
 
   const workOrder = task.metadata?.work_order;
@@ -2838,7 +2862,10 @@ async function main() {
             deliverables: deliverables.length > 0 ? deliverables : undefined,
           },
     });
-  } else {
+  } else if (task.source !== "internal" && CONVERSATION_ID) {
+    // Delegated task finished — post a compact notification card to chat so Sal sees it
+    // without having to navigate to Outputs. Internal/background tasks (proactive planner,
+    // digest, etc.) are suppressed to avoid chat spam.
     const notificationContent = finalStatus === "completed"
       ? formatNotification(agentSlug, task.title, finalText, deliverables)
       : finalText;
@@ -2852,8 +2879,11 @@ async function main() {
       metadata: {
         kind: "notification",
         notification: finalStatus === "completed",
+        // The chat renderer keys off event_type — without it the message silently drops.
+        event_type: finalStatus === "completed" ? "task_completed" : "task_failed",
         completed_task_id: TASK_ID,
         agent_slug: agentSlug,
+        duration_min: elapsedMin || undefined,
         deliverables: deliverables.length > 0 ? deliverables : undefined,
       },
     });
@@ -2886,35 +2916,9 @@ async function main() {
   // Agents can use store_memory explicitly during a run if there's something
   // worth remembering. Manual is fine; auto was noise.
 
-  // 12b. Post completion notification for proactive/background tasks
-  if (finalStatus === "completed" && task.source !== "internal" && isDelegated) {
-    try {
-      const summary = finalText.slice(0, 200) + (finalText.length > 200 ? "..." : "");
-      const taskDuration = task.started_at ? Math.round((Date.now() - new Date(task.started_at).getTime()) / 60000) : 0;
-
-      // Always notify via chat for proactive tasks
-      if (CONVERSATION_ID) {
-        await sbInsert("chat_messages", {
-          conversation_id: CONVERSATION_ID,
-          role: "system",
-          kind: "notification",
-          content: "\u2705 **Task completed: " + (task.title || "Untitled") + "**\n" + summary +
-            (deliverables.length > 0 ? "\n\nDeliverables: " + deliverables.map(d => d.url || d.type).join(", ") : ""),
-          timestamp: new Date().toISOString(),
-          metadata: {
-            kind: "notification",
-            notification: true,
-            event_type: "task_completed",
-            agent_slug: agentSlug,
-            task_id: TASK_ID,
-            duration_min: taskDuration,
-          },
-        });
-      }
-    } catch (notifyErr) {
-      await log("Notification failed (non-critical): " + (notifyErr.message || notifyErr), "notify_error");
-    }
-  }
+  // 12b. (Removed) Duplicate notification block \u2014 the else-branch above (line ~2864)
+  // already inserts a notification for delegated tasks with the correct event_type.
+  // Keeping two blocks meant Sal got the same completion message twice in chat.
 
   // 12c. Child tasks are already inserted as 'pending' by delegate_task.
   if (childTasks.length > 0) {

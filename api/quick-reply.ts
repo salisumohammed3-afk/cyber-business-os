@@ -163,6 +163,7 @@ You're Sal's AI colleague and the master agent for this company. You have full r
 **Read tools — use them aggressively, no permission needed:**
 - \`fetch_url\` — review websites, read public docs/articles
 - \`query_state\` — look up tasks / memories / goals / schedules from this company's DB
+- \`read_agent_output\` — read the full deliverable a specialist wrote for a completed task. **Use this whenever Sal asks "what did research find?", "show me the brief", "pull up that report" — never bounce him back to /outputs or claim you can't see it.** Call by \`agent_slug\` (latest by that agent) or \`task_id\` (specific).
 - \`call_integration\` — call any GET action on a connected vendor. ASC list_apps, list_builds, list_app_store_versions, list_customer_reviews. GitHub list_repos. Whatever's in the Connected External Services block.
 
 **Write tools — also use freely, no approval card needed (these are bounded admin within this company's own state, no money/external side-effects):**
@@ -189,6 +190,7 @@ You're Sal's AI colleague and the master agent for this company. You have full r
 - ❌ Proposing a work order to "research the App Store reviews for me" when you can just call \`call_integration({ vendor: "appstoreconnect", action: "list_customer_reviews", params: { app_id } })\` right now.
 - ❌ Asking permission to "look up tasks" or "check schedules" — just call \`query_state\` and answer.
 - ❌ Saying "I don't have access to X" — check Connected External Services first; if X is there, you DO have access.
+- ❌ Saying "I can't see what research found / I don't have access to that report" — call \`read_agent_output({ agent_slug: "research" })\` and READ IT. The deliverable is in task_results, that's exactly what this tool fetches.
 - ❌ Asking for confirmation before reversible state changes ("Are you sure you want to clear proposed tasks?") — just do it and report.
 
 ### Format reminders for proposals (when needed)
@@ -373,6 +375,25 @@ const CHAT_TOOLS = [
       properties: {
         schedule_id: { type: "string" },
         name_match: { type: "string" },
+      },
+    },
+  },
+  {
+    name: "read_agent_output",
+    description:
+      "Read the full deliverable a specialist wrote for a completed task. Use this when Sal asks 'what did " +
+      "research find?', 'show me the brief', 'pull up that report', or any time you need the actual content " +
+      "a specialist produced. Pass either task_id (specific task) or agent_slug (most-recent completed task " +
+      "by that agent: research, engineering, designer, growth, etc.). NEVER tell Sal you can't see a result " +
+      "without trying this tool first — the deliverable is in task_results, you just have to fetch it.",
+    input_schema: {
+      type: "object",
+      properties: {
+        task_id: { type: "string", description: "Specific task UUID — preferred when known" },
+        agent_slug: {
+          type: "string",
+          description: "Agent slug (e.g. 'research', 'engineering') — returns latest completed task by that agent",
+        },
       },
     },
   },
@@ -779,6 +800,76 @@ async function runRunScheduleNow(
   }
 }
 
+async function runReadAgentOutput(
+  supabase: SupabaseClient,
+  companyId: string,
+  input: Record<string, unknown>
+): Promise<string> {
+  const taskId = typeof input.task_id === "string" ? input.task_id.trim() : "";
+  const agentSlug = typeof input.agent_slug === "string" ? input.agent_slug.trim().toLowerCase() : "";
+  if (!taskId && !agentSlug) {
+    return JSON.stringify({ error: "Provide either task_id or agent_slug" });
+  }
+
+  // Resolve target task (single row, scoped to company)
+  let task: { id: string; title: string; status: string; completed_at: string | null; agent_definition_id: string | null } | null = null;
+  if (taskId) {
+    const { data } = await supabase
+      .from("tasks")
+      .select("id, title, status, completed_at, agent_definition_id")
+      .eq("id", taskId)
+      .eq("company_id", companyId)
+      .maybeSingle();
+    task = data;
+    if (!task) return JSON.stringify({ error: `Task ${taskId} not found in this company` });
+  } else {
+    // Find latest completed task by agent_slug
+    const { data: agent } = await supabase
+      .from("agent_definitions")
+      .select("id")
+      .eq("slug", agentSlug)
+      .eq("company_id", companyId)
+      .maybeSingle();
+    if (!agent) return JSON.stringify({ error: `Agent '${agentSlug}' not found in this company` });
+    const { data: tasks } = await supabase
+      .from("tasks")
+      .select("id, title, status, completed_at, agent_definition_id")
+      .eq("agent_definition_id", agent.id)
+      .eq("company_id", companyId)
+      .eq("status", "completed")
+      .order("completed_at", { ascending: false })
+      .limit(1);
+    task = tasks?.[0] || null;
+    if (!task) return JSON.stringify({ error: `No completed tasks found for agent '${agentSlug}'` });
+  }
+
+  // Fetch the actual deliverable from task_results
+  const { data: results } = await supabase
+    .from("task_results")
+    .select("data, created_at")
+    .eq("task_id", task.id)
+    .order("created_at", { ascending: false })
+    .limit(1);
+  if (!results?.length) return JSON.stringify({ error: `No result row for task ${task.id} (task may have failed before writing output)` });
+
+  const data = (results[0].data || {}) as Record<string, unknown>;
+  const response = typeof data.response === "string" ? data.response : "";
+  // Cap at 6KB to keep tool result tokens reasonable. Full output is also viewable in /outputs.
+  const truncated = response.length > 6000;
+  const responsePreview = truncated ? response.slice(0, 6000) + "\n\n[…truncated, " + (response.length - 6000) + " more chars in /outputs]" : response;
+
+  return JSON.stringify({
+    task_id: task.id,
+    title: task.title,
+    completed_at: task.completed_at,
+    agent_slug: agentSlug || undefined,
+    tools_used: Array.isArray(data.tools_used) ? data.tools_used : [],
+    response: responsePreview,
+    response_length: response.length,
+    truncated,
+  });
+}
+
 async function runStoreMemory(
   supabase: SupabaseClient,
   companyId: string,
@@ -825,6 +916,7 @@ async function runChatTool(
   if (name === "call_integration") return runCallIntegration(supabase, companyId, input);
   if (name === "update_goal") return runUpdateGoal(supabase, companyId, input);
   if (name === "run_schedule_now") return runRunScheduleNow(supabase, companyId, input);
+  if (name === "read_agent_output") return runReadAgentOutput(supabase, companyId, input);
   return JSON.stringify({ error: `Unknown tool: ${name}` });
 }
 

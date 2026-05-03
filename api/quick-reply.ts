@@ -137,6 +137,50 @@ interface WorkOrderProposal {
   preflight: { tool: string; status: "ready" | "missing" | "unknown"; note?: string }[];
 }
 
+// Heuristic: does this message ask the orchestrator to do strategic / briefing
+// work that warrants Opus 4.7 over Sonnet 4.6? The bar is "thinking that, if
+// botched, would have downstream cost across the team or a long-running task."
+//
+// Not a classifier — just patterns. Cheap (no model call) and biased toward
+// over-escalating, since the asymmetry favours that. A user can always
+// downgrade for an obvious chat-only turn by phrasing it as a question.
+const AGENT_SLUGS_RE = /\b(growth|research|engineering|designer|design|sales|outreach|browser|task[\s-]?management|executive[\s-]?assistant|orchestrator)\b/i;
+
+const STRATEGIC_INTENT_PATTERNS: RegExp[] = [
+  // Modifying / briefing another agent — anything that touches the team itself
+  /\b(update|modify|tweak|adjust|improve|sharpen|rewrite|fix|brief|reconfigure|configure|train|teach|coach|repurpose|repurpos|retune)\s+(the\s+)?(\w+\s+)?(agent|prompt|growth|research|engineering|designer|design|sales|outreach|browser|task[\s-]?management|executive[\s-]?assistant|orchestrator)/i,
+  // Multi-agent or system-level reasoning
+  /\b(reorg|restructure|reshape|reorganise|reorganize|rewire|redesign|overhaul)\b/i,
+  // Strategic planning / briefing language
+  /\b(plan\s+(a|the|our)\s+(campaign|launch|rollout|roadmap|strategy|approach)|kick\s*off|outline\s+a\s+plan|design\s+a\s+(strategy|workflow|process|pipeline))\b/i,
+  // Complex research/analysis briefing (vs. quick lookup)
+  /\b(deep\s*dive|long[-\s]form|comprehensive\s+(brief|analysis|report)|in[-\s]depth|full\s+analysis)\b/i,
+  // Explicit asks for substantive thinking
+  /\b(think\s+(carefully|hard|deeply)|figure\s+out\s+how|come\s+up\s+with\s+a\s+(plan|strategy|approach))\b/i,
+];
+
+function detectStrategicIntent(message: string): boolean {
+  if (!message || message.length < 12) return false;
+  const text = message.trim();
+
+  // Pattern 1: any of the strategic-intent regexes
+  for (const re of STRATEGIC_INTENT_PATTERNS) {
+    if (re.test(text)) return true;
+  }
+
+  // Pattern 2: an agent slug + a verb suggesting strategic action on it
+  // ("growth keeps using flat subject lines, can you do something about that")
+  const VERBS_NEAR_AGENT = /(make|teach|coach|train|tune|configure|fix|improve|push|brief|update|tweak|adjust)/i;
+  if (AGENT_SLUGS_RE.test(text) && VERBS_NEAR_AGENT.test(text)) return true;
+
+  // Pattern 3: long-form ask (300+ chars) — usually means real briefing work
+  // rather than quick chat. Same threshold the runner uses for "this is
+  // probably a real ask" routing.
+  if (text.length > 300) return true;
+
+  return false;
+}
+
 function checkRateLimit(companyId: string): boolean {
   const now = Date.now();
   const timestamps = rateLimitMap.get(companyId) || [];
@@ -1524,16 +1568,24 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     // so DB changes for runner/agent quality don't drift chat back to Opus on
     // every keystroke):
     //
-    //   default        → Sonnet 4.6 (fast, plenty smart for tool routing + admin)
-    //   "/think ..."   → Opus 4.7   (deep reasoning when Sal explicitly asks)
+    //   default                         → Sonnet 4.6 (fast, plenty smart for tool routing + admin)
+    //   "/think ..."                    → Opus 4.7   (deep reasoning when Sal explicitly asks)
+    //   strategic / briefing intent     → Opus 4.7   (auto-escalation, see detectStrategicIntent)
     //
-    // Specialist agents running as work orders use Opus 4.7 from
-    // agent_definitions.model — the heavy thinking happens THERE, not in the
-    // tight chat loop.
+    // Why auto-escalate: when Sal asks the orchestrator to brief another agent,
+    // rewrite a prompt, plan a campaign, or do real strategic reasoning, a
+    // chat-fast model could ship a half-baked decision that costs us a week of
+    // bad agent behaviour. Opus for the briefing step itself; chat replies stay
+    // on Sonnet. Asymmetric risk: an Opus chat reply is mildly slower; a Sonnet
+    // brief that lobotomises an agent costs much more to fix.
+    //
+    // Specialist agents running as work orders already use Opus 4.7 from
+    // agent_definitions.model.
     const SONNET_DEFAULT = "claude-sonnet-4-6";
     const OPUS_DEEP = "claude-opus-4-7";
     const wantsDeep = /^\s*\/think\s+/i.test(message);
-    const model = wantsDeep ? OPUS_DEEP : SONNET_DEFAULT;
+    const strategicIntent = !wantsDeep && detectStrategicIntent(message);
+    const model = wantsDeep || strategicIntent ? OPUS_DEEP : SONNET_DEFAULT;
     if (wantsDeep) {
       // Strip the /think prefix from the user's message that the LLM sees so it
       // doesn't try to interpret it as a literal command.
@@ -1925,11 +1977,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         kind: "reply",
         model,
         deep_think: wantsDeep || undefined,
+        auto_escalated: strategicIntent || undefined,
         tool_turns: toolTurns,
       },
     });
 
-    return res.status(200).json({ mode: "direct", tool_turns: toolTurns, model });
+    return res.status(200).json({ mode: "direct", tool_turns: toolTurns, model, auto_escalated: strategicIntent });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error("quick-reply error:", msg);

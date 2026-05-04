@@ -308,50 +308,99 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
 
     // ── Create / upsert ─────────────────────────────────────────────────────
+    // Two paths:
+    //   1) Registered vendor (in vendor-registry.ts): metadata fills auto.
+    //   2) Custom vendor (anything else, e.g. Mirage, OpenRouter, your.app):
+    //      caller supplies auth_type, base_url, optional auth_header_name +
+    //      auth_header_template, optional actions[]. Stored as a self-describing
+    //      row exactly like a registered one — call_integration / runner work
+    //      against the row, not the registry.
     if (req.method === "POST") {
       const body = req.body || {};
       const { company_id, vendor, credentials, config, display_name } = body;
       if (!company_id || !vendor)
         return res.status(400).json({ error: "company_id and vendor are required" });
+
       const def = getVendor(vendor);
-      if (!def) return res.status(400).json({ error: `Unknown vendor: ${vendor}` });
-
-      // Validate required credential fields
       const creds = (credentials && typeof credentials === "object") ? credentials : {};
-      for (const f of def.credentials) {
-        if (f.required && !creds[f.name])
-          return res.status(400).json({ error: `Missing required credential: ${f.label}` });
-      }
 
-      const encrypted = encryptCredentials(creds);
-      // For static-key vendors, mask the secret. For App Store Connect (jwt_es256),
-      // show the (non-secret) Key ID as the preview — the .p8 isn't useful as a label.
-      const previewSrc = String(
-        creds.key || creds.token || creds.password || creds.key_id || ""
-      );
-      const preview = previewSrc
-        ? (def.auth_type === "jwt_es256" ? `Key ID: ${previewSrc}` : maskCredential(previewSrc))
-        : null;
+      let auth_type: string;
+      let resolvedConfig: Record<string, unknown>;
+      let resolvedActions: unknown[];
+      let resolvedKind: string;
+      let resolvedDisplayName: string;
 
-      // Upsert by (company_id, vendor).
-      // Persist auth_header_name + auth_header_template into config so the
-      // runner can build outbound request headers without re-reading the
-      // TypeScript vendor registry. This makes integration rows self-describing.
-      const upsertRow = {
-        company_id,
-        vendor,
-        display_name: display_name || def.display_name,
-        kind: def.kind === "oauth" ? "oauth" : "rest_api",
-        auth_type: def.auth_type,
-        encrypted_credentials: encrypted,
-        credential_preview: preview,
-        config: {
+      if (def) {
+        // Registered vendor — validate required credential fields against registry.
+        for (const f of def.credentials) {
+          if (f.required && !creds[f.name])
+            return res.status(400).json({ error: `Missing required credential: ${f.label}` });
+        }
+        auth_type = def.auth_type;
+        resolvedKind = def.kind === "oauth" ? "oauth" : "rest_api";
+        resolvedDisplayName = display_name || def.display_name;
+        resolvedConfig = {
           base_url: def.base_url,
           auth_header_name: def.auth_header_name,
           auth_header_template: def.auth_header_template,
           ...(config || {}),
-        },
-        actions: def.actions,
+        };
+        resolvedActions = def.actions;
+      } else {
+        // Custom vendor. Body-driven, self-describing.
+        const submittedAuthType = typeof body.auth_type === "string" ? body.auth_type : "bearer";
+        const allowed = ["bearer", "api_key", "basic", "none"];
+        if (!allowed.includes(submittedAuthType)) {
+          return res.status(400).json({
+            error: `Custom vendor auth_type must be one of: ${allowed.join(", ")} (got: ${submittedAuthType})`,
+          });
+        }
+        const submittedConfig = (config && typeof config === "object") ? config as Record<string, unknown> : {};
+        if (submittedAuthType !== "none" && !submittedConfig.base_url) {
+          return res.status(400).json({
+            error: "Custom vendor requires config.base_url (the API root URL).",
+          });
+        }
+        // Default auth header rules per auth_type if caller didn't specify.
+        const defaultHeaderName =
+          submittedAuthType === "bearer" ? "Authorization"
+          : submittedAuthType === "api_key" ? "Authorization"
+          : submittedAuthType === "basic" ? "Authorization"
+          : null;
+        const defaultHeaderTemplate =
+          submittedAuthType === "bearer" ? "Bearer {{api_key}}"
+          : submittedAuthType === "api_key" ? "{{api_key}}"
+          : submittedAuthType === "basic" ? "Basic {{credentials_b64}}"
+          : null;
+        auth_type = submittedAuthType;
+        resolvedKind = "rest_api";
+        resolvedDisplayName = display_name || vendor;
+        resolvedConfig = {
+          ...submittedConfig,
+          auth_header_name: submittedConfig.auth_header_name ?? defaultHeaderName,
+          auth_header_template: submittedConfig.auth_header_template ?? defaultHeaderTemplate,
+        };
+        resolvedActions = Array.isArray(body.actions) ? body.actions : [];
+      }
+
+      const encrypted = encryptCredentials(creds);
+      const previewSrc = String(
+        creds.key || creds.token || creds.api_key || creds.password || creds.key_id || ""
+      );
+      const preview = previewSrc
+        ? (auth_type === "jwt_es256" ? `Key ID: ${previewSrc}` : maskCredential(previewSrc))
+        : null;
+
+      const upsertRow = {
+        company_id,
+        vendor,
+        display_name: resolvedDisplayName,
+        kind: resolvedKind,
+        auth_type,
+        encrypted_credentials: encrypted,
+        credential_preview: preview,
+        config: resolvedConfig,
+        actions: resolvedActions,
         status: "unverified" as const,
       };
 

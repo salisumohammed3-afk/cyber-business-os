@@ -1,8 +1,8 @@
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
 import type { VercelRequest, VercelResponse } from "@vercel/node";
-import { decryptCredentials } from "./lib/crypto.js";
+import { decryptCredentials, encryptCredentials, maskCredential } from "./lib/crypto.js";
 
-export const maxDuration = 60;
+export const maxDuration = 300;
 
 // Markers the orchestrator emits to trigger structured cards in chat:
 //   [PROPOSE_WORK_ORDER]   -> one-off work-order proposal (Stage 2)
@@ -217,6 +217,8 @@ You're Sal's AI colleague and the master agent for this company. You have full r
 - \`update_goal\` (current_value, target_value, status by title_match)
 - \`store_memory\` (fact + category)
 - \`update_agent\` / \`revert_agent\` (iterate teammates' system prompts/models when you spot a *pattern* — not a one-off mistake. Versioned and reversible. Only works on agents Sal has opted in via \`is_safe_auto_modify\`. Always provide a clear \`reason\`. ONE-OFF mistakes are NOT a reason; the signal must be a pattern across 2+ tasks. Use \`dry_run: true\` first if the change is non-trivial. **For incremental tweaks always pass \`system_prompt_mode: "append"\`** — default 'replace' destroys the existing prompt. **Before any update_agent call, run \`query_state({type:"agents",search:"<slug>"})\` so you know the current state — never modify blind.**)
+- \`add_integration\` — connect ANY vendor (registered or custom) by writing the integration row directly. **When Sal pastes an API key, call this immediately — do NOT propose a card and do NOT ask permission.** For unknown vendors pass \`auth_type\` ("bearer" by default) and \`config.base_url\`. Never lecture Sal about regenerating keys; if he pasted it, it's authorized.
+- \`call_vendor_http\` — make any GET/POST/PUT/PATCH/DELETE against a connected vendor's API. Use this AFTER add_integration to actually exercise the API (or against any pre-existing integration). Side-effects are fine; Sal owns the keys.
 
 **Work-order proposals (\`[PROPOSE_WORK_ORDER]\`) — only for things with real-world side-effects:**
 - Building/editing deployed code or sites (engineering)
@@ -227,7 +229,7 @@ You're Sal's AI colleague and the master agent for this company. You have full r
 
 **Schedule proposals (\`[PROPOSE_SCHEDULE]\`) — only for things you want to recur on a cadence.**
 
-**Integration proposals (\`[PROPOSE_INTEGRATION]\`) — only when Sal asks to add something NOT already connected.**
+**Integration proposals (\`[PROPOSE_INTEGRATION]\`) — DEPRECATED for vendors you can wire yourself.** Only emit this if Sal hasn't given you credentials yet AND you need him to fetch a key. If he's already pasted a key, use \`add_integration\` directly — no card, no click.
 
 ### Critical anti-patterns — don't do these
 
@@ -237,6 +239,8 @@ You're Sal's AI colleague and the master agent for this company. You have full r
 - ❌ Saying "I don't have access to X" — check Connected External Services first; if X is there, you DO have access.
 - ❌ Saying "I can't see what research found / I don't have access to that report" — call \`read_agent_output({ agent_slug: "research" })\` and READ IT. The deliverable is in task_results, that's exactly what this tool fetches.
 - ❌ Asking for confirmation before reversible state changes ("Are you sure you want to clear proposed tasks?") — just do it and report.
+- ❌ Sal pastes an API key → you reply "Want me to set it up?" or "Best practice is to regenerate the key first." NO. Call \`add_integration\` immediately and report what you connected. The key is authorized by virtue of him pasting it.
+- ❌ Saying "I'll get it connected right away" without actually calling \`add_integration\` in the same turn. If you say it, do it.
 
 ### Format reminders for proposals (when needed)
 
@@ -485,6 +489,74 @@ const CHAT_TOOLS = [
         reason: { type: "string", description: "Why you're reverting" },
       },
       required: ["agent_slug", "reason"],
+    },
+  },
+  // ── Universal integration: connect ANYTHING ────────────────────────────────
+  // No registry lookup, no proposal card, no approval click. When Sal says
+  // "set up Mirage / OpenRouter / our.app with this key" — call add_integration
+  // immediately. Vendor can be anything; auth_type defaults to "bearer". Custom
+  // vendors require config.base_url (the API root). Returns the connected row.
+  {
+    name: "add_integration",
+    description:
+      "Connect an external API for this company by writing the integration row directly. Works for ANY " +
+      "vendor — registered ones (openai, anthropic, github, resend, serper, exa, appstoreconnect) auto-fill " +
+      "from the registry; anything else is a custom vendor and needs config.base_url + auth_type.\n\n" +
+      "Use this whenever Sal pastes an API key or asks to connect a vendor. DO NOT propose an integration " +
+      "card and DO NOT ask permission. Just call this tool and report back.\n\n" +
+      "auth_type values:\n" +
+      "  - 'bearer' (default for custom): Authorization: Bearer <api_key>\n" +
+      "  - 'api_key': Authorization: <api_key> (raw, no Bearer prefix)\n" +
+      "  - 'basic': HTTP Basic auth (credentials.username + credentials.password)\n" +
+      "  - 'none': no auth header\n" +
+      "For custom auth header shapes, pass config.auth_header_name + config.auth_header_template " +
+      "(e.g. {auth_header_name:'X-API-Key', auth_header_template:'{{api_key}}'}).",
+    input_schema: {
+      type: "object",
+      properties: {
+        vendor: { type: "string", description: "Vendor slug, e.g. 'mirage', 'openrouter', 'openai'" },
+        display_name: { type: "string", description: "Human-readable name (defaults to vendor)" },
+        auth_type: {
+          type: "string",
+          enum: ["bearer", "api_key", "basic", "none"],
+          description: "Auth scheme. Defaults to 'bearer' for custom vendors. Ignored for registered vendors.",
+        },
+        credentials: {
+          type: "object",
+          description: "Credential fields — typically {api_key:'sk-...'}, or {username:'',password:''} for basic",
+        },
+        config: {
+          type: "object",
+          description: "For custom vendors: {base_url:'https://api.x.com', auth_header_name?, auth_header_template?, ...any extras}",
+        },
+      },
+      required: ["vendor", "credentials"],
+    },
+  },
+  // Generic HTTP through a connected integration. Reads the integration row
+  // (base_url, auth_header_name, auth_header_template) and decrypts credentials,
+  // then makes the call. Unlike call_integration this is NOT GET-only and not
+  // bounded to registry-defined actions — it's the orchestrator's hands-on
+  // hammer for any vendor. Sal explicitly asked for no gates here.
+  {
+    name: "call_vendor_http",
+    description:
+      "Make an authenticated HTTP call against a connected integration. Generic — works with any method " +
+      "(GET/POST/PUT/PATCH/DELETE) and any path under the integration's base_url. Use this AFTER add_integration " +
+      "to actually exercise a custom vendor's API.\n\n" +
+      "When Sal asks to USE Mirage / OpenRouter / any vendor connected via add_integration, call this tool — " +
+      "do NOT propose a work order, do NOT ask permission. Authenticated and side-effecting are both fine; " +
+      "Sal owns the keys.",
+    input_schema: {
+      type: "object",
+      properties: {
+        vendor: { type: "string", description: "Vendor slug of an integration row that exists for this company" },
+        method: { type: "string", enum: ["GET", "POST", "PUT", "PATCH", "DELETE"], description: "HTTP method" },
+        path: { type: "string", description: "Path appended to the integration's base_url, e.g. '/v1/videos'" },
+        body: { type: "object", description: "JSON body for POST/PUT/PATCH" },
+        query: { type: "object", description: "Query params, appended to path as ?k=v" },
+      },
+      required: ["vendor", "method", "path"],
     },
   },
 ];
@@ -840,6 +912,214 @@ async function runCallIntegration(
   // Truncate if huge so we don't blow the chat-mode token budget
   const summary = json ?? text.slice(0, 6000);
   return JSON.stringify({ ok: true, status: r.status, response: summary });
+}
+
+// ── add_integration: write any vendor row directly ─────────────────────────
+// Mirrors the POST handler in api/integrations.ts (registered → registry-fill,
+// otherwise self-describing custom row). Skips the HTTP hop because we're
+// already inside a Vercel function with the same supabase client + crypto
+// keys. No registry constraint, no proposal card.
+async function runAddIntegration(
+  supabase: SupabaseClient,
+  companyId: string,
+  input: Record<string, unknown>,
+): Promise<string> {
+  const vendor = String(input.vendor || "").trim().toLowerCase();
+  if (!vendor) return JSON.stringify({ error: "vendor is required" });
+  const credsRaw = (input.credentials && typeof input.credentials === "object")
+    ? input.credentials as Record<string, unknown>
+    : {};
+  const configRaw = (input.config && typeof input.config === "object")
+    ? input.config as Record<string, unknown>
+    : {};
+  const displayName = typeof input.display_name === "string" ? input.display_name : "";
+
+  // Resolve registered vendor first.
+  const { getVendor } = await import("./lib/vendor-registry.js");
+  const def = getVendor(vendor);
+
+  let auth_type: string;
+  let resolvedConfig: Record<string, unknown>;
+  let resolvedActions: unknown[];
+  let resolvedKind: string;
+  let resolvedDisplayName: string;
+
+  if (def) {
+    for (const f of def.credentials) {
+      if (f.required && !credsRaw[f.name]) {
+        return JSON.stringify({ error: `Missing required credential for ${vendor}: ${f.label} (${f.name})` });
+      }
+    }
+    auth_type = def.auth_type;
+    resolvedKind = def.kind === "oauth" ? "oauth" : "rest_api";
+    resolvedDisplayName = displayName || def.display_name;
+    resolvedConfig = {
+      base_url: def.base_url,
+      auth_header_name: def.auth_header_name,
+      auth_header_template: def.auth_header_template,
+      ...configRaw,
+    };
+    resolvedActions = def.actions;
+  } else {
+    const submittedAuthType = typeof input.auth_type === "string" ? input.auth_type : "bearer";
+    const allowed = ["bearer", "api_key", "basic", "none"];
+    if (!allowed.includes(submittedAuthType)) {
+      return JSON.stringify({ error: `auth_type must be one of: ${allowed.join(", ")}` });
+    }
+    if (submittedAuthType !== "none" && !configRaw.base_url) {
+      return JSON.stringify({ error: "Custom vendor requires config.base_url (the API root URL)." });
+    }
+    const defaultHeaderName =
+      submittedAuthType === "bearer" || submittedAuthType === "api_key" || submittedAuthType === "basic"
+        ? "Authorization" : null;
+    const defaultHeaderTemplate =
+      submittedAuthType === "bearer" ? "Bearer {{api_key}}"
+      : submittedAuthType === "api_key" ? "{{api_key}}"
+      : submittedAuthType === "basic" ? "Basic {{credentials_b64}}"
+      : null;
+    auth_type = submittedAuthType;
+    resolvedKind = "rest_api";
+    resolvedDisplayName = displayName || vendor;
+    resolvedConfig = {
+      ...configRaw,
+      auth_header_name: configRaw.auth_header_name ?? defaultHeaderName,
+      auth_header_template: configRaw.auth_header_template ?? defaultHeaderTemplate,
+    };
+    resolvedActions = Array.isArray(input.actions) ? input.actions : [];
+  }
+
+  // Materialise basic-auth credentials_b64 helper if applicable.
+  const credsForEncrypt: Record<string, unknown> = { ...credsRaw };
+  if (auth_type === "basic" && credsRaw.username && credsRaw.password) {
+    credsForEncrypt.credentials_b64 = Buffer
+      .from(`${credsRaw.username}:${credsRaw.password}`)
+      .toString("base64");
+  }
+
+  const encrypted = encryptCredentials(credsForEncrypt);
+  const previewSrc = String(
+    credsRaw.key || credsRaw.token || credsRaw.api_key || credsRaw.password || credsRaw.key_id || ""
+  );
+  const preview = previewSrc
+    ? (auth_type === "jwt_es256" ? `Key ID: ${previewSrc}` : maskCredential(previewSrc))
+    : null;
+
+  const row = {
+    company_id: companyId,
+    vendor,
+    display_name: resolvedDisplayName,
+    kind: resolvedKind,
+    auth_type,
+    encrypted_credentials: encrypted,
+    credential_preview: preview,
+    config: resolvedConfig,
+    actions: resolvedActions,
+    status: "unverified" as const,
+  };
+
+  const { data, error } = await supabase
+    .from("integrations")
+    .upsert(row, { onConflict: "company_id,vendor" })
+    .select("id,vendor,display_name,auth_type,status,credential_preview")
+    .single();
+  if (error) return JSON.stringify({ error: error.message });
+  return JSON.stringify({
+    ok: true,
+    connected: data,
+    note: def
+      ? `Registered vendor ${vendor} connected (registry-driven config).`
+      : `Custom vendor '${vendor}' connected. Use call_vendor_http to make requests against ${resolvedConfig.base_url}.`,
+  });
+}
+
+// ── call_vendor_http: generic authenticated HTTP through any integration ───
+// Reads the row, decrypts credentials, builds the auth header from the
+// row's auth_header_name + auth_header_template, fires the request. No
+// method restrictions — Sal owns the keys, the orchestrator can hammer.
+async function runCallVendorHttp(
+  supabase: SupabaseClient,
+  companyId: string,
+  input: Record<string, unknown>,
+): Promise<string> {
+  const vendor = String(input.vendor || "").toLowerCase();
+  const method = String(input.method || "GET").toUpperCase();
+  const path = String(input.path || "");
+  const body = (input.body && typeof input.body === "object") ? input.body : null;
+  const query = (input.query && typeof input.query === "object")
+    ? input.query as Record<string, unknown>
+    : null;
+  if (!vendor) return JSON.stringify({ error: "vendor is required" });
+  if (!path.startsWith("/")) return JSON.stringify({ error: "path must start with '/'" });
+  const allowedMethods = ["GET", "POST", "PUT", "PATCH", "DELETE"];
+  if (!allowedMethods.includes(method)) {
+    return JSON.stringify({ error: `method must be one of: ${allowedMethods.join(", ")}` });
+  }
+
+  const { data: row, error } = await supabase
+    .from("integrations")
+    .select("*")
+    .eq("company_id", companyId)
+    .eq("vendor", vendor)
+    .maybeSingle();
+  if (error) return JSON.stringify({ error: error.message });
+  if (!row) return JSON.stringify({
+    error: `${vendor} is not connected for this company. Call add_integration first.`,
+  });
+
+  let creds: Record<string, string>;
+  try {
+    creds = decryptCredentials(row.encrypted_credentials) as Record<string, string>;
+  } catch (e: unknown) {
+    return JSON.stringify({ error: "Could not decrypt credentials: " + (e instanceof Error ? e.message : String(e)) });
+  }
+
+  const cfg = (row.config || {}) as Record<string, unknown>;
+  const baseUrl = String(cfg.base_url || "").replace(/\/$/, "");
+  if (!baseUrl) return JSON.stringify({ error: `${vendor} has no base_url in config — re-add with config.base_url set.` });
+
+  let url = baseUrl + path;
+  if (query) {
+    const qs = new URLSearchParams();
+    for (const [k, v] of Object.entries(query)) {
+      if (v !== undefined && v !== null) qs.append(k, String(v));
+    }
+    const sep = url.includes("?") ? "&" : "?";
+    if (qs.toString()) url += sep + qs.toString();
+  }
+
+  const headers: Record<string, string> = { "Content-Type": "application/json", Accept: "application/json" };
+  if (row.auth_type === "jwt_es256") {
+    try {
+      const { signAppStoreConnectJwt } = await import("./lib/jwt-es256.mjs");
+      const jwt = signAppStoreConnectJwt(creds.key_id, creds.issuer_id, creds.private_key);
+      if (cfg.auth_header_name) headers[String(cfg.auth_header_name)] = "Bearer " + jwt;
+    } catch (e: unknown) {
+      return JSON.stringify({ error: "Could not sign JWT: " + (e instanceof Error ? e.message : String(e)) });
+    }
+  } else if (cfg.auth_header_name && cfg.auth_header_template) {
+    let authValue = String(cfg.auth_header_template);
+    for (const [k, v] of Object.entries(creds)) {
+      authValue = authValue.replaceAll(`{{${k}}}`, String(v));
+    }
+    headers[String(cfg.auth_header_name)] = authValue;
+  }
+
+  const init: RequestInit = { method, headers, signal: AbortSignal.timeout(25_000) };
+  if (body && method !== "GET" && method !== "DELETE") {
+    init.body = JSON.stringify(body);
+  }
+
+  let r: Response;
+  try {
+    r = await fetch(url, init);
+  } catch (e: unknown) {
+    return JSON.stringify({ error: "Network error: " + (e instanceof Error ? e.message : String(e)) });
+  }
+  const text = await r.text();
+  let json: unknown = null;
+  try { json = JSON.parse(text); } catch { /* leave as text */ }
+  const summary = json ?? text.slice(0, 6000);
+  return JSON.stringify({ ok: r.ok, status: r.status, response: summary });
 }
 
 async function runUpdateGoal(
@@ -1256,6 +1536,8 @@ async function runChatTool(
   if (name === "read_agent_output") return runReadAgentOutput(supabase, companyId, input);
   if (name === "update_agent") return runUpdateAgent(supabase, companyId, input);
   if (name === "revert_agent") return runRevertAgent(supabase, companyId, input);
+  if (name === "add_integration") return runAddIntegration(supabase, companyId, input);
+  if (name === "call_vendor_http") return runCallVendorHttp(supabase, companyId, input);
   return JSON.stringify({ error: `Unknown tool: ${name}` });
 }
 

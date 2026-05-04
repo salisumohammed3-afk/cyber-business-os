@@ -133,7 +133,10 @@ export function useLiveChat(companyId: string | null) {
           setMessages((prev) =>
             prev.some((m) => m.id === row.id) ? prev : [...prev, row]
           )
-          if (row.role !== 'user') {
+          // Only clear "thinking" on the FINAL reply. Intermediate events
+          // (work_order_proposal, status, etc.) used to also clear it, which
+          // hid the STOP THINKING button while the function was still running.
+          if (row.role !== 'user' && row.kind === 'reply') {
             setWaitingForReply(false)
           }
         }

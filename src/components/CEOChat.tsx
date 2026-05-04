@@ -111,6 +111,16 @@ export function CEOChat() {
   const [sending, setSending] = useState(false)
   const [stagedFiles, setStagedFiles] = useState<StagedFile[]>([])
   const [dragOver, setDragOver] = useState(false)
+  const [isMobile, setIsMobile] = useState(false)
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    const mq = window.matchMedia('(max-width: 640px)')
+    const update = () => setIsMobile(mq.matches)
+    update()
+    mq.addEventListener('change', update)
+    return () => mq.removeEventListener('change', update)
+  }, [])
 
   const autoResize = useCallback(() => {
     const ta = textareaRef.current
@@ -827,10 +837,10 @@ export function CEOChat() {
               }
             }}
             onPaste={onPaste}
-            placeholder={company ? `Message ${company.name}... (drag files, paste images, or prefix with /think for deep reasoning)` : 'Select a company first'}
+            placeholder={company ? (isMobile ? '' : `Message ${company.name}... (drag files, paste images, or prefix with /think for deep reasoning)`) : 'Select a company first'}
             disabled={sending || !company}
             rows={1}
-            className="flex-1 rounded-lg border border-gray-300 px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50 disabled:cursor-not-allowed resize-none overflow-y-auto"
+            className="flex-1 rounded-lg border border-gray-300 px-4 py-2 text-base sm:text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50 disabled:cursor-not-allowed resize-none overflow-y-auto"
             style={{ maxHeight: '160px' }}
           />
           <button

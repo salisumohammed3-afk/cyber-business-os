@@ -359,10 +359,10 @@ const BASE_TOOLS = [
   {
     name: "update_agent",
     description:
-      "Modify another agent's system_prompt, model, or description. Use when you spot a pattern — an agent " +
-      "consistently misses a step, needs more context about the company, or could benefit from a sharper " +
-      "instruction. The change is versioned and reversible. REQUIRES the target agent to have " +
-      "is_safe_auto_modify=true (Sal opts in per-agent). Cannot modify the orchestrator. " +
+      "Modify ANY agent's system_prompt, model, or description — including yourself. Use when you spot a " +
+      "pattern an agent consistently misses, needs sharper context, or has an instruction misfiring. " +
+      "Self-modification is allowed and encouraged when you notice your own behaviour is wrong. " +
+      "Versioned and reversible via revert_agent — that's the safety net, not a permission gate. " +
       "Always include a clear `reason` — it's permanently logged.\n\n" +
       "system_prompt_mode controls how `system_prompt` is interpreted:\n" +
       "  - 'replace' (default): becomes the entire prompt. Use for full rewrites.\n" +
@@ -1260,8 +1260,9 @@ async function loadModifiableAgent(slug) {
     slug: "eq." + slug, company_id: "eq." + companyId,
   }, { select: "id,name,slug,system_prompt,model,description,is_orchestrator,is_safe_auto_modify", single: true });
   if (!target) return { error: `Agent '${slug}' not found in this company` };
-  if (target.is_orchestrator) return { error: "Refusing to modify the orchestrator — it would let it disable its own safety checks" };
-  if (!target.is_safe_auto_modify) return { error: `Agent '${slug}' is not opted in to auto-modify. Sal must enable 'Allow orchestrator to modify' in /company-settings?tab=agents first.` };
+  // Gates removed per Sal's directive — orchestrator can rewrite any agent
+  // including itself. Versioning (agent_definition_versions) + revert_agent
+  // is the safety net.
   return { agent: target };
 }
 
@@ -2638,8 +2639,8 @@ async function main() {
       "- ONE-OFF mistakes are NOT a reason to mutate a prompt. The signal must be a pattern across 2+ tasks, or a glaring oversight in the existing prompt.\n" +
       "- ALWAYS pass `dry_run: true` first to see the diff, unless the change is trivial (e.g. fixing a typo).\n" +
       "- ALWAYS write a `reason` that makes the next reader (Sal, future you) understand WHY. \"Improving prompt\" is not a reason. \"Research kept ignoring competitor pricing — added explicit instruction to extract pricing in dollars\" is a reason.\n" +
-      "- Only agents with `is_safe_auto_modify=true` are mutable. The tool will reject otherwise. Do not nag Sal to opt agents in — he'll do it when he's ready.\n" +
-      "- You CANNOT modify yourself. The orchestrator's identity is fixed by Sal.\n" +
+      "- You CAN modify any agent including yourself. No is_safe_auto_modify gate, no self-mod ban. Versioning is the safety net — every change goes into agent_definition_versions and revert_agent rolls back.\n" +
+      "- Self-modification is encouraged when you spot your own behaviour misfiring. Append the correction to your own prompt with system_prompt_mode='append' so future turns absorb it.\n" +
       "- If a change you made doesn't help — or makes things worse — call `revert_agent({agent_slug, reason})` to roll it back. Every change is logged in `agent_definition_versions`; nothing is destroyed.\n" +
       "- After a meaningful change, store a memory describing what you tried and why, so you can iterate later instead of repeating yourself.\n\n" +
       "If a tool you expect to have is missing, that's a bug to flag — do not invent workarounds that fake the answer.";

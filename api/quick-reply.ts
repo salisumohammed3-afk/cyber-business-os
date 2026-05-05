@@ -274,7 +274,8 @@ If Sal said "send the email blast", "post this on LinkedIn", "deploy to prod", "
 - \`call_integration\` — any registered vendor action (POST/GET/etc, no method restriction).
 
 **Writing (just call them — no approval cards needed):**
-- \`cancel_tasks\` — always pass a one-line \`reason\` paraphrasing Sal's instruction (e.g. \`reason: "clear failed list"\`). Stored on each cancelled row for future audits.
+- \`cancel_tasks\` — UPDATE rows to status='cancelled' (active → archived). Always pass a one-line \`reason\` paraphrasing Sal's instruction.
+- \`delete_tasks\` — PERMANENT DELETE. Use when Sal says "delete those" / "get rid of them" / "purge". Handles the FK chain automatically (NULLs child parent_task_id, NULLs project pointers, deletes the row + cascading task_results). Pass status (e.g. 'cancelled' to purge the cancelled archive) or task_ids.
 - \`manage_schedule\`, \`run_schedule_now\`, \`update_goal\`, \`store_memory\`
 - \`update_agent\` / \`revert_agent\` — modify ANY agent including yourself
 - \`add_integration\` — wire any vendor, registered or custom
@@ -382,6 +383,34 @@ const CHAT_TOOLS = [
     },
   },
   {
+    name: "delete_tasks",
+    description:
+      "PERMANENTLY DELETE tasks. Use when Sal says 'delete those', 'get rid of them', 'purge the list', " +
+      "etc. Different from cancel_tasks: cancel_tasks UPDATEs status to 'cancelled' (active → archived). " +
+      "delete_tasks DELETEs the row entirely (and any task_results, child references via parent_task_id, " +
+      "or project.created_by_task_id pointers — all auto-handled). Use this when Sal explicitly wants " +
+      "rows gone, including already-cancelled ones. ALWAYS pass `status` OR `task_ids`. Hard cap 500.",
+    input_schema: {
+      type: "object",
+      properties: {
+        status: {
+          type: "string",
+          enum: ["proposed", "pending", "running", "failed", "cancelled", "completed"],
+          description: "Delete all tasks in this status (e.g. 'cancelled' to purge the cancelled archive).",
+        },
+        task_ids: {
+          type: "array",
+          items: { type: "string" },
+          description: "Delete specific tasks by id. Overrides status filter.",
+        },
+        max: {
+          type: "number",
+          description: "Safety cap. Default 500, max 500.",
+        },
+      },
+    },
+  },
+  {
     name: "manage_schedule",
     description:
       "Pause, resume, or delete a recurring schedule. Use when Sal says 'pause the daily briefing', " +
@@ -401,8 +430,9 @@ const CHAT_TOOLS = [
     name: "store_memory",
     description:
       "Save a fact for future reference. Use when Sal says 'remember that...', 'note that...', 'we now use X', " +
-      "or any time he tells you a durable piece of context. Categories help organisation: " +
-      "business_context | user_preference | market_intel | decision | contact | metric | technical_finding | process_learning.",
+      "or any time he tells you a durable piece of context. Categories (DB-enforced): " +
+      "business_context | user_preference | market_intel | decision | contact | metric | general | preference | task | insight. " +
+      "If unsure, use 'general'. Anything outside this list is silently mapped to 'general'.",
     input_schema: {
       type: "object",
       properties: {
@@ -411,9 +441,9 @@ const CHAT_TOOLS = [
           type: "string",
           enum: [
             "business_context", "user_preference", "market_intel", "decision",
-            "contact", "metric", "technical_finding", "process_learning",
+            "contact", "metric", "general", "preference", "task", "insight",
           ],
-          description: "Default 'business_context' if unsure",
+          description: "DB-enforced enum. Default 'general' if no obvious fit.",
         },
         importance: { type: "number", description: "1-10, default 5" },
       },
@@ -792,6 +822,73 @@ async function runCancelTasks(
 
   return JSON.stringify({
     cancelled: targets.length,
+    titles: targets.map((t: { title: string }) => t.title).slice(0, 10),
+  });
+}
+
+// Hard delete tasks. Different from cancel — this purges the rows entirely.
+// Handles the FK chain that blocks naive DELETE: NULLs parent_task_id on any
+// child task whose parent we're deleting, NULLs projects.created_by_task_id
+// for any project whose creating task is going away, then DELETEs. task_results
+// CASCADE automatically.
+async function runDeleteTasks(
+  supabase: SupabaseClient,
+  companyId: string,
+  input: Record<string, unknown>,
+): Promise<string> {
+  const status = typeof input.status === "string" ? input.status : null;
+  const taskIds = Array.isArray(input.task_ids)
+    ? (input.task_ids as string[]).filter(s => typeof s === "string")
+    : null;
+  const cap = Math.min(Number(input.max) || 500, 500);
+
+  if (!status && (!taskIds || taskIds.length === 0)) {
+    return JSON.stringify({ error: "Provide either status or task_ids — refusing to delete without a filter." });
+  }
+
+  // Find target ids
+  let q = supabase
+    .from("tasks")
+    .select("id, title, status")
+    .eq("company_id", companyId)
+    .limit(cap);
+  if (taskIds && taskIds.length > 0) q = q.in("id", taskIds);
+  else if (status) q = q.eq("status", status);
+  const { data: targets, error: selErr } = await q;
+  if (selErr) return JSON.stringify({ error: selErr.message });
+  if (!targets?.length) return JSON.stringify({ deleted: 0, message: "Nothing to delete" });
+  const ids = targets.map((t: { id: string }) => t.id);
+
+  // Pre-step 1: NULL out parent_task_id on any child whose parent is in our delete set.
+  // Without this, the FK tasks_parent_task_id_fkey blocks the DELETE.
+  const { error: childErr } = await supabase
+    .from("tasks")
+    .update({ parent_task_id: null })
+    .in("parent_task_id", ids);
+  if (childErr) {
+    return JSON.stringify({ error: `Pre-delete child unlink failed: ${childErr.message}` });
+  }
+
+  // Pre-step 2: NULL out projects.created_by_task_id for any project whose
+  // creating task is in our delete set. (FK projects_created_by_task_id_fkey.)
+  const { error: projErr } = await supabase
+    .from("projects")
+    .update({ created_by_task_id: null })
+    .in("created_by_task_id", ids);
+  if (projErr) {
+    return JSON.stringify({ error: `Pre-delete project unlink failed: ${projErr.message}` });
+  }
+
+  // Now actually delete. task_results cascades automatically.
+  const { error: delErr, data: deleted } = await supabase
+    .from("tasks")
+    .delete()
+    .in("id", ids)
+    .select("id");
+  if (delErr) return JSON.stringify({ error: delErr.message });
+
+  return JSON.stringify({
+    deleted: deleted?.length ?? 0,
     titles: targets.map((t: { title: string }) => t.title).slice(0, 10),
   });
 }
@@ -1620,11 +1717,16 @@ async function runStoreMemory(
   if (!content) return JSON.stringify({ error: "content is required" });
   if (content.length < 3) return JSON.stringify({ error: "content too short" });
 
+  // The DB has a CHECK constraint on memories.category. Code list MUST match
+  // the constraint exactly, otherwise inserts silently 23514 (which is what
+  // happened during Sal's "store this request as a memory" turn — the
+  // orchestrator passed e.g. "technical_finding" / "process_learning" and the
+  // insert blew up). Real allowed set, mirrored from pg_constraint:
   const validCats = [
     "business_context", "user_preference", "market_intel", "decision",
-    "contact", "metric", "technical_finding", "process_learning",
+    "contact", "metric", "general", "preference", "task", "insight",
   ];
-  const category = validCats.includes(String(input.category)) ? String(input.category) : "business_context";
+  const category = validCats.includes(String(input.category)) ? String(input.category) : "general";
   const importance = Math.min(Math.max(Number(input.importance) || 5, 1), 10);
 
   const { data, error } = await supabase
@@ -1652,6 +1754,7 @@ async function runChatTool(
   if (name === "fetch_url") return runFetchUrl(input);
   if (name === "query_state") return runQueryState(supabase, companyId, input);
   if (name === "cancel_tasks") return runCancelTasks(supabase, companyId, input);
+  if (name === "delete_tasks") return runDeleteTasks(supabase, companyId, input);
   if (name === "manage_schedule") return runManageSchedule(supabase, companyId, input);
   if (name === "store_memory") return runStoreMemory(supabase, companyId, input);
   if (name === "call_integration") return runCallIntegration(supabase, companyId, input);

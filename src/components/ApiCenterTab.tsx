@@ -90,15 +90,38 @@ export function ApiCenterTab() {
 
   const handleTest = async (id: string) => {
     setTestingId(id);
+    // Client-side abort if the server takes longer than 15s. Without this,
+    // a slow probe (or a custom-vendor probe that doesn't return cleanly)
+    // would leave the spinner running indefinitely with no way to recover —
+    // exactly the hang Sal observed clicking Test on Mirage.
+    const ac = new AbortController();
+    const timeout = setTimeout(() => ac.abort(), 15_000);
     try {
-      const r = await fetch(`/api/integrations?id=${id}&action=test`, { method: "POST" });
+      const r = await fetch(`/api/integrations?id=${id}&action=test`, {
+        method: "POST",
+        signal: ac.signal,
+      });
       const body = await r.json().catch(() => ({}));
       if (!r.ok) {
         alert("Test failed: " + (body.error || r.statusText));
       } else if (!body.ok) {
         alert(`Test failed: ${body.message}`);
+      } else if (body.message) {
+        // Surface success messages too so Sal sees evidence the test worked,
+        // not just a status badge flip he might miss.
+        // Only alert if the message has anything actionable beyond the default.
+        if (body.message !== "Connection verified") {
+          alert(body.message);
+        }
+      }
+    } catch (e: unknown) {
+      if (e instanceof DOMException && e.name === "AbortError") {
+        alert("Test timed out after 15s. The vendor may be slow or unreachable.");
+      } else {
+        alert("Test failed: " + (e instanceof Error ? e.message : String(e)));
       }
     } finally {
+      clearTimeout(timeout);
       setTestingId(null);
       await refresh();
     }

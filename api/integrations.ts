@@ -66,13 +66,11 @@ function publicShape(row: IntegrationRow) {
 async function buildAuthHeaders(row: IntegrationRow): Promise<Record<string, string>> {
   if (!row.encrypted_credentials) return {};
   const def = getVendor(row.vendor);
-  if (!def) return {};
   const creds = decryptCredentials(row.encrypted_credentials) as Record<string, string>;
   const headers: Record<string, string> = { "Content-Type": "application/json" };
 
-  // jwt_es256: sign a fresh token per request. Currently App Store Connect
-  // is the only known consumer; if we add more we can switch on vendor.
-  if (def.auth_type === "jwt_es256") {
+  // jwt_es256 is registered-only (App Store Connect today).
+  if (def?.auth_type === "jwt_es256") {
     if (def.vendor !== "appstoreconnect") {
       throw new Error(`jwt_es256 not yet wired for vendor: ${def.vendor}`);
     }
@@ -83,13 +81,18 @@ async function buildAuthHeaders(row: IntegrationRow): Promise<Record<string, str
     return headers;
   }
 
-  // Static auth (api_key / bearer / basic): substitute creds into the template.
-  if (def.auth_header_name && def.auth_header_template) {
-    let value: string = def.auth_header_template;
+  // For static auth (api_key / bearer / basic), prefer config.* values from
+  // the row itself (works for custom vendors) and fall back to the registry
+  // for registered ones. Both cases interpolate creds into the template.
+  const rowCfg = (row.config || {}) as Record<string, unknown>;
+  const headerName = (rowCfg.auth_header_name as string) || def?.auth_header_name || "";
+  const headerTemplate = (rowCfg.auth_header_template as string) || def?.auth_header_template || "";
+  if (headerName && headerTemplate) {
+    let value: string = headerTemplate;
     for (const [k, v] of Object.entries(creds)) {
       value = value.replaceAll(`{{${k}}}`, String(v));
     }
-    headers[def.auth_header_name] = value;
+    headers[headerName] = value;
   }
   return headers;
 }
@@ -183,11 +186,8 @@ async function probeIntegration(row: IntegrationRow): Promise<{
   message: string;
 }> {
   const def = getVendor(row.vendor);
-  if (!def) {
-    return { ok: false, status: 0, message: `Unknown vendor: ${row.vendor}` };
-  }
-  const baseUrl = (row.config?.base_url as string) || def.base_url;
-  const url = baseUrl.replace(/\/$/, "") + def.test.path;
+
+  // Build auth headers up-front (works for both registered and custom rows).
   let headers: Record<string, string>;
   try {
     headers = await buildAuthHeaders(row);
@@ -195,22 +195,30 @@ async function probeIntegration(row: IntegrationRow): Promise<{
     const m = err instanceof Error ? err.message : String(err);
     return { ok: false, status: 0, message: `Could not decrypt credentials: ${m}` };
   }
+
+  // Decide what URL + method to hit. Registered vendors have an explicit
+  // test action in the registry. Custom vendors don't, so fall back to a
+  // GET on base_url itself — any 2xx / 4xx (other than auth errors) tells
+  // us the host is reachable and the credential isn't outright rejected.
+  const baseUrl = String((row.config?.base_url as string) || def?.base_url || "").replace(/\/$/, "");
+  if (!baseUrl) {
+    return { ok: false, status: 0, message: "No base_url configured — re-add the integration with config.base_url set." };
+  }
+  const isCustom = !def;
+  const path = def?.test?.path ?? "";
+  const method = def?.test?.method ?? "GET";
+  const url = baseUrl + path;
+  const expected = def?.test?.expect_status ?? 200;
+
   try {
     const r = await fetch(url, {
-      method: def.test.method,
+      method,
       headers,
-      // For POST probes, send empty body; vendors typically reply 400 (auth ok)
-      body: def.test.method === "POST" ? "{}" : undefined,
+      body: method === "POST" ? "{}" : undefined,
       signal: AbortSignal.timeout(10_000),
     });
-    const expected = def.test.expect_status ?? 200;
-    if (r.status === expected || (expected === 200 && r.ok)) {
-      return { ok: true, status: r.status, message: "Connection verified" };
-    }
-    if (r.status === 400 && def.test.expect_status === 400) {
-      // Anthropic-style probes treat 400 as "auth ok"
-      return { ok: true, status: 400, message: "Connection verified (probe returned expected 400)" };
-    }
+
+    // Auth failures are unambiguous regardless of registered vs custom.
     if (r.status === 401 || r.status === 403) {
       const body = await r.text().catch(() => "");
       return {
@@ -221,6 +229,27 @@ async function probeIntegration(row: IntegrationRow): Promise<{
     }
     if (r.status === 429) {
       return { ok: false, status: 429, message: "Rate limited (429) — try again in a moment" };
+    }
+
+    // Custom vendor: any non-auth-failure response means the host is reachable
+    // and the credential at least isn't outright rejected. Treat as ok.
+    if (isCustom) {
+      return {
+        ok: true,
+        status: r.status,
+        message: r.ok
+          ? `Reachable (${r.status}). No vendor-specific test action configured for custom vendor — call call_vendor_http to exercise specific endpoints.`
+          : `Reachable (${r.status}). Host is up and credential isn't rejected, but base URL doesn't accept GET. Try call_vendor_http with a specific path.`,
+      };
+    }
+
+    // Registered vendor: match against the registry's expected status.
+    if (r.status === expected || (expected === 200 && r.ok)) {
+      return { ok: true, status: r.status, message: "Connection verified" };
+    }
+    if (r.status === 400 && expected === 400) {
+      // Anthropic-style probes treat 400 as "auth ok"
+      return { ok: true, status: 400, message: "Connection verified (probe returned expected 400)" };
     }
     const body = await r.text().catch(() => "");
     return { ok: false, status: r.status, message: `Unexpected status ${r.status}: ${body.slice(0, 200)}` };

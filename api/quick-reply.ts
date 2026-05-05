@@ -291,7 +291,8 @@ If Sal said "send the email blast", "post this on LinkedIn", "deploy to prod", "
 - ❌ "Let me propose a work order to..." for non-severe action. Just do it.
 - ❌ "Agent X needs to be opted in before I can modify it" — that gate is gone. Modify it.
 - ❌ Saying "I'll do it" without actually calling the tool in the same turn.
-- ❌ Asking which tool to use, asking which vendor to use, asking which value to use — make a reasonable choice and report what you did. Sal will correct if wrong.`;
+- ❌ Asking which tool to use, asking which vendor to use, asking which value to use — make a reasonable choice and report what you did. Sal will correct if wrong.
+- ❌ Cliffhanger replies. NEVER end with "let me check…", "I'll look that up", "one moment", "checking…", or a dangling colon. If you said you'll do something, DO IT in the same response — call the tool and deliver the result. If you can't, say "I don't have a tool for that" and stop. Cliffhangers leave Sal staring at half a thought.`;
 
 type ToolResultBlock = { type: "tool_result"; tool_use_id: string; content: string };
 type ToolUseBlock = { type: "tool_use"; id: string; name: string; input: Record<string, unknown> };
@@ -2102,12 +2103,37 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       );
       const assistantText = textBlocks.map(b => b.text).join("\n").trim();
 
-      // If no tool calls or we've hit the cap, finalize
+      // If no tool calls or we've hit the cap, finalize.
       if (
         stopReason !== "tool_use" ||
         toolUses.length === 0 ||
         toolTurns >= MAX_TOOL_TURNS
       ) {
+        // Detect cliffhanger replies — Sonnet 4.6 sometimes emits text like
+        // "let me check the actual API reference for the right endpoint:" and
+        // ends its turn (stop_reason=end_turn) instead of following with a
+        // tool call. The user is left waiting for content that never arrives.
+        // Sal hit this verbatim ("404 on that path — let me check…:" then nothing).
+        // If we detect the pattern AND haven't already retried, prod the model
+        // to continue with a single nudge before finalizing.
+        const trimmed = assistantText.trim();
+        const looksDangling =
+          /:[\s]*$/.test(trimmed) ||
+          /\b(let me check|let me look|let me verify|i'?ll check|i'?ll look|i'?ll verify|one moment|hold on|checking now|looking that up|let me grab|let me pull)\b[^.!?]*$/i.test(trimmed);
+        const alreadyNudged = (req.body as { _nudged?: boolean })?._nudged === true;
+        if (looksDangling && !alreadyNudged && stopReason !== "tool_use") {
+          // Append the partial assistant text + a synthetic user nudge that
+          // forces continuation in the SAME function invocation. Capped to one
+          // retry by re-using the body flag so we never loop indefinitely.
+          messages.push({ role: "assistant", content: contentBlocks });
+          messages.push({
+            role: "user",
+            content: "Continue your previous response — finish what you started. Do not promise to check something without actually doing it. Either call the tool you were going to call, or give a complete answer now.",
+          });
+          (req.body as { _nudged?: boolean })._nudged = true;
+          // Don't increment toolTurns; this is a nudge not a real turn.
+          continue;
+        }
         reply = assistantText || "Sorry, I couldn't generate a reply.";
         break;
       }

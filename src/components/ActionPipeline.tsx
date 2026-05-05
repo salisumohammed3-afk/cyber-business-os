@@ -24,7 +24,9 @@ const tabs: { key: TabKey; label: string }[] = [
   { key: "recurring", label: "Recurring" },
   { key: "running", label: "In Progress" },
   { key: "completed", label: "Completed" },
-  { key: "rejected", label: "Rejected" },
+  // Was "Rejected" — but every row in this tab is status='cancelled' (user
+  // cancelled them, not the system rejecting them). "Cancelled" is accurate.
+  { key: "rejected", label: "Cancelled" },
   { key: "failed", label: "Failed" },
 ];
 
@@ -38,7 +40,7 @@ const statusConfig: Record<
   pending: { icon: Clock, color: "text-muted-foreground", bg: "bg-secondary", label: "approved" },
   queued: { icon: Clock, color: "text-muted-foreground", bg: "bg-secondary", label: "queued" },
   failed: { icon: AlertCircle, color: "text-red-500", bg: "bg-red-500/10", label: "failed" },
-  cancelled: { icon: XCircle, color: "text-orange-500", bg: "bg-orange-500/10", label: "rejected" },
+  cancelled: { icon: XCircle, color: "text-orange-500", bg: "bg-orange-500/10", label: "cancelled" },
 };
 
 const fallbackConfig = { icon: Clock, color: "text-muted-foreground", bg: "bg-secondary", label: "unknown" };

@@ -452,9 +452,22 @@ function AgentsTab() {
   return (
     <div className="space-y-3 max-w-3xl">
       <div className="text-xs text-muted-foreground bg-secondary/40 border rounded-md px-3 py-2">
-        <strong className="text-foreground">Auto-modify (opt-in per agent).</strong> When enabled, the orchestrator can iterate this agent's system prompt or model when it spots a recurring pattern — every change is versioned and shown below, so you can revert any change in one click. Default off. The orchestrator can never modify itself.
+        <strong className="text-foreground">Auto-modify.</strong> Each agent (including the orchestrator itself) can be rewritten by the orchestrator when it spots a recurring pattern. Every change is versioned in the timeline below — one-click revert returns to any prior version. Versioning is the safety net; nothing is destroyed.
       </div>
-      {agents.map((a) => (
+      {agents.map((a) => {
+        // Detect cross-tenant prompts: agents whose system_prompt doesn't
+        // mention this company's name (likely cloned from another tenant
+        // and never re-pointed). Surfaced as a yellow warning banner so Sal
+        // sees the bug without clicking Edit. Three specialists in Go
+        // Together had this — browser/taskmaster said "for UBS", designer
+        // said "for Aura OS".
+        const promptText = (a.system_prompt || "").toLowerCase();
+        const companyName = (company?.name || "").toLowerCase();
+        const promptMissingCompany = companyName.length > 0 && !promptText.includes(companyName);
+        const knownStaleTenants = ["ubs", "aura os", "cyber business operating system"]
+          .filter(s => promptText.includes(s));
+        const hasCrossTenantSignal = promptMissingCompany || knownStaleTenants.length > 0;
+        return (
         <Card key={a.id}>
           <CardHeader className="pb-2">
             <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
@@ -466,8 +479,26 @@ function AgentsTab() {
                 {a.is_safe_auto_modify && <Badge className="text-[10px] bg-violet-500/15 text-violet-700 hover:bg-violet-500/20">auto-modify on</Badge>}
               </div>
               <div className="flex items-center gap-2 text-xs text-muted-foreground shrink-0 flex-wrap">
-                <span className="whitespace-nowrap">{a.model?.split("-").slice(0, 2).join("-")}</span>
-                <span className="whitespace-nowrap">{(builtInToolsByAgent[a.slug] || builtInToolsByAgent.research).length} tools</span>
+                {/* Show the full model id (e.g. claude-opus-4-7), not just
+                    the family ("claude-opus") which lost the version. */}
+                <span className="whitespace-nowrap font-mono text-[10px]">{a.model || "—"}</span>
+                {/* Show the first 3 tool names + remainder count, with a
+                    title-tooltip listing all of them, instead of just a
+                    bare "5 tools" count which forced Sal into the Edit
+                    panel to find out what was actually available. */}
+                {(() => {
+                  const toolList = builtInToolsByAgent[a.slug] || builtInToolsByAgent.research;
+                  const head = toolList.slice(0, 3).join(", ");
+                  const remainder = toolList.length - 3;
+                  return (
+                    <span
+                      className="whitespace-nowrap font-mono text-[10px] cursor-help"
+                      title={toolList.join("\n")}
+                    >
+                      {head}{remainder > 0 ? ` +${remainder} more` : ""}
+                    </span>
+                  );
+                })()}
                 <button
                   onClick={() => {
                     setEditingId(editingId === a.id ? null : a.id);
@@ -490,6 +521,15 @@ function AgentsTab() {
           </CardHeader>
           <CardContent className="pt-0">
             <p className="text-xs text-muted-foreground">{a.description}</p>
+            {hasCrossTenantSignal && (
+              <div className="mt-2 text-[11px] rounded border border-amber-500/40 bg-amber-500/10 text-amber-900 dark:text-amber-200 px-2.5 py-2">
+                <strong>⚠️ Cross-tenant prompt detected.</strong>{" "}
+                {knownStaleTenants.length > 0
+                  ? <>This prompt mentions <code className="font-mono">{knownStaleTenants.join(", ")}</code> — looks cloned from another tenant. </>
+                  : <>This prompt doesn't mention <strong>{company?.name}</strong> anywhere — likely a generic template that hasn't been pointed at this company. </>}
+                Click Edit to rewrite, or ask the orchestrator to do it (it can update its own and others' prompts now).
+              </div>
+            )}
             {!a.is_orchestrator && (
               <label className="mt-2 flex items-center gap-2 text-xs cursor-pointer">
                 <input
@@ -532,7 +572,8 @@ function AgentsTab() {
             )}
           </CardContent>
         </Card>
-      ))}
+      );
+      })}
     </div>
   );
 }

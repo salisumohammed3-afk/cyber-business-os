@@ -85,7 +85,26 @@ const AgentSidebar = () => {
             No agents configured for this company yet.
           </div>
         )}
-        {!isLoading && (agents as AgentDef[]).map((agent) => {
+        {!isLoading && (agents as AgentDef[]).slice().sort((a, b) => {
+          // Display order: orchestrator first (it leads the team), then
+          // delivery specialists, then growth/sales/outreach, then utility
+          // agents. Anything not listed falls to the end alphabetically.
+          // Replaces the previous flat alphabetical sort which buried the
+          // orchestrator in the middle of the list.
+          const order = [
+            'orchestrator',
+            'engineering', 'designer', 'research',
+            'growth', 'sales', 'outreach',
+            'taskmaster', 'browser',
+            'executive-assistant',
+          ];
+          const ai = order.indexOf(a.slug);
+          const bi = order.indexOf(b.slug);
+          if (ai !== -1 && bi !== -1) return ai - bi;
+          if (ai !== -1) return -1;
+          if (bi !== -1) return 1;
+          return a.name.localeCompare(b.name);
+        }).map((agent) => {
           const Icon = iconBySlug[agent.slug] || Bot;
           const s = stats[agent.id];
           const running = !!s?.running;
@@ -96,23 +115,29 @@ const AgentSidebar = () => {
               className="p-2.5 rounded-sm border border-border hover:border-foreground/20 hover:bg-secondary transition-colors cursor-pointer group"
               title={agent.description || agent.slug}
             >
-              <div className="flex items-center gap-2 mb-1">
-                <Icon size={14} className="text-muted-foreground group-hover:text-foreground transition-colors" />
-                <span className="text-xs font-medium text-foreground truncate">{agent.name}</span>
+              <div className="flex items-start gap-2 mb-1">
+                <Icon size={14} className="text-muted-foreground group-hover:text-foreground transition-colors mt-0.5 flex-shrink-0" />
+                {/* Allow long names like "Task Management Agent" to wrap
+                    rather than truncate ("Task Management ..."). The card's
+                    width is fixed but two-line names look fine. */}
+                <span className="text-xs font-medium text-foreground leading-tight break-words flex-1 min-w-0">{agent.name}</span>
                 <div
                   className={
-                    "w-1.5 h-1.5 rounded-full ml-auto " +
+                    "w-1.5 h-1.5 rounded-full mt-1.5 flex-shrink-0 " +
                     (running ? "bg-amber-500 animate-pulse" : "bg-gray-300")
                   }
-                  title={running ? "Has a task pending or running" : "Idle"}
+                  title={running ? "Has a task pending or running" : "Idle — no active task"}
                 />
               </div>
               <p className="text-[10px] text-muted-foreground leading-tight font-mono">
                 {agent.slug}
               </p>
               {s && s.completed > 0 && (
-                <p className="text-[9px] text-muted-foreground mt-1 font-mono">
-                  {s.completed} completed
+                <p
+                  className="text-[9px] text-muted-foreground mt-1 font-mono"
+                  title="Lifetime completed tasks for this agent"
+                >
+                  {s.completed} completed (lifetime)
                 </p>
               )}
             </div>

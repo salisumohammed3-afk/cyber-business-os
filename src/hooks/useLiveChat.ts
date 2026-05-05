@@ -44,8 +44,48 @@ function convStorageKey(companyId: string) {
   return `sal-os-conv-${companyId}`
 }
 
+// Resolve the canonical conversation for this company by looking at the SERVER,
+// not localStorage. Otherwise mobile and desktop end up with different
+// conversation IDs (each device's localStorage is independent) and the
+// orchestrator can't see across them. Strategy:
+//   1. Pick the conversation with the most-recent chat_message for this company
+//      (i.e. the thread with actual ongoing activity).
+//   2. If multiple conversations exist with messages, that's a sign of past
+//      device drift — the FE will pick the most-active one and writes will
+//      converge there. The data layer can be merged separately.
+//   3. If no conversation exists at all, return null and let the existing
+//      first-message path create one.
+async function resolveCanonicalConversation(companyId: string): Promise<string | null> {
+  // Step 1: find every conversation for this company.
+  const { data: convs } = await supabase
+    .from('conversations')
+    .select('id')
+    .eq('company_id', companyId)
+  if (!convs || convs.length === 0) return null
+  if (convs.length === 1) return convs[0].id
+
+  // Step 2: pick the one with the latest chat_message. We can't easily group-by
+  // on a join in supabase-js, so fetch the most-recent message per conv-id list
+  // in one shot and bucket client-side.
+  const ids = convs.map(c => c.id)
+  const { data: latest } = await supabase
+    .from('chat_messages')
+    .select('conversation_id, created_at')
+    .in('conversation_id', ids)
+    .order('created_at', { ascending: false })
+    .limit(1)
+  if (latest && latest.length > 0 && latest[0].conversation_id) {
+    return latest[0].conversation_id
+  }
+  // Fallback: no messages yet in any conv, return the first one.
+  return convs[0].id
+}
+
 export function useLiveChat(companyId: string | null) {
   const [messages, setMessages] = useState<ChatMessageRow[]>([])
+  // Start with localStorage as a fast hint to avoid an empty-flash on load,
+  // then immediately validate against the server in the effect below. If the
+  // server says a different conversation is canonical, we switch.
   const [conversationIdState, setConversationIdState] = useState<string | null>(() => {
     if (!companyId) return null
     try { return localStorage.getItem(convStorageKey(companyId)) } catch { return null }
@@ -60,7 +100,9 @@ export function useLiveChat(companyId: string | null) {
   // user can hit STOP THINKING to kill the call from the client side.
   const inFlightRef = useRef<AbortController | null>(null)
 
-  // When companyId changes, load the stored conversation for that company
+  // When companyId changes, resolve the canonical conversation from the SERVER.
+  // localStorage is a hint, never the source of truth — that's what caused the
+  // mobile/desktop fork.
   useEffect(() => {
     if (!companyId) {
       setConversationIdState(null)
@@ -68,15 +110,23 @@ export function useLiveChat(companyId: string | null) {
       setLoading(false)
       return
     }
-    try {
-      const stored = localStorage.getItem(convStorageKey(companyId))
-      setConversationIdState(stored)
-      convIdRef.current = stored
-    } catch {
-      setConversationIdState(null)
-    }
     setMessages([])
     setWaitingForReply(false)
+    let cancelled = false
+    void (async () => {
+      const canonical = await resolveCanonicalConversation(companyId)
+      if (cancelled) return
+      setConversationIdState(canonical)
+      convIdRef.current = canonical
+      // Sync localStorage so subsequent writes use the same conv id.
+      try {
+        if (canonical) localStorage.setItem(convStorageKey(companyId), canonical)
+        else localStorage.removeItem(convStorageKey(companyId))
+      } catch {
+        /* ignore */
+      }
+    })()
+    return () => { cancelled = true }
   }, [companyId])
 
   const fetchMessages = useCallback(async (convId: string) => {

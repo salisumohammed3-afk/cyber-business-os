@@ -1953,7 +1953,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         // Same pattern will apply to other 4.7+ models when they ship.
         body: JSON.stringify({
           model,
-          max_tokens: 1024,
+          // 1024 was too tight — caused mid-sentence truncation on real
+          // multi-paragraph replies (e.g. agent audit). 4096 gives Opus +
+          // Sonnet room for proper output without runaway cost.
+          max_tokens: 4096,
           ...(model.includes("opus-4-7") || model.includes("opus-4-8") ? {} : { temperature: 0.3 }),
           system: systemPrompt,
           tools: CHAT_TOOLS,

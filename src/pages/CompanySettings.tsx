@@ -525,9 +525,18 @@ function AgentsTab() {
         // sees the bug without clicking Edit. Three specialists in Go
         // Together had this — browser/taskmaster said "for UBS", designer
         // said "for Aura OS".
+        //
+        // Skip the orchestrator: it's loaded with company context dynamically
+        // at every chat turn, so its prompt doesn't NEED to name the company
+        // verbatim, AND we still flag explicit known-stale tenants (UBS etc.)
+        // via the second branch.
         const promptText = (a.system_prompt || "").toLowerCase();
-        const companyName = (company?.name || "").toLowerCase();
-        const promptMissingCompany = companyName.length > 0 && !promptText.includes(companyName);
+        const companyNameRaw = (company?.name || "").toLowerCase();
+        // Try both "Go Together" and "gotogether" forms — they're treated as
+        // equivalent since the brand is rendered both ways across the codebase.
+        const companyTokens = [companyNameRaw, companyNameRaw.replace(/\s+/g, "")].filter(Boolean);
+        const promptMentionsCompany = companyTokens.some(t => t.length > 0 && promptText.includes(t));
+        const promptMissingCompany = !a.is_orchestrator && companyTokens.length > 0 && !promptMentionsCompany;
         const knownStaleTenants = ["ubs", "aura os", "cyber business operating system"]
           .filter(s => promptText.includes(s));
         const hasCrossTenantSignal = promptMissingCompany || knownStaleTenants.length > 0;

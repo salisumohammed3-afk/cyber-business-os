@@ -195,10 +195,16 @@ export function useTerminalLogs() {
     queryKey: ["terminal_logs", companyId],
     queryFn: async () => {
       if (!companyId) return [];
+      // Only show logs from the last 5 minutes. Otherwise the bottom ticker
+      // tape kept replaying yesterday's runner steps and looked like live
+      // activity (Sal saw "Step 8 (60s elapsed, 240s left)" cycling from
+      // 22:04 the previous day).
+      const cutoff = new Date(Date.now() - 5 * 60_000).toISOString();
       const { data, error } = await supabase
         .from("terminal_logs")
         .select("*")
         .eq("company_id", companyId)
+        .gte("created_at", cutoff)
         .order("created_at", { ascending: false })
         .limit(50);
       if (error) throw error;

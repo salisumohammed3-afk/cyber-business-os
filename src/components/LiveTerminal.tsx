@@ -57,13 +57,25 @@ const LiveTerminal = () => {
 
     const fetchLogs = async (initial = false) => {
       if (initial) {
+        // Only show logs from the last 5 minutes on first load. Otherwise the
+        // terminal renders yesterday's runner activity and looks like it's
+        // happening live (Sal saw "Step 8 (60s elapsed, 240s left)" from 22:04
+        // the previous day and assumed the runner was still going).
+        const cutoff = new Date(Date.now() - 5 * 60_000).toISOString();
         const { data } = await supabase
           .from("terminal_logs")
           .select("*")
           .eq("company_id", companyId)
+          .gte("created_at", cutoff)
           .order("created_at", { ascending: false })
           .limit(30);
-        if (!data || data.length === 0) return;
+        if (!data || data.length === 0) {
+          // Anchor the polling cursor to NOW so subsequent fetches pull only
+          // genuinely-new rows. Without this we'd grab the entire history on
+          // the first poll after a quiet period.
+          lastSeenTimestampRef.current = new Date().toISOString();
+          return;
+        }
 
         const sorted = [...data].reverse() as LogEntry[];
         setLines(sorted);
@@ -179,28 +191,34 @@ const LiveTerminal = () => {
         </div>
       </div>
 
-      <div className="flex flex-wrap items-center gap-2 px-4 py-1 border-b border-[hsl(0,0%,12%)]">
-        <input
-          type="text"
-          value={taskFilter}
-          onChange={(e) => setTaskFilter(e.target.value)}
-          placeholder="Filter task id…"
-          className="font-mono text-[10px] h-7 px-2 rounded border border-[hsl(0,0%,20%)] bg-[hsl(0,0%,8%)] text-[hsl(var(--terminal-fg))] w-40 placeholder:text-[hsl(0,0%,35%)]"
-        />
-        <input
-          type="text"
-          value={typeFilter}
-          onChange={(e) => setTypeFilter(e.target.value)}
-          placeholder="Filter log_type…"
-          className="font-mono text-[10px] h-7 px-2 rounded border border-[hsl(0,0%,20%)] bg-[hsl(0,0%,8%)] text-[hsl(var(--terminal-fg))] w-36 placeholder:text-[hsl(0,0%,35%)]"
-        />
-      </div>
+      {/* Hide the filter row entirely when there are no logs to filter — the
+          inputs were confusing without context (Sal: "filter what?"). */}
+      {hasLogs && (
+        <div className="flex flex-wrap items-center gap-2 px-4 py-1 border-b border-[hsl(0,0%,12%)]">
+          <input
+            type="text"
+            value={taskFilter}
+            onChange={(e) => setTaskFilter(e.target.value)}
+            placeholder="Filter by task id…"
+            aria-label="Filter terminal logs by task id"
+            className="font-mono text-[10px] h-7 px-2 rounded border border-[hsl(0,0%,20%)] bg-[hsl(0,0%,8%)] text-[hsl(var(--terminal-fg))] w-40 placeholder:text-[hsl(0,0%,35%)]"
+          />
+          <input
+            type="text"
+            value={typeFilter}
+            onChange={(e) => setTypeFilter(e.target.value)}
+            placeholder="Filter by log type (e.g. tool_call)…"
+            aria-label="Filter terminal logs by log type"
+            className="font-mono text-[10px] h-7 px-2 rounded border border-[hsl(0,0%,20%)] bg-[hsl(0,0%,8%)] text-[hsl(var(--terminal-fg))] w-56 placeholder:text-[hsl(0,0%,35%)]"
+          />
+        </div>
+      )}
 
       {/* Log output */}
       <div ref={scrollRef} className="h-40 overflow-y-auto px-4 py-2">
         {!hasLogs && (
           <div className="font-mono text-[11px] text-[hsl(0,0%,40%)] leading-5">
-            &gt; Waiting for agent activity...
+            &gt; No agent activity in the last 5 min — terminal is idle.
           </div>
         )}
         {filteredLines.map((line) => {

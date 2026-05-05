@@ -1194,33 +1194,50 @@ async function runCallVendorHttp(
 
   // Update integration status based on what came back. Same rules as the
   // registry-driven path — 2xx flips to "ok", 401/403 flips to "broken".
-  // (Earlier version chained `.then(() => {}, () => {})` to silently ignore
-  // failures — that turned out to swallow real errors. End-to-end verify
-  // showed the row never updated even on 200 responses. Now we log and
-  // surface the error in the tool result so we can see what's wrong.)
+  let _statusFlipDiag: string | null = null;
   if (r.ok) {
-    const { error: updErr } = await supabase
+    const upd = await supabase
       .from("integrations")
       .update({
         status: "ok",
         last_tested_at: new Date().toISOString(),
         last_test_error: null,
       })
-      .eq("id", row.id);
-    if (updErr) console.error(`call_vendor_http: failed to flip status=ok for ${vendor}:`, updErr.message);
+      .eq("id", row.id)
+      .select("id,status");
+    if (upd.error) {
+      _statusFlipDiag = `update error: ${upd.error.message} (code=${upd.error.code} hint=${upd.error.hint || "n/a"})`;
+      console.error(`call_vendor_http(${vendor}): ${_statusFlipDiag}`);
+    } else if (!upd.data || upd.data.length === 0) {
+      _statusFlipDiag = `update returned 0 rows for id=${row.id} (RLS likely)`;
+      console.error(`call_vendor_http(${vendor}): ${_statusFlipDiag}`);
+    } else {
+      _statusFlipDiag = `flipped to ok (${upd.data.length} row(s))`;
+    }
   } else if (r.status === 401 || r.status === 403) {
-    const { error: updErr } = await supabase
+    const upd = await supabase
       .from("integrations")
       .update({
         status: "broken",
         last_test_error: `Auth failed (${r.status}) on ${method} ${path}`,
       })
-      .eq("id", row.id);
-    if (updErr) console.error(`call_vendor_http: failed to flip status=broken for ${vendor}:`, updErr.message);
+      .eq("id", row.id)
+      .select("id,status");
+    if (upd.error) {
+      _statusFlipDiag = `update error: ${upd.error.message}`;
+      console.error(`call_vendor_http(${vendor}): ${_statusFlipDiag}`);
+    } else if (!upd.data || upd.data.length === 0) {
+      _statusFlipDiag = `update returned 0 rows (RLS likely)`;
+    }
   }
 
   const summary = json ?? text.slice(0, 6000);
-  return JSON.stringify({ ok: r.ok, status: r.status, response: summary });
+  return JSON.stringify({
+    ok: r.ok,
+    status: r.status,
+    response: summary,
+    ...(_statusFlipDiag ? { _status_flip_diag: _statusFlipDiag } : {}),
+  });
 }
 
 async function runUpdateGoal(

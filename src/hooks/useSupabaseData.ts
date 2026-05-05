@@ -176,6 +176,70 @@ export function useChatMessages() {
   });
 }
 
+// Errors that landed in chat_messages within the last 7 days, grouped by
+// their root cause. Used by the Failed tab in ActionPipeline so user-facing
+// errors aren't invisible just because they didn't make it into the tasks
+// table (e.g. Anthropic billing errors live entirely in chat_messages).
+export interface ChatErrorGroup {
+  signature: string;       // first 80 chars of original_error or content
+  count: number;
+  latest_at: string;
+  conversation_ids: string[];
+  sample_message: string;
+  original_error?: string;
+}
+
+export function useChatErrors() {
+  const { company } = useCompany();
+  const companyId = company?.id;
+  return useQuery<ChatErrorGroup[]>({
+    queryKey: ["chat_errors", companyId],
+    queryFn: async () => {
+      if (!companyId) return [];
+      // Get conversations for this company first, then errors from those.
+      const { data: convs } = await supabase
+        .from("conversations")
+        .select("id")
+        .eq("company_id", companyId);
+      const convIds = (convs || []).map((c: { id: string }) => c.id);
+      if (convIds.length === 0) return [];
+      const cutoff = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+      const { data, error } = await supabase
+        .from("chat_messages")
+        .select("id, content, metadata, created_at, conversation_id")
+        .eq("kind", "error")
+        .in("conversation_id", convIds)
+        .gte("created_at", cutoff)
+        .order("created_at", { ascending: false })
+        .limit(200);
+      if (error) throw error;
+      const groups = new Map<string, ChatErrorGroup>();
+      for (const row of (data || []) as Array<{ id: string; content: string; metadata: Record<string, unknown> | null; created_at: string; conversation_id: string }>) {
+        const original = (row.metadata?.original_error as string) || row.content || "";
+        const sig = original.slice(0, 80) || "(empty error)";
+        const existing = groups.get(sig);
+        if (existing) {
+          existing.count += 1;
+          if (!existing.conversation_ids.includes(row.conversation_id)) existing.conversation_ids.push(row.conversation_id);
+          if (row.created_at > existing.latest_at) existing.latest_at = row.created_at;
+        } else {
+          groups.set(sig, {
+            signature: sig,
+            count: 1,
+            latest_at: row.created_at,
+            conversation_ids: [row.conversation_id],
+            sample_message: row.content,
+            original_error: original,
+          });
+        }
+      }
+      return Array.from(groups.values()).sort((a, b) => b.latest_at.localeCompare(a.latest_at));
+    },
+    refetchInterval: 15_000,
+    enabled: !!companyId,
+  });
+}
+
 export function useMetrics() {
   return useQuery({
     queryKey: ["metrics"],

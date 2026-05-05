@@ -1,5 +1,5 @@
 import { useState, useMemo } from "react";
-import { useTasks, useTaskActions, type Task } from "@/hooks/useSupabaseData";
+import { useTasks, useTaskActions, useChatErrors, type Task } from "@/hooks/useSupabaseData";
 import {
   CheckCircle2,
   Loader2,
@@ -80,6 +80,7 @@ function relativeTime(dateStr?: string | null): string {
 
 const ActionPipeline = () => {
   const { data: tasks = [], isLoading } = useTasks();
+  const { data: chatErrors = [] } = useChatErrors();
   const { deleteTask } = useTaskActions();
   const [activeTab, setActiveTab] = useState<TabKey>("proposed");
   const [selectedTask, setSelectedTask] = useState<Task | null>(null);
@@ -95,8 +96,12 @@ const ActionPipeline = () => {
       if (t.status === "cancelled") counts.rejected++;
       if (t.status === "failed") counts.failed++;
     }
+    // Roll chat errors into the Failed badge so it doesn't sit at 0 while
+    // there are 25 unsurfaced errors in chat_messages (the Anthropic billing
+    // failures that swallowed user retries on April 21).
+    counts.failed += chatErrors.length;
     return counts;
-  }, [tasks]);
+  }, [tasks, chatErrors]);
 
   const filtered = useMemo(() => filterTasks(tasks, activeTab), [tasks, activeTab]);
 
@@ -135,9 +140,55 @@ const ActionPipeline = () => {
         </div>
 
         <div className="flex-1 overflow-y-auto p-3 space-y-2">
+          {/* Failed tab: render chat-level error groups in addition to any
+              tasks with status='failed'. Chat errors live entirely in
+              chat_messages — Sal's 25 Anthropic-billing errors from April 21
+              never showed up here before. */}
+          {activeTab === "failed" && chatErrors.length > 0 && (
+            <div className="space-y-2">
+              <div className="text-[10px] font-mono uppercase tracking-wider text-muted-foreground px-1">
+                Chat errors (last 7 days, grouped by root cause)
+              </div>
+              {chatErrors.map((g) => (
+                <div
+                  key={g.signature}
+                  className="rounded-md p-3 border border-red-500/30 bg-red-500/[0.04]"
+                >
+                  <div className="flex items-start gap-2.5">
+                    <AlertCircle size={14} className="mt-0.5 flex-shrink-0 text-red-500" />
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <p className="text-xs font-medium text-foreground">
+                          {g.sample_message.slice(0, 100)}
+                        </p>
+                        {g.count > 1 && (
+                          <span className="text-[10px] font-mono px-1.5 py-0.5 rounded-full bg-red-500/15 text-red-700 dark:text-red-300">
+                            ×{g.count}
+                          </span>
+                        )}
+                      </div>
+                      {g.original_error && g.original_error !== g.sample_message && (
+                        <p className="text-[11px] text-muted-foreground mt-1 font-mono line-clamp-2">
+                          {g.original_error.slice(0, 240)}
+                        </p>
+                      )}
+                      <p className="text-[10px] text-muted-foreground mt-1">
+                        Most recent: {relativeTime(g.latest_at)}
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              ))}
+              {filtered.length > 0 && (
+                <div className="text-[10px] font-mono uppercase tracking-wider text-muted-foreground px-1 pt-3">
+                  Failed tasks
+                </div>
+              )}
+            </div>
+          )}
           {isLoading ? (
             <div className="p-8 text-center text-xs text-muted-foreground">Loading tasks...</div>
-          ) : filtered.length === 0 ? (
+          ) : filtered.length === 0 && !(activeTab === "failed" && chatErrors.length > 0) ? (
             <div className="p-8 text-center text-xs text-muted-foreground">
               No tasks in this category.
             </div>

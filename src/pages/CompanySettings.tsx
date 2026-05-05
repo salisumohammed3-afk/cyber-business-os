@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { ArrowLeft, Save, Plus, Trash2, Target, Bot, Wrench, FileText, Bell, Plug, CalendarClock } from "lucide-react";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -15,38 +15,107 @@ const STAGES = ["idea", "building", "pre-revenue", "scaling", "established"] as 
 
 // ── Brief Tab ──────────────────────────────────────────────────────────────
 
+// Auto-grow textarea — height tracks content via scrollHeight on every change.
+// Fixes the BriefTab issue where the "What We Do" textarea was clipped at 3
+// visible lines and Sal's brief continued past the visible window.
+function AutoTextarea({
+  value,
+  onChange,
+  onBlur,
+  placeholder,
+  className,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  onBlur?: () => void;
+  placeholder?: string;
+  className?: string;
+}) {
+  const ref = useRef<HTMLTextAreaElement | null>(null);
+  // Resize on every value change.
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = el.scrollHeight + "px";
+  }, [value]);
+  return (
+    <textarea
+      ref={ref}
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+      onBlur={onBlur}
+      placeholder={placeholder}
+      rows={1}
+      className={className}
+      style={{ resize: "none", overflow: "hidden" }}
+    />
+  );
+}
+
 function BriefTab() {
   const { company, refreshCompanies } = useCompany();
   const [brief, setBrief] = useState<CompanyBrief>({});
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  // Track whether the local brief has unsaved changes vs. what's persisted.
+  // Used to decide whether onBlur should actually fire a write.
+  const [dirty, setDirty] = useState(false);
 
   useEffect(() => {
     if (company?.brief) setBrief(company.brief);
   }, [company]);
 
-  const save = async () => {
-    if (!company) return;
+  const save = useCallback(async () => {
+    if (!company || !dirty) return;
     setSaving(true);
     await supabase.from("companies").update({ brief }).eq("id", company.id);
     await refreshCompanies();
     setSaving(false);
+    setDirty(false);
     setSaved(true);
     setTimeout(() => setSaved(false), 2000);
-  };
+  }, [company, brief, dirty, refreshCompanies]);
 
   const update = (key: keyof CompanyBrief, value: unknown) => {
     setBrief((prev) => ({ ...prev, [key]: value }));
     setSaved(false);
+    setDirty(true);
   };
+
+  // Inline save status — replaces the "Save Brief" CTA at the bottom of the
+  // form (which used to require scrolling past a long brief to even reach).
+  const statusLabel = saving ? "Saving…" : saved ? "Saved." : dirty ? "Unsaved changes" : "Up to date";
+  const statusClass = saving
+    ? "text-amber-600"
+    : saved
+      ? "text-emerald-600"
+      : dirty
+        ? "text-orange-600"
+        : "text-muted-foreground";
 
   return (
     <div className="space-y-6 max-w-2xl">
+      {/* Sticky header with live save status. Autosave fires on each field's
+          onBlur; manual button is still available as a fallback. */}
+      <div className="sticky top-0 z-10 -mx-2 px-2 py-2 bg-background/95 backdrop-blur border-b flex items-center justify-between">
+        <span className={`text-xs font-mono ${statusClass}`}>{statusLabel}</span>
+        <button
+          onClick={save}
+          disabled={saving || !dirty}
+          className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-blue-600 text-white text-xs font-medium hover:bg-blue-700 disabled:opacity-40"
+        >
+          <Save size={12} />
+          {saving ? "Saving…" : "Save now"}
+        </button>
+      </div>
+
       <div>
         <label className="text-sm font-medium">What We Do</label>
-        <textarea
+        <AutoTextarea
           value={brief.what_we_do || ""}
-          onChange={(e) => update("what_we_do", e.target.value)}
+          onChange={(v) => update("what_we_do", v)}
+          onBlur={save}
           placeholder="One paragraph: what the business sells, who it serves, how it makes money."
           className="mt-1 w-full rounded-lg border px-3 py-2 text-sm min-h-[80px] focus:outline-none focus:ring-2 focus:ring-blue-500"
         />
@@ -57,9 +126,10 @@ function BriefTab() {
         <select
           value={brief.stage || ""}
           onChange={(e) => update("stage", e.target.value || undefined)}
+          onBlur={save}
           className="mt-1 w-full rounded-lg border px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
         >
-          <option value="">Select stage...</option>
+          <option value="">Select stage…</option>
           {STAGES.map((s) => (
             <option key={s} value={s}>
               {s.replace("-", " ")}
@@ -70,9 +140,10 @@ function BriefTab() {
 
       <div>
         <label className="text-sm font-medium">Target Customers</label>
-        <textarea
+        <AutoTextarea
           value={brief.target_customers || ""}
-          onChange={(e) => update("target_customers", e.target.value)}
+          onChange={(v) => update("target_customers", v)}
+          onBlur={save}
           placeholder="Industry, size, role, geography."
           className="mt-1 w-full rounded-lg border px-3 py-2 text-sm min-h-[60px] focus:outline-none focus:ring-2 focus:ring-blue-500"
         />
@@ -83,29 +154,22 @@ function BriefTab() {
         <input
           value={brief.tone_of_voice || ""}
           onChange={(e) => update("tone_of_voice", e.target.value)}
-          placeholder="How the brand communicates."
+          onBlur={save}
+          placeholder="How the brand communicates (e.g. friendly, fresh, fun)."
           className="mt-1 w-full rounded-lg border px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
         />
       </div>
 
       <div>
         <label className="text-sm font-medium">Context Notes</label>
-        <textarea
+        <AutoTextarea
           value={brief.context_notes || ""}
-          onChange={(e) => update("context_notes", e.target.value)}
+          onChange={(v) => update("context_notes", v)}
+          onBlur={save}
           placeholder="Competitors, constraints, recent events — anything the agents should know."
           className="mt-1 w-full rounded-lg border px-3 py-2 text-sm min-h-[80px] focus:outline-none focus:ring-2 focus:ring-blue-500"
         />
       </div>
-
-      <button
-        onClick={save}
-        disabled={saving}
-        className="flex items-center gap-2 px-4 py-2 rounded-lg bg-blue-600 text-white text-sm font-medium hover:bg-blue-700 disabled:opacity-50"
-      >
-        <Save size={14} />
-        {saving ? "Saving..." : saved ? "Saved!" : "Save Brief"}
-      </button>
     </div>
   );
 }

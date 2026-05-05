@@ -42,6 +42,37 @@ function extractScheduleProposal(text: string) {
   return extractJsonAfterAnyMarker(text, SCHEDULE_MARKER);
 }
 
+// Translate Anthropic API errors into messages that tell Sal what to actually
+// do. The raw upstream body is still kept in metadata.original_error so we can
+// debug, but the user-facing chat row gets the humanized version.
+function humanizeAnthropicError(status: number, body: string): string {
+  const lower = (body || "").toLowerCase();
+  if (lower.includes("credit balance is too low") || lower.includes("billing")) {
+    return "🪫 Anthropic credits are out — top up at https://console.anthropic.com/settings/billing then send the message again.";
+  }
+  if (status === 401 || lower.includes("invalid_api_key") || lower.includes("authentication")) {
+    return "🔑 Anthropic API key is invalid or revoked. Rotate it on console.anthropic.com and update the ANTHROPIC_API_KEY env var (Vercel project settings).";
+  }
+  if (status === 429 || lower.includes("rate_limit") || lower.includes("rate limit")) {
+    return "⏱️ Anthropic rate limit hit. Wait ~60s and try again. If it keeps happening, raise org-level limits in console.anthropic.com.";
+  }
+  if (lower.includes("model_not_found") || lower.includes("model not found")) {
+    return "🤖 The model id this orchestrator is configured to use isn't available on your Anthropic plan. Check Settings → Agents → Orchestrator → Model.";
+  }
+  if (lower.includes("overloaded")) {
+    return "🌪️ Anthropic is overloaded. Try again in a few seconds.";
+  }
+  // Default: extract the first useful line of the upstream JSON message.
+  try {
+    const parsed = JSON.parse(body);
+    const m = parsed?.error?.message || parsed?.message;
+    if (typeof m === "string" && m.length > 0) {
+      return `⚠️ Anthropic ${status}: ${m.slice(0, 280)}`;
+    }
+  } catch { /* not JSON, fall through */ }
+  return `⚠️ Anthropic ${status}: ${body.slice(0, 280) || "no body"}`;
+}
+
 // In-memory rate limiter (resets on cold start / redeploy)
 const rateLimitMap = new Map<string, number[]>();
 const RATE_LIMIT_WINDOW = 60_000; // 1 minute
@@ -237,7 +268,8 @@ If Sal said "send the email blast", "post this on LinkedIn", "deploy to prod", "
 - \`call_integration\` — any registered vendor action (POST/GET/etc, no method restriction).
 
 **Writing (just call them — no approval cards needed):**
-- \`cancel_tasks\`, \`manage_schedule\`, \`run_schedule_now\`, \`update_goal\`, \`store_memory\`
+- \`cancel_tasks\` — always pass a one-line \`reason\` paraphrasing Sal's instruction (e.g. \`reason: "clear failed list"\`). Stored on each cancelled row for future audits.
+- \`manage_schedule\`, \`run_schedule_now\`, \`update_goal\`, \`store_memory\`
 - \`update_agent\` / \`revert_agent\` — modify ANY agent including yourself
 - \`add_integration\` — wire any vendor, registered or custom
 - \`call_vendor_http\` — generic HTTP through any connected vendor
@@ -315,8 +347,9 @@ const CHAT_TOOLS = [
     name: "cancel_tasks",
     description:
       "Cancel tasks. Use when Sal says 'clear the list', 'cancel those proposals', 'kill what's running', etc. " +
-      "REQUIRES either status (filters by status) or task_ids (specific tasks). Hard cap of 50 per call. " +
-      "Reports back how many were cancelled.",
+      "REQUIRES either status (filters by status) or task_ids (specific tasks). Hard cap of 500 per call. " +
+      "Reports back how many were cancelled. ALWAYS pass a one-line `reason` paraphrasing Sal's instruction — " +
+      "it's stored on each cancelled row so future audits show real context, not 'Cancelled by orchestrator at user request'.",
     input_schema: {
       type: "object",
       properties: {
@@ -333,6 +366,10 @@ const CHAT_TOOLS = [
         max: {
           type: "number",
           description: "Safety cap on number to cancel. Default 500, max 500. Iterate if more.",
+        },
+        reason: {
+          type: "string",
+          description: "One-line paraphrase of why Sal asked you to cancel (e.g. \"clear failed list\" or \"cancel App Store research, was wrong direction\"). Stored on each cancelled row.",
         },
       },
     },
@@ -689,6 +726,13 @@ async function runCancelTasks(
   const status = typeof input.status === "string" ? input.status : null;
   const taskIds = Array.isArray(input.task_ids) ? (input.task_ids as string[]).filter(s => typeof s === "string") : null;
   const cap = Math.min(Number(input.max) || 500, 500);
+  // Reason is the orchestrator's note about WHY this cancel happened — usually
+  // a short paraphrase of Sal's instruction. Stored on each cancelled row so
+  // future "what did I cancel and why?" queries return real context, not the
+  // generic "Cancelled by orchestrator at user request" placeholder.
+  const reason = typeof input.reason === "string" && input.reason.trim()
+    ? input.reason.trim().slice(0, 240)
+    : null;
 
   if (!status && (!taskIds || taskIds.length === 0)) {
     return JSON.stringify({
@@ -716,12 +760,15 @@ async function runCancelTasks(
 
   const ids = targets.map((t: { id: string }) => t.id);
   const nowIso = new Date().toISOString();
+  const cancelMessage = reason
+    ? `Cancelled at ${nowIso.slice(0,16).replace('T',' ')}Z — ${reason}`
+    : `Cancelled at ${nowIso.slice(0,16).replace('T',' ')}Z (no reason supplied)`;
   const { error: updErr } = await supabase
     .from("tasks")
     .update({
       status: "cancelled",
       completed_at: nowIso,
-      error_message: "Cancelled by orchestrator at user request",
+      error_message: cancelMessage,
     })
     .in("id", ids);
   if (updErr) return JSON.stringify({ error: updErr.message });
@@ -919,6 +966,15 @@ async function runCallIntegration(
     }
     return JSON.stringify({ error: `${vendor}.${actionName} returned HTTP ${r.status}: ${text.slice(0, 400)}` });
   }
+
+  // 2xx — mark the integration verified. Without this, an integration added via
+  // add_integration stays "unverified" forever even though it's clearly working,
+  // which is what Sal saw with Mirage.
+  await supabase.from("integrations").update({
+    status: "ok",
+    last_tested_at: new Date().toISOString(),
+    last_test_error: null,
+  }).eq("id", row.id).then(() => {}, () => {});
 
   // Truncate if huge so we don't blow the chat-mode token budget
   const summary = json ?? text.slice(0, 6000);
@@ -1129,6 +1185,22 @@ async function runCallVendorHttp(
   const text = await r.text();
   let json: unknown = null;
   try { json = JSON.parse(text); } catch { /* leave as text */ }
+
+  // Update integration status based on what came back. Same rules as the
+  // registry-driven path — 2xx flips to "ok", 401/403 flips to "broken".
+  if (r.ok) {
+    await supabase.from("integrations").update({
+      status: "ok",
+      last_tested_at: new Date().toISOString(),
+      last_test_error: null,
+    }).eq("id", row.id).then(() => {}, () => {});
+  } else if (r.status === 401 || r.status === 403) {
+    await supabase.from("integrations").update({
+      status: "broken",
+      last_test_error: `Auth failed (${r.status}) on ${method} ${path}`,
+    }).eq("id", row.id).then(() => {}, () => {});
+  }
+
   const summary = json ?? text.slice(0, 6000);
   return JSON.stringify({ ok: r.ok, status: r.status, response: summary });
 }
@@ -1967,11 +2039,16 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       if (!anthropicRes.ok) {
         const errBody = await anthropicRes.text().catch(() => "");
         const errMsg = `Anthropic ${anthropicRes.status}: ${errBody.slice(0, 300)}`;
+        // Surface a humanized version that tells the user what to actually do.
+        // Old behavior was to just dump the raw upstream message; that gave Sal
+        // 25 unintelligible "Chat error: Anthropic 400: ..." rows on April 21
+        // when the real problem was an exhausted credit balance.
+        const humanized = humanizeAnthropicError(anthropicRes.status, errBody);
         await supabase.from("chat_messages").insert({
           conversation_id,
           role: "system",
           kind: "error",
-          content: `Chat error: ${errMsg.slice(0, 500)}`,
+          content: humanized,
           timestamp: new Date().toISOString(),
           metadata: { kind: "error", source: "anthropic", original_error: errMsg },
         }).then(() => {}, () => {});

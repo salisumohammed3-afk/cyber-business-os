@@ -2324,7 +2324,8 @@ async function runLoop(model, systemPrompt, messages, tools, timeBudgetMs, tempe
       // Compact old messages every 5 turns to control context growth
       if (turn % 5 === 0) compactMessages(messages);
 
-      // Post progress message to chat every 3 turns
+      // Post progress message to chat every 3 turns. metadata.task_id is set
+      // so the terminal-state cleanup at end-of-task can scope its DELETE.
       if (turn % 3 === 0 && CONVERSATION_ID) {
         const recentTools = allToolCalls.slice(-3).map(t => t.tool).join(", ");
         await sbInsert("chat_messages", {
@@ -2333,7 +2334,7 @@ async function runLoop(model, systemPrompt, messages, tools, timeBudgetMs, tempe
           kind: "progress",
           content: "Working on it... (step " + turn + ", using: " + recentTools + ")",
           timestamp: new Date().toISOString(),
-          metadata: { kind: "progress", progress: true, agent_slug: agentSlug, turn },
+          metadata: { kind: "progress", progress: true, agent_slug: agentSlug, turn, task_id: TASK_ID },
         }).catch(() => {}); // non-fatal
       }
 
@@ -3169,6 +3170,19 @@ async function main() {
     completed_at: new Date().toISOString(),
     ...(failReason ? { error_message: failReason } : {}),
   }, { id: "eq." + TASK_ID });
+
+  // Clean up the per-turn "Working on it..." progress messages now that the
+  // task has reached a terminal state. Without this, every multi-turn delegation
+  // leaves N progress rows in chat_messages forever (Sal's main convo had 293
+  // of these stacked between actual replies). Scoped by task_id so concurrent
+  // tasks aren't affected.
+  if (CONVERSATION_ID) {
+    await sbDelete("chat_messages", {
+      conversation_id: "eq." + CONVERSATION_ID,
+      kind: "eq.progress",
+      "metadata->>task_id": "eq." + TASK_ID,
+    }).catch(() => {});
+  }
 
   await sbInsert("task_results", {
     task_id: TASK_ID,

@@ -970,11 +970,17 @@ async function runCallIntegration(
   // 2xx — mark the integration verified. Without this, an integration added via
   // add_integration stays "unverified" forever even though it's clearly working,
   // which is what Sal saw with Mirage.
-  await supabase.from("integrations").update({
-    status: "ok",
-    last_tested_at: new Date().toISOString(),
-    last_test_error: null,
-  }).eq("id", row.id).then(() => {}, () => {});
+  {
+    const { error: updErr } = await supabase
+      .from("integrations")
+      .update({
+        status: "ok",
+        last_tested_at: new Date().toISOString(),
+        last_test_error: null,
+      })
+      .eq("id", row.id);
+    if (updErr) console.error(`call_integration: failed to flip status=ok for ${vendor}:`, updErr.message);
+  }
 
   // Truncate if huge so we don't blow the chat-mode token budget
   const summary = json ?? text.slice(0, 6000);
@@ -1188,17 +1194,29 @@ async function runCallVendorHttp(
 
   // Update integration status based on what came back. Same rules as the
   // registry-driven path — 2xx flips to "ok", 401/403 flips to "broken".
+  // (Earlier version chained `.then(() => {}, () => {})` to silently ignore
+  // failures — that turned out to swallow real errors. End-to-end verify
+  // showed the row never updated even on 200 responses. Now we log and
+  // surface the error in the tool result so we can see what's wrong.)
   if (r.ok) {
-    await supabase.from("integrations").update({
-      status: "ok",
-      last_tested_at: new Date().toISOString(),
-      last_test_error: null,
-    }).eq("id", row.id).then(() => {}, () => {});
+    const { error: updErr } = await supabase
+      .from("integrations")
+      .update({
+        status: "ok",
+        last_tested_at: new Date().toISOString(),
+        last_test_error: null,
+      })
+      .eq("id", row.id);
+    if (updErr) console.error(`call_vendor_http: failed to flip status=ok for ${vendor}:`, updErr.message);
   } else if (r.status === 401 || r.status === 403) {
-    await supabase.from("integrations").update({
-      status: "broken",
-      last_test_error: `Auth failed (${r.status}) on ${method} ${path}`,
-    }).eq("id", row.id).then(() => {}, () => {});
+    const { error: updErr } = await supabase
+      .from("integrations")
+      .update({
+        status: "broken",
+        last_test_error: `Auth failed (${r.status}) on ${method} ${path}`,
+      })
+      .eq("id", row.id);
+    if (updErr) console.error(`call_vendor_http: failed to flip status=broken for ${vendor}:`, updErr.message);
   }
 
   const summary = json ?? text.slice(0, 6000);

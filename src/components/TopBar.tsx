@@ -87,10 +87,22 @@ function CreateCompanyDialog({
 }
 
 const TopBar = () => {
-  const { company, companies, switchCompany } = useCompany();
+  const { company, companies, switchCompany, loading } = useCompany();
   const [showCreate, setShowCreate] = useState(false);
   const navigate = useNavigate();
   const isMobile = useIsMobile();
+
+  // Distinguish three states for the switcher label:
+  // - loading=true: companies still fetching (don't say "Select Company" — that's
+  //   misleading because we may already have one persisted in localStorage and
+  //   the dropdown will populate momentarily). Sal saw this on first load: the
+  //   dropdown showed "Select Company" then auto-resolved to Go Together as
+  //   soon as he clicked, because the resolve was waiting on the fetch.
+  // - loading=false, no company, no companies: empty account → "Select Company"
+  // - loading=false, no company but companies exist: stale active id → "Select Company"
+  const switcherLabel = loading
+    ? "Loading…"
+    : company?.name || "Select Company";
 
   return (
     <>
@@ -100,8 +112,8 @@ const TopBar = () => {
           <DropdownMenuTrigger asChild>
             <button className="flex items-center gap-1.5 sm:gap-2 px-2 sm:px-3 py-1.5 rounded-md hover:bg-secondary transition-colors min-w-0 flex-shrink">
               <Building2 size={16} className="text-blue-500 flex-shrink-0" />
-              <span className="text-sm font-semibold tracking-tight text-foreground truncate">
-                {company?.name || "Select Company"}
+              <span className={`text-sm font-semibold tracking-tight truncate ${loading ? 'text-muted-foreground italic' : 'text-foreground'}`}>
+                {switcherLabel}
               </span>
               <ChevronDown size={14} className="text-muted-foreground flex-shrink-0" />
             </button>

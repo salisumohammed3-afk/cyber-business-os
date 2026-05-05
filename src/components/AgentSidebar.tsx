@@ -25,7 +25,7 @@ interface AgentDef {
 
 const AgentSidebar = () => {
   const { data: agents = [], isLoading } = useAgentDefinitions();
-  const { company } = useCompany();
+  const { company, loading: companyLoading } = useCompany();
   const navigate = useNavigate();
 
   // Per-agent live state: how many tasks completed lifetime, and whether one
@@ -72,10 +72,15 @@ const AgentSidebar = () => {
       </div>
 
       <div className="flex-1 overflow-y-auto p-2 space-y-1">
-        {isLoading && (
-          <div className="p-4 text-xs text-muted-foreground">Loading agents...</div>
+        {(companyLoading || isLoading) && (
+          <div className="p-4 text-xs text-muted-foreground">Loading agents…</div>
         )}
-        {!isLoading && agents.length === 0 && (
+        {!companyLoading && !isLoading && !company && (
+          <div className="p-4 text-xs text-muted-foreground italic">
+            Select a company to see its team.
+          </div>
+        )}
+        {!companyLoading && !isLoading && company && agents.length === 0 && (
           <div className="p-4 text-xs text-muted-foreground italic">
             No agents configured for this company yet.
           </div>

@@ -396,16 +396,16 @@ export function CEOChat() {
                 : []
             )
 
-            // Render progress messages as subtle status indicators
+            // Drop progress messages from render entirely. They previously
+            // rendered as subtle italic status lines, but since the runner
+            // posts one every 3 turns and they persist forever in
+            // chat_messages, Sal's main convo had 293 of them stacked between
+            // actual replies. The STOP THINKING button + waitingForReply
+            // already conveys "task running"; we don't need per-step rows
+            // permanently in the scrollback. (Server-side cleanup at task
+            // terminal state also deletes them now — see runner.mjs.)
             if (kind === 'progress' || meta?.progress === true) {
-              return (
-                <div key={msg.id} className="flex justify-start">
-                  <div className="text-xs text-gray-400 italic px-4 py-1 flex items-center gap-1.5">
-                    <Loader2 size={10} className="animate-spin" />
-                    {msg.content}
-                  </div>
-                </div>
-              )
+              return null
             }
 
             // Render kind=integration_problem — auth failure on a connected integration.

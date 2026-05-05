@@ -974,7 +974,7 @@ async function runCallIntegration(
     const { error: updErr } = await supabase
       .from("integrations")
       .update({
-        status: "ok",
+        status: "active",
         last_tested_at: new Date().toISOString(),
         last_test_error: null,
       })
@@ -1199,7 +1199,7 @@ async function runCallVendorHttp(
     const upd = await supabase
       .from("integrations")
       .update({
-        status: "ok",
+        status: "active",
         last_tested_at: new Date().toISOString(),
         last_test_error: null,
       })

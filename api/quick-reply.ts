@@ -104,7 +104,13 @@ const AGENT_FOR_TYPE: Record<WorkOrderType, string> = {
   edit_project: "engineering",
   send_outreach: "growth",
   design_mockup: "designer",
-  meeting_admin: "executive-assistant",
+  // meeting_admin used to route to a dedicated executive-assistant agent.
+  // Sal pruned that agent — the orchestrator now handles EA work inline (no
+  // delegation needed for calendar / email triage / meeting notes). Routing
+  // any meeting_admin work order to orchestrator keeps the type alive in
+  // case it gets emitted, but in practice orchestrator should just do the
+  // work in-chat rather than spawn a delegated task.
+  meeting_admin: "orchestrator",
   summary: "orchestrator",
 };
 

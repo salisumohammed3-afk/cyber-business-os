@@ -86,17 +86,18 @@ const AgentSidebar = () => {
           </div>
         )}
         {!isLoading && (agents as AgentDef[]).slice().sort((a, b) => {
-          // Display order: orchestrator first (it leads the team), then
-          // delivery specialists, then growth/sales/outreach, then utility
-          // agents. Anything not listed falls to the end alphabetically.
-          // Replaces the previous flat alphabetical sort which buried the
-          // orchestrator in the middle of the list.
+          // Display order: orchestrator leads, then delivery specialists,
+          // then growth (which absorbs outreach + BD). Sal pruned outreach,
+          // sales, browser, taskmaster, and executive-assistant — the
+          // orchestrator handles EA work directly and growth handles
+          // outreach + BD. Anything not in this list falls to the end
+          // alphabetically (forward-compatible if new agents are added).
           const order = [
             'orchestrator',
-            'engineering', 'designer', 'research',
-            'growth', 'sales', 'outreach',
-            'taskmaster', 'browser',
-            'executive-assistant',
+            'engineering',
+            'designer',
+            'research',
+            'growth',
           ];
           const ai = order.indexOf(a.slug);
           const bi = order.indexOf(b.slug);

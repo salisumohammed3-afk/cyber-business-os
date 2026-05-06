@@ -2030,7 +2030,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           "Content-Type": "application/json",
           ...(conduitSecret ? { "X-Conduit-Secret": conduitSecret } : {}),
         },
-        body: JSON.stringify({ company_id, conversation_id, user_message: message, attachments: attachmentList }),
+        body: JSON.stringify({ company_id, conversation_id, user_message: message, attachments: Array.isArray(attachments) ? attachments : [] }),
       });
       if (!upstream.ok) {
         const errBody = await upstream.text().catch(() => "");

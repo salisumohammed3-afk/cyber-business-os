@@ -2619,7 +2619,22 @@ async function main() {
     "## Memory\n" +
     "You have persistent memory across tasks. Use `recall_memories` to check what you or your teammates already know before starting work. " +
     "After completing significant work, store key findings, decisions, and learnings using `store_memory` — your future self and teammates will use them. " +
-    "Scopes: mine (default, your own memories), team (all agents), agent:<slug> (specific teammate).";
+    "Scopes: mine (default, your own memories), team (all agents), agent:<slug> (specific teammate)." +
+
+    // ── Anti-hallucination — HARD RULE ──────────────────────────────────────
+    // Sal's repeated failure case: an agent on a build_static_site work order
+    // emits text like "Designer task is queued" or "Site is live at <url>"
+    // with tool_calls=[]. The runner now refuses to mark such a task complete
+    // (see WORK_ORDER_REQUIRED_TOOLS) but the model should never produce that
+    // output in the first place. This rule sits in EVERY agent's runtime
+    // addendum so it can't be missed.
+    "\n\n## Anti-hallucination — non-negotiable\n" +
+    "Words alone are not work. If you say 'I queued the designer', you MUST have called `delegate_task` in this same response. " +
+    "If you say 'site is live at X', you MUST have called `deploy_static_site` and that call MUST have succeeded with a real URL. " +
+    "If you say 'I pushed the file', you MUST have called `github_push_file` successfully. " +
+    "Pattern to follow: call the tool first, see its real result, THEN write a text answer that reflects that result. " +
+    "If you can't call the tool right now, say what's blocking you — DO NOT narrate fake completion. " +
+    "The runner now enforces this server-side: a task that finishes with zero required tool calls is automatically marked FAILED with the reason 'Hallucinated completion'. So you'll be caught.";
 
   if (agentSlug === "orchestrator") {
     operationalRules +=
@@ -2761,6 +2776,31 @@ async function main() {
     summary: new Set([
       "database_query", "store_memory", "recall_memories", "fail_task",
     ]),
+  };
+
+  // EVIDENCE-OF-WORK requirement per work-order type. After the loop, the
+  // runner checks toolCalls against this set: if a type is listed here and
+  // ZERO of its required tools were called, the task is marked FAILED with
+  // a clear "hallucinated completion" message — instead of silently passing
+  // the model's text claim ("Designer task is queued", "Site is live", etc.)
+  // through as success.
+  //
+  // Sal's failure case (task cb24824e, 2026-05-06): engineering on a
+  // build_static_site work order replied "Designer task is live and queued"
+  // with tool_calls=[]. Runner declared completed because result.status was
+  // "completed" (model emitted text + stopped). This map closes that gap.
+  //
+  // Tools listed here are the minimum proof that REAL external work happened
+  // for that type. store_memory / recall_memories / fail_task / test_url
+  // alone do NOT count — those can be called by hallucinations too.
+  const WORK_ORDER_REQUIRED_TOOLS = {
+    research:          new Set(["web_search", "fetch_url", "test_url", "call_integration", "composio_execute"]),
+    build_static_site: new Set(["deploy_static_site", "github_push_file", "github_create_repo", "sandbox_bash", "sandbox_write_file", "register_project"]),
+    edit_project:      new Set(["deploy_static_site", "github_push_file", "sandbox_bash", "sandbox_write_file"]),
+    send_outreach:     new Set(["composio_execute", "call_integration"]),
+    design_mockup:     new Set(["sandbox_write_file", "github_push_file", "deploy_static_site"]),
+    meeting_admin:     new Set(["composio_execute", "call_integration"]),
+    summary:           new Set(["database_query", "store_memory"]),
   };
 
   // Vendor allowlist per work-order type. call_integration enforces this at
@@ -3084,9 +3124,36 @@ async function main() {
   let finalStatus = (hasRealOutput || didWorkButTimedOut) ? "completed" : "failed";
   let failReason = null;
 
+  // EVIDENCE-OF-WORK gate. If this task carries a work_order with a defined
+  // required-tools set, completing without firing AT LEAST ONE of those tools
+  // is a hallucination — the model wrote "Site is live" / "Designer queued"
+  // without doing the work. Flip to failed and surface the gap clearly.
+  // task_results still records the bogus text so we have an audit trail.
+  if (finalStatus === "completed" && task.metadata?.work_order?.type && WORK_ORDER_REQUIRED_TOOLS[task.metadata.work_order.type]) {
+    const requiredSet = WORK_ORDER_REQUIRED_TOOLS[task.metadata.work_order.type];
+    const calledRequired = result.toolCalls.some(tc => requiredSet.has(tc.tool));
+    if (!calledRequired) {
+      const woType = task.metadata.work_order.type;
+      finalStatus = "failed";
+      failReason =
+        `Hallucinated completion: agent emitted text but called ZERO of the tools required for a "${woType}" work order ` +
+        `(needed at least one of: ${[...requiredSet].join(", ")}). Tools actually called: ${result.toolCalls.map(t => t.tool).join(", ") || "none"}.`;
+      await log(
+        "EVIDENCE_FAIL: " + failReason,
+        "evidence_of_work_failed",
+        {
+          work_order_type: woType,
+          required_tools: [...requiredSet],
+          tool_calls_actual: result.toolCalls.map(t => t.tool),
+          model_text: finalText.slice(0, 600),
+        }
+      );
+    }
+  }
+
   if (finalStatus === "failed" && result.status === "time_expired") {
     failReason = "Time budget expired without producing output";
-  } else if (finalStatus === "failed") {
+  } else if (finalStatus === "failed" && !failReason) {
     failReason = finalText.slice(0, 500);
   }
 

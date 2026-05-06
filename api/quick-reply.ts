@@ -274,9 +274,12 @@ If Sal said "send the email blast", "post this on LinkedIn", "deploy to prod", "
 - \`call_integration\` — any registered vendor action (POST/GET/etc, no method restriction).
 
 **Writing (just call them — no approval cards needed):**
+- \`run_agent\` — **DEFAULT delegation path.** Fires a specialist agent immediately with a brief. Task goes straight to status='pending', Railway picks it up. NO approval gate. Use for normal work (research, design, build, outreach drafts). After firing, narrate what you started ("Firing designer with brief X, will share output when it's back"). Do NOT say "I've proposed…" — wrong word.
 - \`cancel_tasks\` — UPDATE rows to status='cancelled' (active → archived). Always pass a one-line \`reason\` paraphrasing Sal's instruction.
 - \`delete_tasks\` — PERMANENT DELETE. Use when Sal says "delete those" / "get rid of them" / "purge". Handles the FK chain automatically (NULLs child parent_task_id, NULLs project pointers, deletes the row + cascading task_results). Pass status (e.g. 'cancelled' to purge the cancelled archive) or task_ids.
 - \`manage_schedule\`, \`run_schedule_now\`, \`update_goal\`, \`store_memory\`
+
+**\`[PROPOSE_WORK_ORDER]\` — DEPRECATED for normal work.** It exists only for materially severe / irreversible actions (mass deletions across many companies, spending >$100, public posts at scale, anything that can't be unwound). For everything else use \`run_agent\`. Sal hates the proposal-then-approve flow for normal stuff — he's been clear and repeated about this.
 - \`update_agent\` / \`revert_agent\` — modify ANY agent including yourself
 - \`add_integration\` — wire any vendor, registered or custom
 - \`call_vendor_http\` — generic HTTP through any connected vendor
@@ -380,6 +383,35 @@ const CHAT_TOOLS = [
           description: "One-line paraphrase of why Sal asked you to cancel (e.g. \"clear failed list\" or \"cancel App Store research, was wrong direction\"). Stored on each cancelled row.",
         },
       },
+    },
+  },
+  {
+    name: "run_agent",
+    description:
+      "Fire a specialist agent IMMEDIATELY with a brief. Skips the work-order proposal/approval gate — the task is created with status='pending' and Railway picks it up within seconds. Use this for ANY normal delegation: 'redesign the landing', 'research X', 'ship a fix for Y', 'draft outreach for Z'. " +
+      "Do NOT use the [PROPOSE_WORK_ORDER] markdown protocol for normal work — that path requires Sal to click Approve. Reserve [PROPOSE_WORK_ORDER] only for materially severe / irreversible actions (mass deletions, money movement, public posts at scale). " +
+      "After firing, narrate what you started in chat (e.g. 'Firing designer with brief: rebuild theaialarm.com homepage'). Do NOT say 'I've proposed…' — that's the wrong word.",
+    input_schema: {
+      type: "object",
+      properties: {
+        agent: {
+          type: "string",
+          description: "Agent slug — must exist in agent_definitions for this company. e.g. 'designer', 'engineering', 'research', 'growth'.",
+        },
+        title: {
+          type: "string",
+          description: "Short one-line title that'll show in the task pipeline (max 60 chars).",
+        },
+        brief: {
+          type: "string",
+          description: "Full instruction for the agent. Be specific — the agent reads this verbatim. Include constraints, target output format, success criteria.",
+        },
+        parent_task_id: {
+          type: "string",
+          description: "Optional: the parent task this is a child of (for multi-step orchestration).",
+        },
+      },
+      required: ["agent", "title", "brief"],
     },
   },
   {
@@ -823,6 +855,76 @@ async function runCancelTasks(
   return JSON.stringify({
     cancelled: targets.length,
     titles: targets.map((t: { title: string }) => t.title).slice(0, 10),
+  });
+}
+
+// Fire a specialist agent immediately. No proposal step, no approval gate —
+// task is created with status='pending' and the Railway worker picks it up.
+// This is the orchestrator's primary delegation path. Reserve [PROPOSE_WORK_ORDER]
+// for genuinely severe actions only. Sal's been clear: he wants the agent to
+// just run things, not ask permission for normal work.
+async function runRunAgent(
+  supabase: SupabaseClient,
+  companyId: string,
+  conversationId: string | null,
+  input: Record<string, unknown>,
+): Promise<string> {
+  const agentSlug = typeof input.agent === "string" ? input.agent.trim() : "";
+  const title = typeof input.title === "string" ? input.title.trim().slice(0, 60) : "";
+  const brief = typeof input.brief === "string" ? input.brief.trim().slice(0, 4000) : "";
+  const parentTaskId = typeof input.parent_task_id === "string" ? input.parent_task_id : null;
+
+  if (!agentSlug) return JSON.stringify({ error: "agent slug is required" });
+  if (!title) return JSON.stringify({ error: "title is required" });
+  if (!brief || brief.length < 10) return JSON.stringify({ error: "brief is required (min 10 chars)" });
+
+  // Resolve agent_definition_id — agent must exist for this company
+  const { data: agentDef, error: agentErr } = await supabase
+    .from("agent_definitions")
+    .select("id, slug, name")
+    .eq("slug", agentSlug)
+    .eq("company_id", companyId)
+    .maybeSingle();
+  if (agentErr) return JSON.stringify({ error: agentErr.message });
+  if (!agentDef) {
+    return JSON.stringify({
+      error: `No agent with slug '${agentSlug}' for this company. Run query_state on agent_definitions to see available slugs.`,
+    });
+  }
+
+  // Insert as PENDING — the Railway worker polls for pending tasks. Skipping
+  // 'proposed' means no approval gate.
+  const { data: taskRow, error: insertErr } = await supabase
+    .from("tasks")
+    .insert({
+      conversation_id: conversationId,
+      agent_definition_id: agentDef.id,
+      company_id: companyId,
+      status: "pending",
+      title,
+      description: brief,
+      input_data: { instruction: brief, context: brief },
+      source: "chat",
+      parent_task_id: parentTaskId,
+      metadata: {
+        delegation: {
+          fired_directly: true,
+          agent: agentSlug,
+        },
+      },
+    })
+    .select("id")
+    .single();
+  if (insertErr) return JSON.stringify({ error: insertErr.message });
+
+  return JSON.stringify({
+    ok: true,
+    task_id: taskRow?.id,
+    agent: agentSlug,
+    agent_name: agentDef.name,
+    title,
+    status: "pending",
+    note: "Task is queued and Railway worker will pick it up. Tell Sal what you fired and what you're waiting on.",
   });
 }
 
@@ -1749,10 +1851,12 @@ async function runChatTool(
   supabase: SupabaseClient,
   companyId: string,
   name: string,
-  input: Record<string, unknown>
+  input: Record<string, unknown>,
+  conversationId: string | null = null,
 ): Promise<string> {
   if (name === "fetch_url") return runFetchUrl(input);
   if (name === "query_state") return runQueryState(supabase, companyId, input);
+  if (name === "run_agent") return runRunAgent(supabase, companyId, conversationId, input);
   if (name === "cancel_tasks") return runCancelTasks(supabase, companyId, input);
   if (name === "delete_tasks") return runDeleteTasks(supabase, companyId, input);
   if (name === "manage_schedule") return runManageSchedule(supabase, companyId, input);
@@ -2226,9 +2330,18 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         // If we detect the pattern AND haven't already retried, prod the model
         // to continue with a single nudge before finalizing.
         const trimmed = assistantText.trim();
-        const looksDangling =
-          /:[\s]*$/.test(trimmed) ||
-          /\b(let me check|let me look|let me verify|i'?ll check|i'?ll look|i'?ll verify|one moment|hold on|checking now|looking that up|let me grab|let me pull)\b[^.!?]*$/i.test(trimmed);
+        // Cliffhanger heuristics — a reply that LOOKS like it intended to
+        // continue but stopped. Sal's hit several variants:
+        //   - dangling colon ("let me check the right endpoint:")
+        //   - unfinished inline code ("...via the `") ← Opus 4.7 truncated mid-token
+        //   - "let me…" / "I'll…" / "checking…" without follow-through
+        //   - bare comma / em-dash / opening bracket at end
+        const looksDangling = trimmed.length > 0 && (
+          /[:`,—–-]\s*$/.test(trimmed) ||                 // : ` , — – -
+          /[({[]\s*$/.test(trimmed) ||                              // unclosed bracket
+          /\*\*\s*$/.test(trimmed) ||                               // unclosed bold
+          /\b(let me check|let me look|let me verify|let me grab|let me pull|i'?ll check|i'?ll look|i'?ll verify|one moment|hold on|checking now|looking that up|give me a sec|will do that now|on it now)\b[^.!?]*$/i.test(trimmed)
+        );
         const alreadyNudged = (req.body as { _nudged?: boolean })?._nudged === true;
         if (looksDangling && !alreadyNudged && stopReason !== "tool_use") {
           // Append the partial assistant text + a synthetic user nudge that
@@ -2253,7 +2366,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       // Run each tool
       const toolResults: ContentBlock[] = [];
       for (const tu of toolUses) {
-        const result = await runChatTool(supabase, company_id, tu.name, tu.input);
+        const result = await runChatTool(supabase, company_id, tu.name, tu.input, conversation_id);
         toolResults.push({
           type: "tool_result",
           tool_use_id: tu.id,

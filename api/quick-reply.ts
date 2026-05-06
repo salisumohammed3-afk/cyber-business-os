@@ -2006,6 +2006,50 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (!checkRateLimit(company_id))
     return res.status(429).json({ error: "Rate limit exceeded. Max " + RATE_LIMIT_MAX + " requests per minute." });
 
+  // ── Conduit mode ────────────────────────────────────────────────────────
+  // If ORCHESTRATOR_WORKER_URL is set, this Vercel function becomes a thin
+  // HTTP relay to the Railway-hosted orchestrator. The worker has the full
+  // Claude Code toolkit (bash + git + workspace clone + supabase_sql) and
+  // self-modifies via git push → Vercel auto-deploy. See
+  // worker/orchestrator.mjs for the rebuild architecture.
+  //
+  // Sal explicitly asked for this shape (2026-05-06):
+  //   "Maybe the Vercel function needs to talk to an actual orchestrator
+  //    that actually has everything you have […]. The Vercel function is
+  //    just a conduit to the orchestrator."
+  //
+  // Falls through to the legacy in-Vercel orchestrator below if the env
+  // var is not set, so this can be flipped on/off without redeploying.
+  const workerUrl = process.env.ORCHESTRATOR_WORKER_URL;
+  if (workerUrl) {
+    try {
+      const conduitSecret = process.env.CONDUIT_SECRET;
+      const upstream = await fetch(`${workerUrl.replace(/\/$/, "")}/chat`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(conduitSecret ? { "X-Conduit-Secret": conduitSecret } : {}),
+        },
+        body: JSON.stringify({ company_id, conversation_id, user_message: message, attachments: attachmentList }),
+      });
+      if (!upstream.ok) {
+        const errBody = await upstream.text().catch(() => "");
+        return res.status(502).json({
+          error: `Orchestrator worker ${upstream.status}: ${errBody.slice(0, 400)}`,
+          conduit_url: workerUrl,
+        });
+      }
+      const data = await upstream.json();
+      return res.status(200).json({ mode: "conduit", reply: data.reply });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return res.status(502).json({
+        error: `Conduit forward failed: ${msg.slice(0, 400)}`,
+        conduit_url: workerUrl,
+      });
+    }
+  }
+
   const attachmentList: Array<{ name: string; url: string; type: string; size: number }> =
     Array.isArray(attachments) ? attachments : [];
 
